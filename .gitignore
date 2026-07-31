@@ -1,0 +1,34 @@
+# Build outputs
+bin/
+obj/
+_build_check/
+artifacts/
+
+# IDE/user-local files
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Runtime/local app data
+*.log
+*.tmp
+*.bak
+*.pdb
+*.cache
+
+# Internal planning/design notes
+IMPLEMENTATION_PLAN.md
+TECHNICAL_DESIGN.md
+DAYZ_COMPANION_SPECIFICATION.md
+DAYZ_COMPANION_PROGRESS.md
+
+# NuGet
+*.nupkg
+packages/
+
+# OS noise
+Thumbs.db
+Desktop.ini

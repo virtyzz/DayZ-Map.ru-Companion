@@ -1,0 +1,100 @@
+name: Windows Installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Installer version
+        required: true
+        default: 0.1.0
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-installer:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Resolve version
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $version = "${{ github.ref_name }}".TrimStart("v")
+          } else {
+            $version = "${{ inputs.version }}"
+          }
+
+          "DAYZ_COMPANION_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "Resolved installer version: $version"
+
+      - name: Publish app
+        shell: pwsh
+        run: |
+          dotnet publish .\CrosshairMarker.csproj `
+            --configuration Release `
+            --runtime win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:DebugType=none `
+            -p:DebugSymbols=false `
+            -p:Version=$env:DAYZ_COMPANION_VERSION `
+            -p:AssemblyVersion=$env:DAYZ_COMPANION_VERSION.0 `
+            -p:FileVersion=$env:DAYZ_COMPANION_VERSION.0 `
+            --output .\artifacts\publish
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" .\installer\Crosslay.iss
+          Copy-Item .\artifacts\installer\DayZ-Map-ru-Companion-Setup-$env:DAYZ_COMPANION_VERSION.exe .\artifacts\installer\DayZ-Map-ru-Companion-Setup-latest.exe
+
+      - name: Build release notes
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $manualNotes = ".\.github\release-notes\$tag.md"
+          if (-not (Test-Path $manualNotes)) {
+            throw "Для публикации $tag подготовьте подробные русскоязычные заметки: $manualNotes"
+          }
+          Copy-Item $manualNotes .\artifacts\release_notes.md
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DayZ-Map-ru-Companion-Setup-${{ env.DAYZ_COMPANION_VERSION }}
+          path: artifacts/installer/*.exe
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $installers = Get-ChildItem .\artifacts\installer\*.exe
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @($installers.FullName) --clobber
+            gh release edit $tag --notes-file .\artifacts\release_notes.md
+          } else {
+            gh release create $tag @($installers.FullName) --title "DayZ-Map.ru Companion $tag" --notes-file .\artifacts\release_notes.md
+          }
