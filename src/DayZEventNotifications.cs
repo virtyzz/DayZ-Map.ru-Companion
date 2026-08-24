@@ -250,7 +250,37 @@ internal sealed class DayZEventNotifications : IDisposable
         return string.IsNullOrWhiteSpace(result) ? title : result;
     }
     internal static string Normalize(string text) => string.Join(' ', new string(text.ToLowerInvariant().Where(c => char.IsLetterOrDigit(c) || char.IsWhiteSpace(c)).ToArray()).Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
-    private async Task<string> OcrAsync(Bitmap image) { var status = GetOcrStatus(); if (!status.Ready) throw new DayZCompanionException(status.Message); var path = Path.Combine(Path.GetTempPath(), "dayz-ocr-" + Guid.NewGuid().ToString("N") + ".png"); try { using var prepared = PrepareForOcr(image); await File.WriteAllBytesAsync(path, Png(prepared)); var start = new ProcessStartInfo(status.ExecutablePath!, $"\"{path}\" stdout -l rus+eng --psm 6 --dpi 192") { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8, CreateNoWindow = true }; using var process = Process.Start(start) ?? throw new DayZCompanionException("Не удалось запустить OCR."); var output = await process.StandardOutput.ReadToEndAsync(); var error = await process.StandardError.ReadToEndAsync(); await process.WaitForExitAsync(); if (process.ExitCode != 0) throw new DayZCompanionException("OCR недоступен: " + error.Trim()); return output; } finally { if (File.Exists(path)) File.Delete(path); } }
+    private async Task<string> OcrAsync(Bitmap image)
+    {
+        var status = GetOcrStatus();
+        // The installer can replace Tesseract while Companion is running. Do not
+        // keep using a cached path that no longer exists after that update.
+        if (!IsOcrExecutableAvailable(status))
+        {
+            RefreshOcrStatus();
+            status = GetOcrStatus();
+        }
+
+        if (!status.Ready || !IsOcrExecutableAvailable(status)) throw new DayZCompanionException(status.Message);
+        var path = Path.Combine(Path.GetTempPath(), "dayz-ocr-" + Guid.NewGuid().ToString("N") + ".png");
+        try
+        {
+            using var prepared = PrepareForOcr(image);
+            await File.WriteAllBytesAsync(path, Png(prepared));
+            var start = new ProcessStartInfo(status.ExecutablePath!, $"\"{path}\" stdout -l rus+eng --psm 6 --dpi 192") { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8, CreateNoWindow = true };
+            using var process = Process.Start(start) ?? throw new DayZCompanionException("Не удалось запустить OCR.");
+            var output = await process.StandardOutput.ReadToEndAsync();
+            var error = await process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync();
+            if (process.ExitCode != 0) throw new DayZCompanionException("OCR недоступен: " + error.Trim());
+            return output;
+        }
+        finally { if (File.Exists(path)) File.Delete(path); }
+    }
+
+    private static bool IsOcrExecutableAvailable(DayZOcrStatus status) =>
+        status.Ready && !string.IsNullOrWhiteSpace(status.ExecutablePath) &&
+        (string.Equals(status.ExecutablePath, "tesseract.exe", StringComparison.OrdinalIgnoreCase) || File.Exists(status.ExecutablePath));
     private static DayZOcrStatus DetectOcr() { var candidates = new[] { Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "Tesseract-OCR", "tesseract.exe"), Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Tesseract-OCR", "tesseract.exe"), Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Tesseract-OCR", "tesseract.exe"), "tesseract.exe" }; foreach (var executable in candidates.Where(item => item == "tesseract.exe" || File.Exists(item))) { try { var start = new ProcessStartInfo(executable, "--list-langs") { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true }; using var process = Process.Start(start); if (process is null || !process.WaitForExit(5000) || process.ExitCode != 0) continue; var languages = process.StandardOutput.ReadToEnd().Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries); return languages.Contains("rus") && languages.Contains("eng") ? new(true, "Tesseract OCR готов: rus и eng найдены.", executable) : new(false, "В Tesseract должны быть установлены языки rus и eng.", executable); } catch (System.ComponentModel.Win32Exception) { } } return new(false, "Tesseract OCR не установлен."); }
     private static Bitmap Capture(Rectangle bounds) { var image = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppArgb); using var g = Graphics.FromImage(image); g.CopyFromScreen(bounds.Location, Point.Empty, bounds.Size); return image; }
     private static Bitmap? CaptureWindow(GameWindow window) { var image = new Bitmap(window.Bounds.Width, window.Bounds.Height, PixelFormat.Format32bppArgb); using var graphics = Graphics.FromImage(image); var hdc = graphics.GetHdc(); try { if (!GameWindows.Print(window.Handle, hdc)) { image.Dispose(); return null; } } finally { graphics.ReleaseHdc(hdc); } return image; }
