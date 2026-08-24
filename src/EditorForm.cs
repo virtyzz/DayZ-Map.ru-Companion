@@ -1,5 +1,6 @@
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.Diagnostics;
 using System.Text.Json;
 using System.Windows.Forms;
 using Microsoft.Web.WebView2.Core;
@@ -21,6 +22,7 @@ internal sealed class EditorForm : Form
     private AppConfig config;
     private DayZCompanionSettings dayZSettings;
     private DayZCompanionStatus dayZStatus;
+    private readonly DayZEventNotifications eventNotifications;
     private UpdateInfo? updateInfo;
     private string? pendingTab;
     private bool webReady;
@@ -32,7 +34,7 @@ internal sealed class EditorForm : Form
     public event Action<DayZCompanionSettings>? DayZSettingsChanged;
     public event Action? DayZStatusRequested;
 
-    public EditorForm(AppConfig source, UpdateService updateService, DayZCompanionSettings dayZSettings, DayZCompanionStatus dayZStatus, string? initialTab = null)
+    public EditorForm(AppConfig source, UpdateService updateService, DayZCompanionSettings dayZSettings, DayZCompanionStatus dayZStatus, DayZEventNotifications eventNotifications, string? initialTab = null)
     {
         this.updateService = updateService;
         pendingTab = initialTab;
@@ -41,6 +43,7 @@ internal sealed class EditorForm : Form
         this.dayZSettings = dayZSettings;
         this.dayZSettings.Normalize();
         this.dayZStatus = dayZStatus;
+        this.eventNotifications = eventNotifications;
 
         Text = AppIdentity.DisplayName;
         Icon = AppIcons.MainIcon();
@@ -108,6 +111,17 @@ internal sealed class EditorForm : Form
         dayZSettings = settings;
         dayZSettings.Normalize();
         dayZStatus = status;
+        _ = SendStateAsync();
+    }
+
+    public void ApplyEventNotificationState(DayZEventNotificationSettings settings, bool monitoring)
+    {
+        if (IsHandleCreated && InvokeRequired)
+        {
+            BeginInvoke(new Action(() => ApplyEventNotificationState(settings, monitoring)));
+            return;
+        }
+        dayZSettings.EventNotifications = settings;
         _ = SendStateAsync();
     }
 
@@ -238,6 +252,28 @@ internal sealed class EditorForm : Form
             case "openRuntimeLog":
                 OpenFileLocation(AppRuntimeLog.FilePath);
                 break;
+            case "connectEventNotifications":
+                if (!dayZStatus.Port.HasValue) throw new DayZCompanionException("Локальный API Companion не запущен.");
+                Process.Start(new ProcessStartInfo(eventNotifications.BeginPairing(dayZStatus.Port.Value)) { UseShellExecute = true });
+                break;
+            case "testEventNotifications":
+                await eventNotifications.SendTestAsync(CancellationToken.None);
+                break;
+            case "disconnectEventNotifications":
+                await eventNotifications.DisconnectAsync(CancellationToken.None);
+                break;
+            case "installEventOcr":
+                eventNotifications.InstallOcr();
+                break;
+            case "refreshEventOcr":
+                eventNotifications.RefreshOcrStatus();
+                break;
+            case "previewEventCapture":
+                eventNotifications.RefreshCapturePreview();
+                break;
+            case "clearEventLog":
+                eventNotifications.ClearLog();
+                break;
         }
     }
 
@@ -364,6 +400,15 @@ internal sealed class EditorForm : Form
             openTab,
             update = updateInfo,
             dayZ = new { settings = dayZSettings, status = dayZStatus },
+            eventNotifications = new
+            {
+                settings = eventNotifications.Settings,
+                monitoring = eventNotifications.IsMonitoring,
+                windows = GameWindows.Find().Select(window => new { window.Title, width = window.Bounds.Width, height = window.Bounds.Height }),
+                log = eventNotifications.GetLog(),
+                ocr = eventNotifications.GetOcrStatus(),
+                capturePreview = eventNotifications.GetCapturePreview()
+            },
             monitors = MonitorInfo.GetAll().Select(monitor => new
             {
                 monitor.DeviceName,
@@ -708,6 +753,17 @@ input[type="color"] {
   border-color: #6e4c1b;
   color: var(--accent);
 }
+.action:disabled, .action.primary:disabled, .action.danger:disabled {
+  background: #29292d;
+  border-color: #414146;
+  color: #8a8a90;
+  cursor: not-allowed;
+  opacity: 1;
+}
+.action:disabled:hover {
+  background: #29292d;
+  color: #8a8a90;
+}
 .action.active {
   background: #3a2a17;
   border-color: #6e4c1b;
@@ -741,6 +797,15 @@ input[type="color"] {
   display: grid;
   gap: 8px;
   color: var(--text);
+}
+.event-log {
+  max-height: 280px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 8px;
+  align-content: start;
+  word-break: break-word;
+  scrollbar-color: #6e4c1b #17171a;
 }
 .update-status strong {
   color: var(--accent);
@@ -880,6 +945,7 @@ const defaultHotkeys = {
 
 const navigation = [
   { tab: ["dayz", "Синхронизация меток"] },
+  { tab: ["events", "Уведомления о событиях"] },
   { id: "crosshair", label: "Прицел", tabs: [
     ["crosshair", "Настройка прицела"],
     ["image", "Изображение"],
@@ -1125,7 +1191,30 @@ function render() {
 
 function isEditingValueControl() {
   const active = document.activeElement;
-  return !!active?.matches?.("[data-slider], [data-number], [data-color], [data-color-all], [data-check], [data-select], input[type='text']");
+  return !!active?.matches?.("input, select, textarea, [contenteditable='true']");
+}
+
+function renderDataChanged(previous, next) {
+  if (!previous) return true;
+  // DayZ status is polled periodically. It is not form data, so it must not
+  // recreate the whole editor and steal focus from a field or an open select.
+  const stable = value => ({
+    config: value.config,
+    openTab: value.openTab,
+    update: value.update,
+    dayZSettings: value.dayZ?.settings,
+    eventNotifications: value.eventNotifications,
+    monitors: value.monitors,
+    preview: value.preview
+  });
+  return JSON.stringify(stable(previous)) !== JSON.stringify(stable(next));
+}
+
+function keepEditedState(previous, next) {
+  return {
+    ...previous,
+    dayZ: next.dayZ ? { ...previous.dayZ, status: next.dayZ.status } : previous.dayZ
+  };
 }
 
 function renderSidebar() {
@@ -1157,6 +1246,7 @@ function renderEditor() {
     hotkeys: renderHotkeys(),
     monitor: renderMonitor(),
     dayz: renderDayZ(),
+    events: renderEvents(),
     profiles: renderProfiles(),
     updates: renderUpdates()
   };
@@ -1430,6 +1520,55 @@ function renderDayZ() {
   `;
 }
 
+function renderCaptureZone(label, property, zone) {
+  const percent = value => Math.round(Number(value) * 100);
+  const input = (name, title) => `<label class="limit">${title}<input type="number" min="0" max="100" step="1" value="${percent(zone[name])}" data-event-zone="${property}" data-event-zone-value="${name}"></label>`;
+  return field(label, { input: `<div class="update-status"><div class="actions">${input("X", "Слева, %")}${input("Y", "Сверху, %")}${input("Width", "Ширина, %")}${input("Height", "Высота, %")}</div><span>На предпросмотре зону можно перетаскивать мышью, а её размер — менять за маркер в правом нижнем углу.</span></div>` });
+}
+
+function renderCaptureCalibration(preview, settings) {
+  if (!preview?.DataUri) return "";
+  const zone = (property, label, color) => {
+    const value = settings[property];
+    const style = `left:${Number(value.X) * 100}%;top:${Number(value.Y) * 100}%;width:${Number(value.Width) * 100}%;height:${Number(value.Height) * 100}%;border-color:${color};`;
+    return `<div data-event-calibration-zone="${property}" style="position:absolute;box-sizing:border-box;border:2px solid ${color};background:transparent;cursor:move;touch-action:none;${style}"><span style="position:absolute;left:0;top:0;padding:2px 5px;background:${color};color:#101014;font-size:11px;line-height:14px;white-space:nowrap;pointer-events:none">${label}</span><span data-event-calibration-resize="${property}" title="Изменить размер" style="position:absolute;right:-7px;bottom:-7px;width:14px;height:14px;border:2px solid #101014;border-radius:50%;background:${color};cursor:nwse-resize"></span></div>`;
+  };
+  return `<div data-event-calibrator style="position:relative;width:100%;margin-top:10px;line-height:0;user-select:none"><img src="${preview.DataUri}" alt="Предпросмотр зон DayZ" draggable="false" style="display:block;width:100%;height:auto;border:1px solid #414146;border-radius:6px">${zone("TopLeftZone", "Верхняя левая", "#ffb547")}${zone("TopCenterZone", "Верхняя центральная", "#55c4ff")}</div>`;
+}
+
+function renderEvents() {
+  const settings = state.eventNotifications.settings;
+  const windows = state.eventNotifications.windows || [];
+  const log = state.eventNotifications.log || [];
+  const ocr = state.eventNotifications.ocr;
+  const capturePreview = state.eventNotifications.capturePreview;
+  const isConnected = Boolean(settings.DeviceId && settings.ConnectedUser);
+  const connected = isConnected ? `Подключено: ${settings.ConnectedUser}` : "Устройство не подключено";
+  const delivery = settings.LastDeliveryAt ? new Date(settings.LastDeliveryAt).toLocaleString() : "Пока нет";
+  const error = settings.LastError ? `Ошибка: ${settings.LastError}` : (state.eventNotifications.monitoring ? "Мониторинг запущен" : "Мониторинг выключен");
+  return `
+    <h2>Уведомления о событиях</h2>
+    ${field("Связь DayZ-Map / Discord", { input: `<div class="update-status">${escapeHtml(connected)}<span>${escapeHtml(error)}</span><span>Последняя доставка: ${escapeHtml(delivery)}</span></div>` })}
+    ${field("Адрес DayZ-Map API", { input: `<input type="url" value="${escapeHtml(settings.BackendUrl)}" data-event-text="BackendUrl">` })}
+    ${field("Tesseract OCR", { input: `<div class="update-status">${escapeHtml(ocr?.Message || "Проверка OCR ещё не выполнена.")}</div><div class="actions"><button class="action primary" data-command="installEventOcr" ${ocr?.Ready ? "disabled" : ""}>Установить Tesseract</button><button class="action" data-command="refreshEventOcr">Проверить снова</button></div>` })}
+    ${field("Окно DayZ", { input: `<select data-event-text="WindowTitle"><option value="" ${!settings.WindowTitle ? "selected" : ""}>Автоматически: первое найденное окно</option>${windows.map(window => `<option value="${escapeHtml(window.Title)}" ${window.Title === settings.WindowTitle ? "selected" : ""}>${escapeHtml(window.Title)} (${window.width}×${window.height})</option>`).join("")}</select><div class="limit">Список обновляется при открытии вкладки. Если выбранное окно закрыто, мониторинг остановится с понятной ошибкой.</div>` })}
+    ${renderCaptureZone("Зона: верхняя левая", "TopLeftZone", settings.TopLeftZone)}
+    ${renderCaptureZone("Зона: верхняя центральная", "TopCenterZone", settings.TopCenterZone)}
+    ${field("Предпросмотр зон", { input: `<div class="update-status">${escapeHtml(capturePreview?.Message || "Предпросмотр ещё не создан.")}${renderCaptureCalibration(capturePreview, settings)}</div><div class="actions"><button class="action" data-command="previewEventCapture">Обновить предпросмотр</button><button class="action" data-event-reset-zones>Сбросить зоны</button></div>` })}
+    ${field("Мониторить игровые уведомления", { value: `<input type="checkbox" ${settings.Enabled ? "checked" : ""} data-event-check="Enabled">`, input: `` })}
+    ${field("Интервал проверки, мс", { input: `<input type="number" min="200" max="2000" value="${settings.PollIntervalMs}" data-event-number="PollIntervalMs">` })}
+    ${field("Минимальный повтор, сек", { input: `<input type="number" min="5" max="3600" value="${settings.DuplicateIntervalSeconds}" data-event-number="DuplicateIntervalSeconds">` })}
+    ${field("Военный конвой", { value: `<input type="checkbox" ${settings.MilitaryConvoy ? "checked" : ""} data-event-check="MilitaryConvoy">`, input: `` })}
+    ${field("Лагерь", { value: `<input type="checkbox" ${settings.Camp ? "checked" : ""} data-event-check="Camp">`, input: `` })}
+    ${field("Погрузка", { value: `<input type="checkbox" ${settings.Loading ? "checked" : ""} data-event-check="Loading">`, input: `` })}
+    ${field("Зачистка местности", { value: `<input type="checkbox" ${settings.AreaClearance ? "checked" : ""} data-event-check="AreaClearance">`, input: `` })}
+    ${field("Изображение", { value: `<input type="checkbox" ${settings.SendFullFrame ? "checked" : ""} data-event-check="SendFullFrame">`, input: `<div class="limit">Включено — отправляется полный кадр окна DayZ; выключено — только область уведомления.</div>` })}
+    <div class="actions"><button class="action primary" data-command="connectEventNotifications" ${isConnected ? "disabled" : ""}>${isConnected ? "DayZ-Map подключён" : "Войти через DayZ-Map"}</button><button class="action" data-command="testEventNotifications" ${isConnected ? "" : "disabled"}>Проверить Discord-уведомление</button><button class="action danger" data-command="disconnectEventNotifications" ${isConnected ? "" : "disabled"}>Отключить</button></div>
+    ${field("Локальный журнал", { input: `<div class="update-status event-log">${log.length ? log.map(item => `<span>${escapeHtml(new Date(item.At).toLocaleTimeString())} — ${escapeHtml(item.Message)}</span>`).join("") : "Событий в этой сессии пока нет."}</div><div class="actions"><button class="action" data-command="clearEventLog" ${log.length ? "" : "disabled"}>Очистить журнал</button></div>` })}
+    <div class="limit">Захват выполняется только из двух зон окна DayZ: верхней левой и верхней центральной. Нужен установленный Tesseract OCR с языками rus и eng. Companion не читает память игры и не эмулирует ввод.</div>
+  `;
+}
+
 function renderUpdates() {
   const info = state.update;
   if (!info) {
@@ -1514,6 +1653,15 @@ function bindEditorEvents() {
       updateDayZ(settings => settings[input.dataset.dayzNumber] = value);
     });
   });
+  document.querySelectorAll("[data-event-check]").forEach(input => input.addEventListener("change", () => updateDayZ(settings => settings.EventNotifications[input.dataset.eventCheck] = input.checked)));
+  document.querySelectorAll("[data-event-number]").forEach(input => input.addEventListener("change", () => updateDayZ(settings => settings.EventNotifications[input.dataset.eventNumber] = Math.min(Number(input.max), Math.max(Number(input.min), Number(input.value || input.min))))));
+  document.querySelectorAll("[data-event-text]").forEach(input => input.addEventListener("change", () => updateDayZ(settings => settings.EventNotifications[input.dataset.eventText] = input.value.trim())));
+  document.querySelectorAll("[data-event-zone]").forEach(input => input.addEventListener("change", () => updateDayZ(settings => settings.EventNotifications[input.dataset.eventZone][input.dataset.eventZoneValue] = Math.min(100, Math.max(0, Number(input.value || 0))) / 100)));
+  document.querySelectorAll("[data-event-reset-zones]").forEach(button => button.addEventListener("click", () => updateDayZ(settings => {
+    settings.EventNotifications.TopLeftZone = { X: .04, Y: .06, Width: .30, Height: .11 };
+    settings.EventNotifications.TopCenterZone = { X: .38, Y: .06, Width: .24, Height: .11 };
+  })));
+  bindCaptureCalibration();
   document.querySelectorAll("[data-overlay-size]").forEach(input => {
     input.addEventListener("change", () => update(config => config.OverlayWindowSize = Number(input.value)));
   });
@@ -1608,6 +1756,67 @@ function bindEditorEvents() {
   if (name) name.addEventListener("change", flushPendingConfig);
   const monitor = document.getElementById("monitorSelect");
   if (monitor) monitor.addEventListener("change", () => update(config => config.TargetMonitorDeviceName = monitor.value));
+}
+
+function bindCaptureCalibration() {
+  document.querySelectorAll("[data-event-calibrator]").forEach(calibrator => {
+    const image = calibrator.querySelector("img");
+    const updateZoneDisplay = (property, value) => {
+      const element = calibrator.querySelector(`[data-event-calibration-zone="${property}"]`);
+      if (element) {
+        element.style.left = `${value.X * 100}%`;
+        element.style.top = `${value.Y * 100}%`;
+        element.style.width = `${value.Width * 100}%`;
+        element.style.height = `${value.Height * 100}%`;
+      }
+      document.querySelectorAll(`[data-event-zone="${property}"]`).forEach(input => {
+        input.value = Math.round(Number(value[input.dataset.eventZoneValue]) * 100);
+      });
+    };
+    calibrator.querySelectorAll("[data-event-calibration-zone]").forEach(element => {
+      element.addEventListener("pointerdown", event => {
+        const property = element.dataset.eventCalibrationZone;
+        const resizing = event.target.closest("[data-event-calibration-resize]")?.dataset.eventCalibrationResize === property;
+        const initial = clone(state.dayZ.settings.EventNotifications[property]);
+        const bounds = () => image.getBoundingClientRect();
+        const start = { x: event.clientX, y: event.clientY };
+        let current = initial;
+        event.preventDefault();
+        element.setPointerCapture(event.pointerId);
+        const move = moveEvent => {
+          const rect = bounds();
+          if (!rect.width || !rect.height) return;
+          const dx = (moveEvent.clientX - start.x) / rect.width;
+          const dy = (moveEvent.clientY - start.y) / rect.height;
+          if (resizing) {
+            current = {
+              X: initial.X,
+              Y: initial.Y,
+              Width: Math.min(1 - initial.X, Math.max(.05, initial.Width + dx)),
+              Height: Math.min(1 - initial.Y, Math.max(.05, initial.Height + dy))
+            };
+          } else {
+            current = {
+              X: Math.min(1 - initial.Width, Math.max(0, initial.X + dx)),
+              Y: Math.min(1 - initial.Height, Math.max(0, initial.Y + dy)),
+              Width: initial.Width,
+              Height: initial.Height
+            };
+          }
+          updateZoneDisplay(property, current);
+        };
+        const finish = () => {
+          element.removeEventListener("pointermove", move);
+          element.removeEventListener("pointerup", finish);
+          element.removeEventListener("pointercancel", finish);
+          updateDayZ(settings => settings.EventNotifications[property] = current);
+        };
+        element.addEventListener("pointermove", move);
+        element.addEventListener("pointerup", finish);
+        element.addEventListener("pointercancel", finish);
+      });
+    });
+  });
 }
 
 function updateDayZ(mutator) {
@@ -1817,7 +2026,8 @@ document.addEventListener("click", event => {
 
 window.DayZMapCompanion = {
   receiveState(next) {
-    state = next;
+    const previous = state;
+    const wasDayZStatusPending = dayZStatusPending;
     if (dayZStatusPending && next.dayZ) {
       dayZStatusPending = false;
       const status = next.dayZ.status;
@@ -1825,16 +2035,19 @@ window.DayZMapCompanion = {
         ? `Готово: файл ${status.FileWritable ? "проверен и доступен для записи" : "найден, но требует внимания"}.`
         : "Поиск завершён: PrivateMarkers.json не найден.";
     }
-    if (next.openTab) {
-      activeTab = next.openTab;
-      expandNavForTab(activeTab);
-    }
-    if (isEditingValueControl()) {
+    if (previous && isEditingValueControl()) {
+      state = keepEditedState(previous, next);
       document.getElementById("preview").src = state.preview || "";
       document.getElementById("activeProfileName").textContent = profile()?.Name || "";
       return;
     }
-    render();
+    const needsRender = renderDataChanged(previous, next) || wasDayZStatusPending || !!next.openTab;
+    state = next;
+    if (next.openTab) {
+      activeTab = next.openTab;
+      expandNavForTab(activeTab);
+    }
+    if (needsRender) render();
   },
   openTab(tab) {
     activeTab = tab;

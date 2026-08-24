@@ -1,6 +1,9 @@
 #define MyAppName "DayZ-Map.ru Companion"
 #define MyAppPublisher "DayZ-Map.ru"
 #define MyAppExeName "DayZMapCompanion.exe"
+#define TesseractInstaller "tesseract-ocr-w64-setup-5.5.0.20241111.exe"
+#define TesseractInstallerSha256 "f3fc4236425b690c8be756f35793f77394ee004be0a6460a440c754d892f68bc"
+#define TesseractRussianDataSha256 "e16e5e036cce1d9ec2b00063cf8b54472625b9e14d893a169e2b0dedeb4df225"
 #define MyAppVersion GetEnv("DAYZ_COMPANION_VERSION")
 
 #if MyAppVersion == ""
@@ -38,6 +41,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "..\artifacts\publish\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "third_party\{#TesseractInstaller}"; DestDir: "{tmp}"; Flags: deleteafterinstall; Hash: "{#TesseractInstallerSha256}"
+Source: "third_party\rus.traineddata"; DestDir: "{tmp}"; Flags: deleteafterinstall; Hash: "{#TesseractRussianDataSha256}"
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
@@ -69,5 +74,21 @@ begin
   Result := '';
 end;
 
+function IsTesseractInstalled(): Boolean;
+begin
+  Result := FileExists(ExpandConstant('{localappdata}\Programs\Tesseract-OCR\tesseract.exe')) or
+    FileExists(ExpandConstant('{autopf}\Tesseract-OCR\tesseract.exe'));
+end;
+
+procedure InstallTesseractRussianData();
+var
+  TessdataPath: String;
+begin
+  TessdataPath := ExpandConstant('{localappdata}\Programs\Tesseract-OCR\tessdata');
+  if DirExists(TessdataPath) then
+    FileCopy(ExpandConstant('{tmp}\rus.traineddata'), AddBackslash(TessdataPath) + 'rus.traineddata', False);
+end;
+
 [Run]
+Filename: "{tmp}\{#TesseractInstaller}"; Parameters: "/S /D={localappdata}\Programs\Tesseract-OCR"; StatusMsg: "Установка Tesseract OCR…"; Flags: waituntilterminated; Check: not IsTesseractInstalled; AfterInstall: InstallTesseractRussianData
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent

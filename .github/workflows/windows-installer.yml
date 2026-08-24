@@ -39,6 +39,28 @@ jobs:
           "DAYZ_COMPANION_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
           "Resolved installer version: $version"
 
+      - name: Verify release notes
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $notes = ".\.github\release-notes\${{ github.ref_name }}.md"
+          if (-not (Test-Path $notes)) {
+            throw "Для публикации ${{ github.ref_name }} подготовьте подробные русскоязычные заметки: $notes"
+          }
+
+      - name: Verify bundled OCR assets
+        shell: pwsh
+        run: |
+          $expected = @{
+            ".\installer\third_party\tesseract-ocr-w64-setup-5.5.0.20241111.exe" = "F3FC4236425B690C8BE756F35793F77394EE004BE0A6460A440C754D892F68BC"
+            ".\installer\third_party\rus.traineddata" = "E16E5E036CCE1D9EC2B00063CF8B54472625B9E14D893A169E2B0DEDEB4DF225"
+          }
+          foreach ($entry in $expected.GetEnumerator()) {
+            if (-not (Test-Path -LiteralPath $entry.Key)) { throw "Отсутствует OCR-asset: $($entry.Key)" }
+            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $entry.Key).Hash
+            if ($actual -ne $entry.Value) { throw "SHA-256 не совпадает для $($entry.Key)" }
+          }
+
       - name: Publish app
         shell: pwsh
         run: |
@@ -71,9 +93,6 @@ jobs:
         run: |
           $tag = "${{ github.ref_name }}"
           $manualNotes = ".\.github\release-notes\$tag.md"
-          if (-not (Test-Path $manualNotes)) {
-            throw "Для публикации $tag подготовьте подробные русскоязычные заметки: $manualNotes"
-          }
           Copy-Item $manualNotes .\artifacts\release_notes.md
 
       - name: Upload installer artifact

@@ -12,6 +12,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
     private readonly DayZCompanionSettingsStore dayZSettingsStore;
     private DayZCompanionServer dayZCompanion;
     private DayZCompanionSettings dayZSettings;
+    private readonly DayZEventNotifications eventNotifications;
     private EditorForm? editor;
     private AppConfig config;
 
@@ -48,8 +49,11 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         {
             dayZSettingsStore.Save(dayZSettings);
         }
-        dayZCompanion = new DayZCompanionServer(dayZSettings);
+        eventNotifications = new DayZEventNotifications(dayZSettings.EventNotifications);
+        eventNotifications.Changed += OnEventNotificationsChanged;
+        dayZCompanion = new DayZCompanionServer(dayZSettings, eventNotifications);
         dayZCompanion.Start();
+        eventNotifications.Start();
         _ = CheckForStartupUpdateAsync();
 
         if (!config.StartMinimizedToTray)
@@ -96,7 +100,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             return;
         }
 
-        editor = new EditorForm(config, updateService, dayZSettings, dayZCompanion.GetStatus(), initialTab);
+        editor = new EditorForm(config, updateService, dayZSettings, dayZCompanion.GetStatus(), eventNotifications, initialTab);
         editor.ConfigChanged += nextConfig =>
         {
             var startupChanged = config.StartWithWindows != nextConfig.StartWithWindows;
@@ -131,10 +135,11 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             var restartHttp = dayZSettings.RequiresHttpRestart(nextSettings);
             dayZSettings.CopyFrom(nextSettings);
             dayZSettingsStore.Save(dayZSettings);
+            if (dayZSettings.EventNotifications.Enabled) eventNotifications.Start(); else eventNotifications.Stop();
             if (restartHttp)
             {
                 dayZCompanion.Dispose();
-                dayZCompanion = new DayZCompanionServer(dayZSettings);
+                dayZCompanion = new DayZCompanionServer(dayZSettings, eventNotifications);
                 dayZCompanion.Start();
             }
             editor?.ApplyDayZState(dayZSettings, dayZCompanion.GetStatus());
@@ -142,6 +147,12 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         editor.DayZStatusRequested += () => editor?.ApplyDayZState(dayZSettings, dayZCompanion.GetStatus());
         editor.ExitRequested += ExitApplication;
         editor.Show();
+    }
+
+    private void OnEventNotificationsChanged()
+    {
+        dayZSettingsStore.Save(dayZSettings);
+        editor?.ApplyEventNotificationState(eventNotifications.Settings, eventNotifications.IsMonitoring);
     }
 
     private async Task CheckForStartupUpdateAsync()
@@ -265,6 +276,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
     {
         store.SaveAtomic(config);
         dayZCompanion.Dispose();
+        eventNotifications.Dispose();
         hotkeys.Dispose();
         tray.Dispose();
         overlay.Close();

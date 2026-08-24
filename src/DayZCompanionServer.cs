@@ -16,14 +16,16 @@ internal sealed class DayZCompanionServer : IDisposable
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
     };
     private readonly DayZMarkersService markers;
+    private readonly DayZEventNotifications? eventNotifications;
     private readonly CancellationTokenSource cancellation = new();
     private HttpListener? listener;
     private Task? worker;
 
-    public DayZCompanionServer(DayZCompanionSettings settings)
+    public DayZCompanionServer(DayZCompanionSettings settings, DayZEventNotifications? eventNotifications = null)
     {
         this.settings = settings;
         markers = new DayZMarkersService(settings);
+        this.eventNotifications = eventNotifications;
     }
 
     public int? Port { get; private set; }
@@ -90,6 +92,11 @@ internal sealed class DayZCompanionServer : IDisposable
         try
         {
             var request = context.Request;
+            if (request.HttpMethod == "GET" && request.Url!.AbsolutePath == "/companion/callback" && eventNotifications is not null)
+            {
+                await CompletePairingAsync(context);
+                return;
+            }
             if (!request.Url!.AbsolutePath.StartsWith("/api/", StringComparison.Ordinal))
             {
                 context.Response.StatusCode = 404;
@@ -146,6 +153,23 @@ internal sealed class DayZCompanionServer : IDisposable
         finally
         {
             try { context.Response.Close(); } catch { }
+        }
+    }
+
+    private async Task CompletePairingAsync(HttpListenerContext context)
+    {
+        try
+        {
+            var code = context.Request.QueryString["code"] ?? "";
+            var state = context.Request.QueryString["state"] ?? "";
+            await eventNotifications!.CompletePairingAsync(code, state, cancellation.Token);
+            var bytes = Encoding.UTF8.GetBytes("<meta charset=\"utf-8\"><h2>DayZ-Map Companion подключён.</h2><p>Можно закрыть эту вкладку и вернуться в приложение.</p>");
+            context.Response.StatusCode = 200; context.Response.ContentType = "text/html; charset=utf-8"; context.Response.ContentLength64 = bytes.Length; await context.Response.OutputStream.WriteAsync(bytes);
+        }
+        catch (DayZCompanionException ex)
+        {
+            var bytes = Encoding.UTF8.GetBytes("<meta charset=\"utf-8\"><h2>Не удалось подключить Companion</h2><p>" + System.Net.WebUtility.HtmlEncode(ex.Message) + "</p>");
+            context.Response.StatusCode = 400; context.Response.ContentType = "text/html; charset=utf-8"; context.Response.ContentLength64 = bytes.Length; await context.Response.OutputStream.WriteAsync(bytes);
         }
     }
 

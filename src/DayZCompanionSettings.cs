@@ -12,11 +12,14 @@ internal sealed class DayZCompanionSettings
     public int BackupLimit { get; set; } = 20;
     public int BackupMaxAgeDays { get; set; } = 90;
     public EditorWindowBounds? EditorWindowBounds { get; set; }
+    public DayZEventNotificationSettings EventNotifications { get; set; } = new();
 
     public void Normalize()
     {
         BackupLimit = Math.Clamp(BackupLimit, 1, 100);
         BackupMaxAgeDays = Math.Clamp(BackupMaxAgeDays, 1, 3650);
+        EventNotifications ??= new DayZEventNotificationSettings();
+        EventNotifications.Normalize();
         EditorWindowBounds?.Normalize();
         if (!string.IsNullOrWhiteSpace(PrivateMarkersPath))
         {
@@ -37,6 +40,7 @@ internal sealed class DayZCompanionSettings
         BackupLimit = source.BackupLimit;
         BackupMaxAgeDays = source.BackupMaxAgeDays;
         EditorWindowBounds = source.EditorWindowBounds?.Clone();
+        EventNotifications.CopyFrom(source.EventNotifications);
         Normalize();
     }
 }
