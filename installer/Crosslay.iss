@@ -90,5 +90,5 @@ begin
 end;
 
 [Run]
-Filename: "{tmp}\{#TesseractInstaller}"; Parameters: "/S /D={localappdata}\Programs\Tesseract-OCR"; StatusMsg: "Установка Tesseract OCR…"; Flags: waituntilterminated; Check: not IsTesseractInstalled; AfterInstall: InstallTesseractRussianData
+Filename: "{tmp}\{#TesseractInstaller}"; Parameters: "/S /D={localappdata}\Programs\Tesseract-OCR"; StatusMsg: "Установка Tesseract OCR…"; Flags: waituntilterminated shellexec; Check: not IsTesseractInstalled; AfterInstall: InstallTesseractRussianData
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
