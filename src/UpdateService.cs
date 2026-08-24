@@ -8,6 +8,7 @@ namespace CrosshairMarker;
 
 internal sealed class UpdateService
 {
+    private const string ReleasesPageUrl = "https://github.com/virtyzz/DayZ-Map.ru-Companion/releases";
     private const string LatestReleaseUrl = "https://api.github.com/repos/virtyzz/DayZ-Map.ru-Companion/releases/latest";
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -74,6 +75,14 @@ internal sealed class UpdateService
         }
 
         Process.Start(new ProcessStartInfo(url)
+        {
+            UseShellExecute = true
+        });
+    }
+
+    public static void OpenReleasesPage()
+    {
+        Process.Start(new ProcessStartInfo(ReleasesPageUrl)
         {
             UseShellExecute = true
         });

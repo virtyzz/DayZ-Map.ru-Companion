@@ -52,7 +52,8 @@ jobs:
         shell: pwsh
         run: |
           $expected = @{
-            ".\installer\third_party\tesseract-ocr-w64-setup-5.5.0.20241111.exe" = "F3FC4236425B690C8BE756F35793F77394EE004BE0A6460A440C754D892F68BC"
+            ".\installer\third_party\tesseract-ocr-w64-setup-5.5.3.20260724.exe" = "BEE9E3434BD94FD65387D9BE28CD467A41F61B1275383B55B0F59A1331270AE4"
+            ".\installer\third_party\eng.traineddata" = "7D4322BD2A7749724879683FC3912CB542F19906C83BCC1A52132556427170B2"
             ".\installer\third_party\rus.traineddata" = "E16E5E036CCE1D9EC2B00063CF8B54472625B9E14D893A169E2B0DEDEB4DF225"
           }
           foreach ($entry in $expected.GetEnumerator()) {

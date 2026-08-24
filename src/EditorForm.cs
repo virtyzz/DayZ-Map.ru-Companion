@@ -233,6 +233,9 @@ internal sealed class EditorForm : Form
                 }
                 UpdateService.OpenDownload(updateInfo);
                 break;
+            case "openCompanionReleases":
+                UpdateService.OpenReleasesPage();
+                break;
             case "exitApplication":
                 ExitRequested?.Invoke();
                 break;
@@ -1577,6 +1580,7 @@ function renderUpdates() {
       ${field("Статус", { input: `<div class="update-status">Проверка еще не выполнялась.</div>` })}
       <div class="actions">
         <button class="action primary" data-command="checkUpdate">Проверить</button>
+        <button class="action" data-command="openCompanionReleases">Открыть релизы</button>
       </div>
     `;
   }
@@ -1597,6 +1601,7 @@ function renderUpdates() {
     <div class="actions">
       <button class="action" data-command="checkUpdate">Проверить снова</button>
       <button class="action primary" data-command="downloadUpdate" ${downloadDisabled}>Скачать установщик</button>
+      <button class="action" data-command="openCompanionReleases">Открыть релизы</button>
     </div>
   `;
 }
