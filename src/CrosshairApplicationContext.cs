@@ -13,6 +13,10 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
     private DayZCompanionServer dayZCompanion;
     private DayZCompanionSettings dayZSettings;
     private readonly DayZEventNotifications eventNotifications;
+    private readonly BattlePassStore battlePassStore;
+    private readonly BattlePassTracker battlePassTracker;
+    private readonly BattlePassOverlayForm battlePassOverlay;
+    private BattlePassSettings battlePassSettings;
     private EditorForm? editor;
     private AppConfig config;
 
@@ -37,11 +41,29 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             onOpenEditor: OpenEditor,
             onOpenUpdates: OpenUpdates,
             onSelectProfile: SelectProfile,
+            onOpenBattlePass: OpenBattlePassSettings,
+            onScanBattlePass: () => ScanBattlePass(),
             onExit: ExitApplication);
         tray.SetOverlayVisible(config.OverlayVisible);
         tray.SetProfiles(config.Profiles, config.ActiveProfileId);
 
         hotkeys = new HotkeyManager();
+        battlePassStore = new BattlePassStore();
+        battlePassSettings = battlePassStore.LoadSettings();
+        battlePassTracker = new BattlePassTracker(battlePassStore);
+        battlePassOverlay = new BattlePassOverlayForm();
+        battlePassOverlay.SettingsChanged += SaveBattlePassSettings;
+        battlePassOverlay.SettingsPersistRequested += PersistBattlePassSettings;
+        battlePassOverlay.SnapshotChanged += snapshot =>
+        {
+            battlePassStore.SaveSnapshot(snapshot);
+            editor?.ApplyBattlePassState(battlePassSettings, snapshot);
+        };
+        battlePassOverlay.ManualTasksChanged += tasks => battlePassStore.SaveManualTasks(tasks);
+        battlePassOverlay.ScanRequested += page => ScanBattlePass(page);
+        ApplyBattlePassOverlay();
+        battlePassOverlay.SetEditing(battlePassSettings.OverlayEditingEnabled);
+        if (battlePassSettings.OverlayVisible) battlePassOverlay.Show();
         RegisterConfiguredHotkeys();
         dayZSettingsStore = new DayZCompanionSettingsStore();
         dayZSettings = dayZSettingsStore.Load();
@@ -78,6 +100,169 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         store.SaveAtomic(config);
     }
 
+    private void OpenBattlePassSettings()
+    {
+        OpenEditor("tasks");
+    }
+
+    private void OpenBattlePassTasks()
+    {
+        using var form = new BattlePassTasksForm(battlePassStore);
+        form.Changed += () =>
+        {
+            ApplyBattlePassOverlay();
+            editor?.ApplyBattlePassState(battlePassSettings, battlePassStore.LoadSnapshot());
+        };
+        form.ShowDialog();
+    }
+
+    private void ClearBattlePass()
+    {
+        if (MessageBox.Show("Удалить все сохранённые задания Battle Pass?", "Battle Pass", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+        {
+            return;
+        }
+        battlePassStore.SaveSnapshot(new BattlePassSnapshot());
+        ApplyBattlePassOverlay();
+        editor?.ApplyBattlePassState(battlePassSettings, battlePassStore.LoadSnapshot());
+    }
+
+    private void OpenBattlePassDebugScreenshot()
+    {
+        var path = battlePassStore.DebugScreenshotPath;
+        if (path is null)
+        {
+            MessageBox.Show("Отладочный снимок ещё не создан. Включите его сохранение и выполните сканирование.", "Battle Pass", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(path) { UseShellExecute = true });
+    }
+
+    private void ToggleBattlePassOverlay()
+    {
+        battlePassSettings.OverlayVisible = !battlePassSettings.OverlayVisible;
+        SaveBattlePassSettings(battlePassSettings);
+    }
+
+    private void ToggleBattlePassEditing()
+    {
+        if (!battlePassOverlay.Visible)
+        {
+            battlePassSettings.OverlayVisible = true;
+            SaveBattlePassSettings(battlePassSettings);
+        }
+        battlePassSettings.OverlayEditingEnabled = !battlePassSettings.OverlayEditingEnabled;
+        SaveBattlePassSettings(battlePassSettings);
+    }
+
+    private async void ScanBattlePass(BattlePassPage? requestedPage = null)
+    {
+        var wasVisible = battlePassOverlay.Visible;
+        var originalBounds = battlePassOverlay.Bounds;
+        if (wasVisible) battlePassOverlay.Hide();
+        try
+        {
+            await Task.Delay(120);
+            var result = await battlePassTracker.ScanAsync(requestedPage ?? battlePassSettings.CapturePage, battlePassSettings);
+            ApplyBattlePassOverlay();
+            battlePassOverlay.RestoreOverlayBounds(originalBounds);
+            if (!result.Success)
+            {
+                MessageBox.Show(result.Message, "Battle Pass", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+        catch (Exception ex)
+        {
+            AppRuntimeLog.Error("Battle Pass scan failed", ex);
+            MessageBox.Show(ex.Message, "Battle Pass", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            if (wasVisible && battlePassSettings.OverlayVisible)
+            {
+                battlePassOverlay.Show();
+                battlePassOverlay.Refresh();
+            }
+        }
+    }
+
+    private void SaveBattlePassSettings(BattlePassSettings next)
+    {
+        battlePassSettings = next.Clone();
+        battlePassSettings.Normalize();
+        battlePassStore.SaveSettings(battlePassSettings);
+        ApplyBattlePassOverlay();
+        battlePassOverlay.SetEditing(battlePassSettings.OverlayEditingEnabled);
+        if (battlePassSettings.OverlayVisible && !battlePassOverlay.Visible) battlePassOverlay.Show();
+        if (!battlePassSettings.OverlayVisible && battlePassOverlay.Visible) battlePassOverlay.Hide();
+        editor?.ApplyBattlePassState(battlePassSettings, battlePassStore.LoadSnapshot());
+    }
+
+    private void PersistBattlePassSettings(BattlePassSettings next)
+    {
+        battlePassSettings = next.Clone();
+        battlePassSettings.Normalize();
+        battlePassStore.SaveSettings(battlePassSettings);
+        editor?.ApplyBattlePassState(battlePassSettings, battlePassStore.LoadSnapshot());
+    }
+
+    private void HandleBattlePassCommand(string command)
+    {
+        switch (command)
+        {
+            case "scanBattlePass": ScanBattlePass(); break;
+            case "editBattlePassTasks": OpenBattlePassTasks(); break;
+            case "clearBattlePass": ClearBattlePass(); break;
+            case "showBattlePassDebug": OpenBattlePassDebugScreenshot(); break;
+            case "previewBattlePassZones": PreviewBattlePassZones(); break;
+            case "calibrateBattlePassZones": CalibrateBattlePassZones(); break;
+        }
+    }
+
+    private void CalibrateBattlePassZones()
+    {
+        var wasVisible = battlePassOverlay.Visible;
+        if (wasVisible) battlePassOverlay.Hide();
+        try
+        {
+            using var screenshot = battlePassTracker.CaptureCalibrationImage(battlePassSettings);
+            using var form = new BattlePassCalibrationForm((Bitmap)screenshot.Clone(), battlePassSettings);
+            form.Saved += SaveBattlePassSettings;
+            form.ShowDialog();
+        }
+        catch (Exception ex)
+        {
+            AppRuntimeLog.Error("Battle Pass zones calibration failed", ex);
+            MessageBox.Show(ex.Message, "Battle Pass", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            if (wasVisible && battlePassSettings.OverlayVisible) battlePassOverlay.Show();
+        }
+    }
+
+    private void PreviewBattlePassZones()
+    {
+        var wasVisible = battlePassOverlay.Visible;
+        if (wasVisible) battlePassOverlay.Hide();
+        try
+        {
+            battlePassTracker.CreateZonesPreview(battlePassSettings);
+            OpenBattlePassDebugScreenshot();
+        }
+        catch (Exception ex)
+        {
+            AppRuntimeLog.Error("Battle Pass zones preview failed", ex);
+            MessageBox.Show(ex.Message, "Battle Pass", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            if (wasVisible && battlePassSettings.OverlayVisible) battlePassOverlay.Show();
+        }
+    }
+
+    private void ApplyBattlePassOverlay() => battlePassOverlay.Apply(battlePassSettings, battlePassStore.LoadSnapshot(), battlePassStore.LoadManualTasks());
+
     private void OpenEditor()
     {
         OpenEditor(null);
@@ -100,7 +285,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             return;
         }
 
-        editor = new EditorForm(config, updateService, dayZSettings, dayZCompanion.GetStatus(), eventNotifications, initialTab);
+        editor = new EditorForm(config, updateService, dayZSettings, dayZCompanion.GetStatus(), eventNotifications, battlePassSettings, battlePassStore.LoadSnapshot(), initialTab);
         editor.ConfigChanged += nextConfig =>
         {
             var startupChanged = config.StartWithWindows != nextConfig.StartWithWindows;
@@ -145,6 +330,8 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             editor?.ApplyDayZState(dayZSettings, dayZCompanion.GetStatus());
         };
         editor.DayZStatusRequested += () => editor?.ApplyDayZState(dayZSettings, dayZCompanion.GetStatus());
+        editor.BattlePassSettingsChanged += SaveBattlePassSettings;
+        editor.BattlePassCommandRequested += HandleBattlePassCommand;
         editor.ExitRequested += ExitApplication;
         editor.Show();
     }
@@ -206,6 +393,27 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         RegisterHotkey(config.Hotkeys.OpacityDown, () => AdjustOpacity(-15));
         RegisterHotkey(config.Hotkeys.SizeUp, () => AdjustSize(1));
         RegisterHotkey(config.Hotkeys.SizeDown, () => AdjustSize(-1));
+        RegisterHotkey(config.Hotkeys.ToggleBattlePassOverlay, ToggleBattlePassOverlay);
+        RegisterHotkey(config.Hotkeys.ScanBattlePass, () => ScanBattlePass());
+        RegisterHotkey(config.Hotkeys.NextBattlePassDisplayMode, NextBattlePassDisplayMode);
+        RegisterHotkey(config.Hotkeys.ToggleBattlePassDescriptions, ToggleBattlePassDescriptions);
+    }
+
+    private void NextBattlePassDisplayMode()
+    {
+        battlePassSettings.DisplayMode = battlePassSettings.DisplayMode switch
+        {
+            BattlePassDisplayMode.All => BattlePassDisplayMode.Unfinished,
+            BattlePassDisplayMode.Unfinished => BattlePassDisplayMode.Pinned,
+            _ => BattlePassDisplayMode.All
+        };
+        SaveBattlePassSettings(battlePassSettings);
+    }
+
+    private void ToggleBattlePassDescriptions()
+    {
+        battlePassSettings.DescriptionsCollapsed = !battlePassSettings.DescriptionsCollapsed;
+        SaveBattlePassSettings(battlePassSettings);
     }
 
     private void RegisterHotkey(HotkeyBinding binding, Action action)
@@ -275,11 +483,13 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
     private void ExitApplication()
     {
         store.SaveAtomic(config);
+        battlePassStore.SaveSettings(battlePassSettings);
         dayZCompanion.Dispose();
         eventNotifications.Dispose();
         hotkeys.Dispose();
         tray.Dispose();
         overlay.Close();
+        battlePassOverlay.Close();
         editor?.Close();
         ExitThread();
     }

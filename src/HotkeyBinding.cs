@@ -11,6 +11,11 @@ internal sealed class HotkeyBindings
     public HotkeyBinding OpacityDown { get; set; } = DefaultOpacityDown();
     public HotkeyBinding SizeUp { get; set; } = DefaultSizeUp();
     public HotkeyBinding SizeDown { get; set; } = DefaultSizeDown();
+    public HotkeyBinding ToggleBattlePassOverlay { get; set; } = DefaultToggleBattlePassOverlay();
+    public HotkeyBinding ScanBattlePass { get; set; } = DefaultScanBattlePass();
+    public HotkeyBinding EditBattlePassOverlay { get; set; } = DefaultEditBattlePassOverlay();
+    public HotkeyBinding NextBattlePassDisplayMode { get; set; } = DefaultNextBattlePassDisplayMode();
+    public HotkeyBinding ToggleBattlePassDescriptions { get; set; } = DefaultToggleBattlePassDescriptions();
 
     public static HotkeyBindings Default() => new();
 
@@ -21,6 +26,11 @@ internal sealed class HotkeyBindings
     public static HotkeyBinding DefaultOpacityDown() => new(Keys.Down);
     public static HotkeyBinding DefaultSizeUp() => new(Keys.PageUp);
     public static HotkeyBinding DefaultSizeDown() => new(Keys.PageDown);
+    public static HotkeyBinding DefaultToggleBattlePassOverlay() => new(Keys.F8);
+    public static HotkeyBinding DefaultScanBattlePass() => new(Keys.F9);
+    public static HotkeyBinding DefaultEditBattlePassOverlay() => new(Keys.F10);
+    public static HotkeyBinding DefaultNextBattlePassDisplayMode() => new(Keys.F11);
+    public static HotkeyBinding DefaultToggleBattlePassDescriptions() => new(Keys.F12);
 
     public void Normalize()
     {
@@ -31,6 +41,11 @@ internal sealed class HotkeyBindings
         OpacityDown ??= DefaultOpacityDown();
         SizeUp ??= DefaultSizeUp();
         SizeDown ??= DefaultSizeDown();
+        ToggleBattlePassOverlay ??= DefaultToggleBattlePassOverlay();
+        ScanBattlePass ??= DefaultScanBattlePass();
+        EditBattlePassOverlay ??= DefaultEditBattlePassOverlay();
+        NextBattlePassDisplayMode ??= DefaultNextBattlePassDisplayMode();
+        ToggleBattlePassDescriptions ??= DefaultToggleBattlePassDescriptions();
     }
 
     public HotkeyBindings Clone() => new()
@@ -41,7 +56,12 @@ internal sealed class HotkeyBindings
         OpacityUp = OpacityUp.Clone(),
         OpacityDown = OpacityDown.Clone(),
         SizeUp = SizeUp.Clone(),
-        SizeDown = SizeDown.Clone()
+        SizeDown = SizeDown.Clone(),
+        ToggleBattlePassOverlay = ToggleBattlePassOverlay.Clone(),
+        ScanBattlePass = ScanBattlePass.Clone(),
+        EditBattlePassOverlay = EditBattlePassOverlay.Clone(),
+        NextBattlePassDisplayMode = NextBattlePassDisplayMode.Clone(),
+        ToggleBattlePassDescriptions = ToggleBattlePassDescriptions.Clone()
     };
 }
 

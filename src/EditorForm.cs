@@ -2,6 +2,7 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.Diagnostics;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Windows.Forms;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
@@ -12,7 +13,8 @@ internal sealed class EditorForm : Form
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
-        PropertyNameCaseInsensitive = true
+        PropertyNameCaseInsensitive = true,
+        Converters = { new JsonStringEnumConverter() }
     };
 
     private readonly AssetStore assetStore = new();
@@ -23,6 +25,8 @@ internal sealed class EditorForm : Form
     private DayZCompanionSettings dayZSettings;
     private DayZCompanionStatus dayZStatus;
     private readonly DayZEventNotifications eventNotifications;
+    private BattlePassSettings battlePassSettings;
+    private BattlePassSnapshot battlePassSnapshot;
     private UpdateInfo? updateInfo;
     private string? pendingTab;
     private bool webReady;
@@ -33,8 +37,10 @@ internal sealed class EditorForm : Form
     public event Action? ExitRequested;
     public event Action<DayZCompanionSettings>? DayZSettingsChanged;
     public event Action? DayZStatusRequested;
+    public event Action<BattlePassSettings>? BattlePassSettingsChanged;
+    public event Action<string>? BattlePassCommandRequested;
 
-    public EditorForm(AppConfig source, UpdateService updateService, DayZCompanionSettings dayZSettings, DayZCompanionStatus dayZStatus, DayZEventNotifications eventNotifications, string? initialTab = null)
+    public EditorForm(AppConfig source, UpdateService updateService, DayZCompanionSettings dayZSettings, DayZCompanionStatus dayZStatus, DayZEventNotifications eventNotifications, BattlePassSettings battlePassSettings, BattlePassSnapshot battlePassSnapshot, string? initialTab = null)
     {
         this.updateService = updateService;
         pendingTab = initialTab;
@@ -44,6 +50,8 @@ internal sealed class EditorForm : Form
         this.dayZSettings.Normalize();
         this.dayZStatus = dayZStatus;
         this.eventNotifications = eventNotifications;
+        this.battlePassSettings = battlePassSettings.Clone();
+        this.battlePassSnapshot = battlePassSnapshot;
 
         Text = AppIdentity.DisplayName;
         Icon = AppIcons.MainIcon();
@@ -114,6 +122,13 @@ internal sealed class EditorForm : Form
         _ = SendStateAsync();
     }
 
+    public void ApplyBattlePassState(BattlePassSettings settings, BattlePassSnapshot snapshot)
+    {
+        battlePassSettings = settings.Clone();
+        battlePassSnapshot = snapshot;
+        _ = SendStateAsync();
+    }
+
     public void ApplyEventNotificationState(DayZEventNotificationSettings settings, bool monitoring)
     {
         if (IsHandleCreated && InvokeRequired)
@@ -172,6 +187,9 @@ internal sealed class EditorForm : Form
                     break;
                 case "updateDayZSettings":
                     ApplyDayZSettingsFromWeb(root.GetProperty("settings"));
+                    break;
+                case "updateBattlePassSettings":
+                    ApplyBattlePassSettingsFromWeb(root.GetProperty("settings"));
                     break;
                 case "command":
                     await HandleCommandAsync(root.GetProperty("name").GetString());
@@ -255,6 +273,14 @@ internal sealed class EditorForm : Form
             case "openRuntimeLog":
                 OpenFileLocation(AppRuntimeLog.FilePath);
                 break;
+            case "scanBattlePass":
+            case "editBattlePassTasks":
+            case "clearBattlePass":
+            case "showBattlePassDebug":
+            case "previewBattlePassZones":
+            case "calibrateBattlePassZones":
+                if (name is not null) BattlePassCommandRequested?.Invoke(name);
+                break;
             case "connectEventNotifications":
                 if (!dayZStatus.Port.HasValue) throw new DayZCompanionException("Локальный API Companion не запущен.");
                 Process.Start(new ProcessStartInfo(eventNotifications.BeginPairing(dayZStatus.Port.Value)) { UseShellExecute = true });
@@ -287,6 +313,15 @@ internal sealed class EditorForm : Form
         next.Normalize();
         dayZSettings = next;
         DayZSettingsChanged?.Invoke(next);
+    }
+
+    private void ApplyBattlePassSettingsFromWeb(JsonElement settingsElement)
+    {
+        var next = settingsElement.Deserialize<BattlePassSettings>(JsonOptions);
+        if (next is null) return;
+        next.Normalize();
+        battlePassSettings = next;
+        BattlePassSettingsChanged?.Invoke(next);
     }
 
     private void SelectDayZMarkersFile()
@@ -403,6 +438,7 @@ internal sealed class EditorForm : Form
             openTab,
             update = updateInfo,
             dayZ = new { settings = dayZSettings, status = dayZStatus },
+            battlePass = new { settings = battlePassSettings, snapshot = battlePassSnapshot },
             eventNotifications = new
             {
                 settings = eventNotifications.Settings,
@@ -587,7 +623,7 @@ button, input, select {
 .sidebar {
   padding: 14px;
   display: grid;
-  grid-template-rows: auto auto 1fr auto;
+  grid-template-rows: 1fr auto;
   gap: 14px;
 }
 .profile-select, .field select, .field input[type="text"], .number-input {
@@ -603,6 +639,7 @@ button, input, select {
 .nav {
   display: grid;
   gap: 8px;
+  align-content: start;
 }
 .nav button, .action {
   height: 38px;
@@ -657,12 +694,35 @@ button, input, select {
   padding: 14px;
   overflow: auto;
 }
+.editor.updates-editor {
+  display: flex;
+  overflow: hidden;
+}
 .section {
   display: none;
   gap: 10px;
 }
 .section.active {
   display: grid;
+}
+.section.updates-section {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.updates-layout {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  gap: 10px;
+}
+.update-notes-slot, .update-notes-slot .field {
+  min-height: 0;
+}
+.update-notes-slot .field {
+  height: 100%;
+  box-sizing: border-box;
+  grid-template-rows: auto minmax(0, 1fr);
 }
 .section h2 {
   margin: 0 0 4px;
@@ -841,7 +901,8 @@ input[type="color"] {
   color: var(--accent);
 }
 .release-notes {
-  max-height: 260px;
+  min-height: 0;
+  max-height: none;
   overflow: auto;
   color: var(--muted);
 }
@@ -933,9 +994,7 @@ input[type="color"] {
 
   <main class="layout">
     <aside class="panel sidebar">
-      <select id="profileSelect" class="profile-select"></select>
       <div class="nav" id="nav"></div>
-      <div class="limit" id="profileLimit"></div>
       <button class="action danger" id="exitApplication">Выйти из приложения</button>
     </aside>
 
@@ -971,12 +1030,21 @@ const defaultHotkeys = {
   OpacityUp: { Enabled: true, Key: "Up", Control: true, Alt: true, Shift: false, Win: false },
   OpacityDown: { Enabled: true, Key: "Down", Control: true, Alt: true, Shift: false, Win: false },
   SizeUp: { Enabled: true, Key: "PageUp", Control: true, Alt: true, Shift: false, Win: false },
-  SizeDown: { Enabled: true, Key: "PageDown", Control: true, Alt: true, Shift: false, Win: false }
+  SizeDown: { Enabled: true, Key: "PageDown", Control: true, Alt: true, Shift: false, Win: false },
+  ToggleBattlePassOverlay: { Enabled: true, Key: "F8", Control: true, Alt: true, Shift: false, Win: false },
+  ScanBattlePass: { Enabled: true, Key: "F9", Control: true, Alt: true, Shift: false, Win: false },
+  EditBattlePassOverlay: { Enabled: true, Key: "F10", Control: true, Alt: true, Shift: false, Win: false }
+  , NextBattlePassDisplayMode: { Enabled: true, Key: "F11", Control: true, Alt: true, Shift: false, Win: false }
+  , ToggleBattlePassDescriptions: { Enabled: true, Key: "F12", Control: true, Alt: true, Shift: false, Win: false }
 };
 
 const navigation = [
   { tab: ["dayz", "Синхронизация меток"] },
   { tab: ["events", "Уведомления о событиях"] },
+  { id: "tasks", label: "Отслеживание заданий", tabs: [
+    ["tasks", "Настройки"],
+    ["taskhotkeys", "Горячие клавиши"]
+  ] },
   { id: "crosshair", label: "Прицел", tabs: [
     ["crosshair", "Настройка прицела"],
     ["image", "Изображение"],
@@ -1234,6 +1302,7 @@ function renderDataChanged(previous, next) {
     openTab: value.openTab,
     update: value.update,
     dayZSettings: value.dayZ?.settings,
+    battlePass: value.battlePass,
     eventNotifications: value.eventNotifications,
     monitors: value.monitors,
     preview: value.preview
@@ -1249,8 +1318,6 @@ function keepEditedState(previous, next) {
 }
 
 function renderSidebar() {
-  const select = document.getElementById("profileSelect");
-  select.innerHTML = state.config.Profiles.map(p => `<option value="${p.Id}" ${p.Id === state.config.ActiveProfileId ? "selected" : ""}>${escapeHtml(p.Name)}</option>`).join("");
   document.getElementById("nav").innerHTML = navigation.map(item => {
     if (item.tab) {
       const [id, label] = item.tab;
@@ -1260,7 +1327,6 @@ function renderSidebar() {
     const children = item.tabs.map(([id, label]) => `<button class="${id === activeTab ? "active" : ""}" data-tab="${id}">${label}</button>`).join("");
     return `<div class="nav-group"><button class="nav-group-toggle" data-nav-group="${item.id}">${item.label}<span>${open ? "▾" : "▸"}</span></button>${open ? `<div class="nav-children">${children}</div>` : ""}</div>`;
   }).join("");
-  document.getElementById("profileLimit").textContent = `${state.config.Profiles.length} профилей`;
 }
 
 function expandNavForTab(tab) {
@@ -1275,13 +1341,17 @@ function renderEditor() {
     crosshair: renderCrosshair(),
     image: renderImage(),
     hotkeys: renderHotkeys(),
+    taskhotkeys: renderBattlePassHotkeys(),
     monitor: renderMonitor(),
     dayz: renderDayZ(),
     events: renderEvents(),
+    tasks: renderBattlePass(),
     profiles: renderProfiles(),
     updates: renderUpdates()
   };
-  document.getElementById("editor").innerHTML = `<div class="section active">${sections[activeTab]}</div>`;
+  const editor = document.getElementById("editor");
+  editor.classList.toggle("updates-editor", activeTab === "updates");
+  editor.innerHTML = `<div class="section active ${activeTab === "updates" ? "updates-section" : ""}">${sections[activeTab]}</div>`;
   if (activeTab === "crosshair") {
     organizeCrosshairSection();
   }
@@ -1487,8 +1557,39 @@ function renderMonitor() {
   `;
 }
 
+function renderBattlePass() {
+  const bp = state.battlePass || { settings: {}, snapshot: { Tasks: [] } };
+  const s = bp.settings;
+  const tasks = bp.snapshot?.Tasks || [];
+  const monitors = [{ DeviceName: "", DisplayName: "Основной монитор" }, ...state.monitors];
+  const monitorOptions = monitors.map(m => `<option value="${m.DeviceName}" ${m.DeviceName === (s.MonitorDeviceName || "") ? "selected" : ""}>${escapeHtml(m.DisplayName)}</option>`).join("");
+  return `
+    <h2>Отслеживание заданий</h2>
+    <div class="limit">Откройте Battle Pass в DayZ, выберите тип страницы ниже и нажмите «Считать экран». Для еженедельных заданий повторите для страниц 1 и 2.</div>
+    ${field("Монитор", { input: `<select data-bp-select="MonitorDeviceName">${monitorOptions}</select>` })}
+    ${field("Оверлей", { input: `<label><input type="checkbox" data-bp-check="OverlayVisible" ${s.OverlayVisible ? "checked" : ""}> Показывать</label> <label><input type="checkbox" data-bp-check="ShowCompleted" ${s.ShowCompleted ? "checked" : ""}> Выполненные</label> <label><input type="checkbox" data-bp-check="ShowSeasonal" ${s.ShowSeasonal ? "checked" : ""}> Сезонные</label> <label><input type="checkbox" data-bp-check="ShowTaskDescriptions" ${s.ShowTaskDescriptions ? "checked" : ""}> Показывать описания</label> <label><input type="checkbox" data-bp-check="OverlayEditingEnabled" ${s.OverlayEditingEnabled ? "checked" : ""}> Перемещение и изменение размера</label> <label><input type="checkbox" data-bp-check="SaveDebugScreenshot" ${s.SaveDebugScreenshot ? "checked" : ""}> Сохранять отладочный снимок</label>` })}
+    ${field("Размер", { input: `<label>Ширина <input type="number" min="220" max="900" value="${s.Width || 360}" data-bp-number="Width"></label> <label>Высота <input type="number" min="92" max="850" value="${s.Height || 470}" data-bp-number="Height"></label> <label>Шрифт <input type="number" min="9" max="28" value="${s.FontSize || 14}" data-bp-number="FontSize"></label> <label>Прозрачность <input type="number" min="40" max="255" value="${s.Opacity || 230}" data-bp-number="Opacity"></label>` })}
+    <div class="limit">Для точной настройки используйте «Настроить зоны на экране»: зоны можно перетаскивать и менять их размер прямо поверх текущего изображения Battle Pass.</div>
+    <div class="actions"><button class="action primary" data-command="calibrateBattlePassZones">Настроить зоны на экране</button><button class="action" data-command="previewBattlePassZones">Предпросмотр зон</button><button class="action primary" data-command="scanBattlePass">Считать экран</button><button class="action" data-command="editBattlePassTasks">Проверить и исправить</button><button class="action" data-command="showBattlePassDebug">Открыть отладочный снимок</button><button class="action danger" data-command="clearBattlePass">Очистить данные</button></div>
+    <div class="update-status">Последнее обновление: ${bp.snapshot?.UpdatedAt ? escapeHtml(new Date(bp.snapshot.UpdatedAt).toLocaleString()) : "ещё не выполнялось"}. Сохранено заданий: ${tasks.length}.</div>
+  `;
+}
+
+function renderBattlePassHotkeys() {
+  const keys = [
+    ["ToggleBattlePassOverlay", "Показать или скрыть оверлей"],
+    ["ScanBattlePass", "Считать экран"],
+    ["ToggleBattlePassDescriptions", "Свернуть/развернуть описания"]
+  ];
+  return `<h2>Отслеживание заданий — горячие клавиши</h2>` + keys.map(([key, label]) => {
+    const binding = state.config.Hotkeys[key];
+    return field(label, { input: `<div class="actions"><button class="action" data-hotkey="${key}">${displayHotkey(binding)}</button><button class="action" data-hotkey-clear="${key}">Очистить</button></div>` });
+  }).join("");
+}
+
 function renderProfiles() {
   const selected = selectedProfile();
+  const profileOptions = state.config.Profiles.map(profile => `<option value="${profile.Id}" ${profile.Id === state.config.ActiveProfileId ? "selected" : ""}>${escapeHtml(profile.Name)}</option>`).join("");
   const list = state.config.Profiles.map(profile => `
     <button type="button" class="${profile.Id === selected.Id ? "active" : ""}" data-profile-select="${profile.Id}">
       ${escapeHtml(profile.Name)}
@@ -1496,6 +1597,7 @@ function renderProfiles() {
   `).join("");
   return `
     <h2>Профили</h2>
+    ${field("Активный профиль", { input: `<select id="profileSelect" class="profile-select">${profileOptions}</select>` })}
     ${field("Список профилей", { input: `<div class="profile-list">${list}</div>` })}
     ${text("Название профиля", "profileName", selected.Name)}
     <div class="actions">
@@ -1622,16 +1724,16 @@ function renderUpdates() {
   const notes = (info.ReleaseNotes || "Описание версии не указано.").trim();
   const downloadDisabled = !info.InstallerUrl && !info.ReleaseUrl ? "disabled" : "";
 
-  return `
-    <h2>Обновление</h2>
-    ${field("Статус", { input: `<div class="update-status">${status}<span>Текущая версия: ${escapeHtml(info.CurrentVersion)}</span><span>Последняя версия: ${escapeHtml(info.LatestVersion || "-")}${published ? " от " + escapeHtml(published) : ""}</span></div>` })}
-    ${field("Описание версии", { input: `<div class="release-notes">${renderMarkdown(notes)}</div>` })}
-    <div class="actions">
-      <button class="action" data-command="checkUpdate">Проверить снова</button>
-      <button class="action primary" data-command="downloadUpdate" ${downloadDisabled}>Скачать установщик</button>
-      <button class="action" data-command="openCompanionReleases">Открыть релизы</button>
-    </div>
-  `;
+  return `<div class="updates-layout">
+      <h2>Обновление</h2>
+      ${field("Статус", { input: `<div class="update-status">${status}<span>Текущая версия: ${escapeHtml(info.CurrentVersion)}</span><span>Последняя версия: ${escapeHtml(info.LatestVersion || "-")}${published ? " от " + escapeHtml(published) : ""}</span></div>` })}
+      <div class="update-notes-slot">${field("Описание версии", { input: `<div class="release-notes">${renderMarkdown(notes)}</div>` })}</div>
+      <div class="actions">
+        <button class="action" data-command="checkUpdate">Проверить снова</button>
+        <button class="action primary" data-command="downloadUpdate" ${downloadDisabled}>Скачать установщик</button>
+        <button class="action" data-command="openCompanionReleases">Открыть релизы</button>
+      </div>
+  </div>`;
 }
 
 function bindEditorEvents() {
@@ -1686,6 +1788,10 @@ function bindEditorEvents() {
       updateDayZ(settings => settings[input.dataset.dayzNumber] = value);
     });
   });
+  document.querySelectorAll("[data-bp-check]").forEach(input => input.addEventListener("change", () => updateBattlePass(settings => settings[input.dataset.bpCheck] = input.checked)));
+  document.querySelectorAll("[data-bp-select]").forEach(input => input.addEventListener("change", () => updateBattlePass(settings => settings[input.dataset.bpSelect] = input.value || null)));
+  document.querySelectorAll("[data-bp-number]").forEach(input => input.addEventListener("change", () => updateBattlePass(settings => settings[input.dataset.bpNumber] = Number(input.value))));
+  document.querySelectorAll("[data-bp-percent]").forEach(input => input.addEventListener("change", () => updateBattlePass(settings => settings[input.dataset.bpPercent] = Number(input.value) / 100)));
   document.querySelectorAll("[data-event-check]").forEach(input => input.addEventListener("change", () => updateDayZ(settings => settings.EventNotifications[input.dataset.eventCheck] = input.checked)));
   document.querySelectorAll("[data-event-number]").forEach(input => input.addEventListener("change", () => updateDayZ(settings => settings.EventNotifications[input.dataset.eventNumber] = Math.min(Number(input.max), Math.max(Number(input.min), Number(input.value || input.min))))));
   document.querySelectorAll("[data-event-text]").forEach(input => input.addEventListener("change", () => updateDayZ(settings => settings.EventNotifications[input.dataset.eventText] = input.value.trim())));
@@ -1773,6 +1879,10 @@ function bindEditorEvents() {
   document.querySelectorAll("[data-hotkey-default]").forEach(button => {
     button.addEventListener("click", () => update(config => config.Hotkeys[button.dataset.hotkeyDefault] = clone(defaultHotkeys[button.dataset.hotkeyDefault])));
   });
+  const profileSelect = document.getElementById("profileSelect");
+  if (profileSelect) profileSelect.addEventListener("change", event => {
+    update(config => config.ActiveProfileId = event.target.value);
+  });
   const name = document.getElementById("profileName");
   if (name) name.addEventListener("input", () => {
     const nextName = name.value.trim() || String.fromCharCode(1055, 1088, 1080, 1094, 1077, 1083);
@@ -1859,6 +1969,14 @@ function updateDayZ(mutator) {
   mutator(next);
   state.dayZ.settings = next;
   post({ type: "updateDayZSettings", settings: next });
+  render();
+}
+
+function updateBattlePass(mutator) {
+  const next = clone(state.battlePass.settings);
+  mutator(next);
+  state.battlePass.settings = next;
+  post({ type: "updateBattlePassSettings", settings: next });
   render();
 }
 
@@ -1991,9 +2109,6 @@ document.addEventListener("click", event => {
   }
 });
 
-document.getElementById("profileSelect").addEventListener("change", event => {
-  update(config => config.ActiveProfileId = event.target.value);
-});
 document.getElementById("exitApplication").addEventListener("click", () => post({ type: "command", name: "exitApplication" }));
 
 document.addEventListener("click", event => {

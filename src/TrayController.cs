@@ -16,6 +16,8 @@ internal sealed class TrayController : IDisposable
         Action onOpenEditor,
         Action onOpenUpdates,
         Action<string> onSelectProfile,
+        Action onOpenBattlePass,
+        Action onScanBattlePass,
         Action onExit)
     {
         this.onSelectProfile = onSelectProfile;
@@ -30,6 +32,8 @@ internal sealed class TrayController : IDisposable
         menu.Items.Add(profilesItem);
         menu.Items.Add(editorItem);
         menu.Items.Add(updatesItem);
+        menu.Items.Add(new ToolStripMenuItem("Battle Pass: настройки", null, (_, _) => onOpenBattlePass()));
+        menu.Items.Add(new ToolStripMenuItem("Battle Pass: считать экран", null, (_, _) => onScanBattlePass()));
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(exitItem);
 

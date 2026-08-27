@@ -31,7 +31,8 @@ var tests = new (string Name, Action Run)[]
     ("привязка Companion обменивает код через mock API", CompanionPairingUsesMockApi),
     ("доставка события отправляет multipart через mock API", CompanionDeliveryUsesMockApi),
     ("отозванная сервером сессия удаляется локально", RevokedCompanionSessionIsCleared),
-    ("отключение Companion отзывает устройство на сервере", CompanionDisconnectRevokesDevice)
+    ("отключение Companion отзывает устройство на сервере", CompanionDisconnectRevokesDevice),
+    ("Battle Pass settings normalise OCR layout", BattlePassSettingsNormalize)
 };
 
 var failures = new List<string>();
@@ -446,6 +447,17 @@ static ImportRequest Request(string server, string mode, string markers)
 {
     using var document = JsonDocument.Parse(markers);
     return new ImportRequest(server, mode, document.RootElement.EnumerateArray().Select(marker => marker.Clone()).ToList());
+}
+
+static void BattlePassSettingsNormalize()
+{
+    var settings = new BattlePassSettings { TitleX = -1, TitleWidth = 5, ProgressX = 8, FirstRowY = -4, RowStep = 2, Width = 1, DisplayMode = (BattlePassDisplayMode)99, ShowDaily = false, ShowWeekly = false };
+    settings.Normalize();
+    Equal(0d, settings.TitleX, "TitleX должен быть ограничен");
+    True(settings.TitleWidth <= 1, "ширина OCR-зоны не должна выходить за экран");
+    True(settings.ProgressX <= .95, "ProgressX должен быть ограничен");
+    Equal(BattlePassDisplayMode.Unfinished, settings.DisplayMode, "некорректный режим должен быть заменён");
+    True(settings.ShowDaily || settings.ShowWeekly || settings.ShowSeasonal, "должен остаться хотя бы один тип задач");
 }
 
 static void Equal<T>(T expected, T actual, string message)
