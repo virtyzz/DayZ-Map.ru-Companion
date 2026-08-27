@@ -79,7 +79,10 @@ static void MergeDeduplicatesAndUpdates()
 static void OcrClassifiesGameEvents()
 {
     Equal("military_convoy", DayZEventNotifications.Classify("Военный конвой остановился"), "конвой не распознан");
-    Equal("camp", DayZEventNotifications.Classify("Лагерь обнаружен"), "лагерь не распознан");
+    Equal("camp", DayZEventNotifications.Classify("Военный лагерь обнаружен"), "военный лагерь не распознан");
+    Equal(null, DayZEventNotifications.Classify("Лагерь обнаружен"), "обычный лагерь не должен распознаваться");
+    Equal("sectant_ritual", DayZEventNotifications.Classify("Сектанты начинают ритуал"), "ритуал сектантов не распознан");
+    Equal("chemical_accident", DayZEventNotifications.Classify("Химическая авария произошла"), "химическая авария не распознана");
     Equal("loading", DayZEventNotifications.Classify("Погрузка завершена"), "погрузка не распознана");
     Equal("area_clearance", DayZEventNotifications.Classify("Зачистка местности завершена"), "зачистка не распознана");
 }
@@ -145,15 +148,16 @@ static void CompanionDeliveryUsesMockApi()
         var content = request.Content as MultipartFormDataContent;
         True(content is not null, "событие передано не как multipart");
         var parts = content!.ToList();
-        True(parts.Any(part => part.Headers.ContentDisposition?.Name?.Trim('"') == "event_type"), "в multipart нет типа события");
-        var image = parts.Single(part => part.Headers.ContentDisposition?.Name?.Trim('"') == "image");
+        Equal(1, parts.Count, "в Discord должен отправляться только скриншот");
+        var image = parts.Single();
+        Equal("image", image.Headers.ContentDisposition?.Name?.Trim('"'), "скриншот передан в неверном поле");
         Equal("image/png", image.Headers.ContentType?.MediaType, "изображение передано в неверном формате");
         return new HttpResponseMessage(HttpStatusCode.OK);
     });
     var settings = new DayZEventNotificationSettings { BackendUrl = "https://mock.dayz-map.test/profiles-api", DeviceTokenProtected = Protect("device-token") };
     using var notifications = new DayZEventNotifications(settings, handler);
     using var image = new System.Drawing.Bitmap(2, 2);
-    notifications.SendEventAsync("military_convoy", "Военный конвой", (System.Drawing.Bitmap)image.Clone(), CancellationToken.None).GetAwaiter().GetResult();
+    notifications.SendEventAsync("military_convoy", (System.Drawing.Bitmap)image.Clone(), CancellationToken.None).GetAwaiter().GetResult();
     True(settings.LastDeliveryAt is not null, "успешная доставка не записала время");
     Equal(1, handler.Requests.Count, "доставка выполнила лишние запросы");
 }

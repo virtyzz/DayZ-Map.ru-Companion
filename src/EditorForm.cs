@@ -810,6 +810,33 @@ input[type="color"] {
   word-break: break-word;
   scrollbar-color: #6e4c1b #17171a;
 }
+.event-zone-settings {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  background: #1d1d21;
+  border: 1px solid var(--soft);
+  border-radius: 10px;
+}
+.event-zone-settings summary {
+  cursor: pointer;
+  color: var(--text);
+  font-weight: 700;
+}
+.event-notification-actions .danger {
+  grid-column: 1;
+}
+.event-toggles {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 16px;
+}
+.event-toggles label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+}
 .update-status strong {
   color: var(--accent);
 }
@@ -930,6 +957,7 @@ const bridge = window.chrome.webview;
 let state = null;
 let activeTab = "crosshair";
 let hotkeyCapture = null;
+let eventZoneSettingsOpen = false;
 let pendingConfig = null;
 let pendingConfigTimer = null;
 let selectedProfileId = null;
@@ -1552,21 +1580,21 @@ function renderEvents() {
   return `
     <h2>Уведомления о событиях</h2>
     ${field("Связь DayZ-Map / Discord", { input: `<div class="update-status">${escapeHtml(connected)}<span>${escapeHtml(error)}</span><span>Последняя доставка: ${escapeHtml(delivery)}</span></div>` })}
-    ${field("Адрес DayZ-Map API", { input: `<input type="url" value="${escapeHtml(settings.BackendUrl)}" data-event-text="BackendUrl">` })}
+    ${field("Мониторить игровые уведомления", { value: `<input type="checkbox" ${settings.Enabled ? "checked" : ""} data-event-check="Enabled">`, input: `` })}
+    ${field("Изображение", { input: `<div class="limit">В Discord отправляется только скриншот области уведомления.</div>` })}
+    <div class="actions event-notification-actions"><button class="action primary" data-command="connectEventNotifications" ${isConnected ? "disabled" : ""}>${isConnected ? "DayZ-Map подключён" : "Войти через DayZ-Map"}</button><button class="action" data-command="testEventNotifications" ${isConnected ? "" : "disabled"}>Проверить Discord-уведомление</button><button class="action danger" data-command="disconnectEventNotifications" ${isConnected ? "" : "disabled"}>Отключить</button></div>
     ${field("Tesseract OCR", { input: `<div class="update-status">${escapeHtml(ocr?.Message || "Проверка OCR ещё не выполнена.")}</div><div class="actions"><button class="action primary" data-command="installEventOcr" ${ocr?.Ready ? "disabled" : ""}>Установить Tesseract</button><button class="action" data-command="refreshEventOcr">Проверить снова</button></div>` })}
     ${field("Окно DayZ", { input: `<select data-event-text="WindowTitle"><option value="" ${!settings.WindowTitle ? "selected" : ""}>Автоматически: первое найденное окно</option>${windows.map(window => `<option value="${escapeHtml(window.Title)}" ${window.Title === settings.WindowTitle ? "selected" : ""}>${escapeHtml(window.Title)} (${window.width}×${window.height})</option>`).join("")}</select><div class="limit">Список обновляется при открытии вкладки. Если выбранное окно закрыто, мониторинг остановится с понятной ошибкой.</div>` })}
-    ${renderCaptureZone("Зона: верхняя левая", "TopLeftZone", settings.TopLeftZone)}
-    ${renderCaptureZone("Зона: верхняя центральная", "TopCenterZone", settings.TopCenterZone)}
-    ${field("Предпросмотр зон", { input: `<div class="update-status">${escapeHtml(capturePreview?.Message || "Предпросмотр ещё не создан.")}${renderCaptureCalibration(capturePreview, settings)}</div><div class="actions"><button class="action" data-command="previewEventCapture">Обновить предпросмотр</button><button class="action" data-event-reset-zones>Сбросить зоны</button></div>` })}
-    ${field("Мониторить игровые уведомления", { value: `<input type="checkbox" ${settings.Enabled ? "checked" : ""} data-event-check="Enabled">`, input: `` })}
+    <details class="event-zone-settings" data-event-zone-settings ${eventZoneSettingsOpen ? "open" : ""}>
+      <summary>Настройка зон</summary>
+      ${renderCaptureZone("Зона: верхняя левая", "TopLeftZone", settings.TopLeftZone)}
+      ${renderCaptureZone("Зона: верхняя центральная", "TopCenterZone", settings.TopCenterZone)}
+      ${field("Предпросмотр зон", { input: `<div class="update-status">${escapeHtml(capturePreview?.Message || "Предпросмотр ещё не создан.")}${renderCaptureCalibration(capturePreview, settings)}</div><div class="actions"><button class="action" data-command="previewEventCapture">Обновить предпросмотр</button><button class="action" data-event-reset-zones>Сбросить зоны</button></div>` })}
+    </details>
     ${field("Интервал проверки, мс", { input: `<input type="number" min="200" max="2000" value="${settings.PollIntervalMs}" data-event-number="PollIntervalMs">` })}
     ${field("Минимальный повтор, сек", { input: `<input type="number" min="5" max="3600" value="${settings.DuplicateIntervalSeconds}" data-event-number="DuplicateIntervalSeconds">` })}
-    ${field("Военный конвой", { value: `<input type="checkbox" ${settings.MilitaryConvoy ? "checked" : ""} data-event-check="MilitaryConvoy">`, input: `` })}
-    ${field("Лагерь", { value: `<input type="checkbox" ${settings.Camp ? "checked" : ""} data-event-check="Camp">`, input: `` })}
-    ${field("Погрузка", { value: `<input type="checkbox" ${settings.Loading ? "checked" : ""} data-event-check="Loading">`, input: `` })}
-    ${field("Зачистка местности", { value: `<input type="checkbox" ${settings.AreaClearance ? "checked" : ""} data-event-check="AreaClearance">`, input: `` })}
-    ${field("Изображение", { value: `<input type="checkbox" ${settings.SendFullFrame ? "checked" : ""} data-event-check="SendFullFrame">`, input: `<div class="limit">Включено — отправляется полный кадр окна DayZ; выключено — только область уведомления.</div>` })}
-    <div class="actions"><button class="action primary" data-command="connectEventNotifications" ${isConnected ? "disabled" : ""}>${isConnected ? "DayZ-Map подключён" : "Войти через DayZ-Map"}</button><button class="action" data-command="testEventNotifications" ${isConnected ? "" : "disabled"}>Проверить Discord-уведомление</button><button class="action danger" data-command="disconnectEventNotifications" ${isConnected ? "" : "disabled"}>Отключить</button></div>
+    ${field("События", { input: `<div class="event-toggles"><label><input type="checkbox" ${settings.MilitaryConvoy ? "checked" : ""} data-event-check="MilitaryConvoy">Военный конвой</label><label><input type="checkbox" ${settings.Camp ? "checked" : ""} data-event-check="Camp">Военный лагерь</label><label><input type="checkbox" ${settings.SectantRitual ? "checked" : ""} data-event-check="SectantRitual">Ритуал сектантов</label><label><input type="checkbox" ${settings.ChemicalAccident ? "checked" : ""} data-event-check="ChemicalAccident">Химическая авария</label><label><input type="checkbox" ${settings.Loading ? "checked" : ""} data-event-check="Loading">Погрузка</label><label><input type="checkbox" ${settings.AreaClearance ? "checked" : ""} data-event-check="AreaClearance">Зачистка местности</label></div>` })}
+    ${field("Адрес DayZ-Map API", { input: `<input type="url" value="${escapeHtml(settings.BackendUrl)}" data-event-text="BackendUrl">` })}
     ${field("Локальный журнал", { input: `<div class="update-status event-log">${log.length ? log.map(item => `<span>${escapeHtml(new Date(item.At).toLocaleTimeString())} — ${escapeHtml(item.Message)}</span>`).join("") : "Событий в этой сессии пока нет."}</div><div class="actions"><button class="action" data-command="clearEventLog" ${log.length ? "" : "disabled"}>Очистить журнал</button></div>` })}
     <div class="limit">Захват выполняется только из двух зон окна DayZ: верхней левой и верхней центральной. Нужен установленный Tesseract OCR с языками rus и eng. Companion не читает память игры и не эмулирует ввод.</div>
   `;
@@ -1662,6 +1690,8 @@ function bindEditorEvents() {
   document.querySelectorAll("[data-event-number]").forEach(input => input.addEventListener("change", () => updateDayZ(settings => settings.EventNotifications[input.dataset.eventNumber] = Math.min(Number(input.max), Math.max(Number(input.min), Number(input.value || input.min))))));
   document.querySelectorAll("[data-event-text]").forEach(input => input.addEventListener("change", () => updateDayZ(settings => settings.EventNotifications[input.dataset.eventText] = input.value.trim())));
   document.querySelectorAll("[data-event-zone]").forEach(input => input.addEventListener("change", () => updateDayZ(settings => settings.EventNotifications[input.dataset.eventZone][input.dataset.eventZoneValue] = Math.min(100, Math.max(0, Number(input.value || 0))) / 100)));
+  const zoneSettings = document.querySelector("[data-event-zone-settings]");
+  if (zoneSettings) zoneSettings.addEventListener("toggle", () => eventZoneSettingsOpen = zoneSettings.open);
   document.querySelectorAll("[data-event-reset-zones]").forEach(button => button.addEventListener("click", () => updateDayZ(settings => {
     settings.EventNotifications.TopLeftZone = { X: .04, Y: .06, Width: .30, Height: .11 };
     settings.EventNotifications.TopCenterZone = { X: .38, Y: .06, Width: .24, Height: .11 };

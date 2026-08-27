@@ -33,17 +33,18 @@ internal sealed class DayZEventNotificationSettings
     public string LastError { get; set; } = "";
     public bool MilitaryConvoy { get; set; } = true;
     public bool Camp { get; set; } = true;
+    public bool SectantRitual { get; set; } = true;
+    public bool ChemicalAccident { get; set; } = true;
     public bool Loading { get; set; } = true;
     public bool AreaClearance { get; set; } = true;
-    public bool SendFullFrame { get; set; }
     public string WindowTitle { get; set; } = "";
     public DayZCaptureZone TopLeftZone { get; set; } = new(.04, .06, .30, .11);
     public DayZCaptureZone TopCenterZone { get; set; } = new(.38, .06, .24, .11);
-    public int PollIntervalMs { get; set; } = 350;
-    public int DuplicateIntervalSeconds { get; set; } = 15;
-    public void Normalize() { PollIntervalMs = Math.Clamp(PollIntervalMs, 200, 2000); DuplicateIntervalSeconds = Math.Clamp(DuplicateIntervalSeconds, 5, 3600); BackendUrl = string.IsNullOrWhiteSpace(BackendUrl) ? "https://dayz-map.ru/profiles-api" : BackendUrl.TrimEnd('/'); WindowTitle ??= ""; TopLeftZone ??= new(.04, .06, .30, .11); TopCenterZone ??= new(.38, .06, .24, .11); if (IsLegacyZone(TopLeftZone, 0, 0, .42, .30) || IsLegacyZone(TopLeftZone, .03, .05, .32, .14)) TopLeftZone = new(.04, .06, .30, .11); if (IsLegacyZone(TopCenterZone, .28, 0, .44, .24) || IsLegacyZone(TopCenterZone, .35, .05, .30, .14)) TopCenterZone = new(.38, .06, .24, .11); TopLeftZone.Normalize(); TopCenterZone.Normalize(); }
+    public int PollIntervalMs { get; set; } = 1500;
+    public int DuplicateIntervalSeconds { get; set; } = 20;
+    public void Normalize() { if (PollIntervalMs == 350) PollIntervalMs = 1500; if (DuplicateIntervalSeconds == 15) DuplicateIntervalSeconds = 20; PollIntervalMs = Math.Clamp(PollIntervalMs, 200, 2000); DuplicateIntervalSeconds = Math.Clamp(DuplicateIntervalSeconds, 5, 3600); BackendUrl = string.IsNullOrWhiteSpace(BackendUrl) ? "https://dayz-map.ru/profiles-api" : BackendUrl.TrimEnd('/'); WindowTitle ??= ""; TopLeftZone ??= new(.04, .06, .30, .11); TopCenterZone ??= new(.38, .06, .24, .11); if (IsLegacyZone(TopLeftZone, 0, 0, .42, .30) || IsLegacyZone(TopLeftZone, .03, .05, .32, .14)) TopLeftZone = new(.04, .06, .30, .11); if (IsLegacyZone(TopCenterZone, .28, 0, .44, .24) || IsLegacyZone(TopCenterZone, .35, .05, .30, .14)) TopCenterZone = new(.38, .06, .24, .11); TopLeftZone.Normalize(); TopCenterZone.Normalize(); }
     public DayZEventNotificationSettings Clone() => (DayZEventNotificationSettings)MemberwiseClone();
-    public void CopyFrom(DayZEventNotificationSettings source) { Enabled = source.Enabled; BackendUrl = source.BackendUrl; DeviceTokenProtected = source.DeviceTokenProtected; ConnectedUser = source.ConnectedUser; DeviceId = source.DeviceId; LastDeliveryAt = source.LastDeliveryAt; LastError = source.LastError; MilitaryConvoy = source.MilitaryConvoy; Camp = source.Camp; Loading = source.Loading; AreaClearance = source.AreaClearance; SendFullFrame = source.SendFullFrame; WindowTitle = source.WindowTitle; TopLeftZone = source.TopLeftZone?.Clone() ?? new(.04, .06, .30, .11); TopCenterZone = source.TopCenterZone?.Clone() ?? new(.38, .06, .24, .11); PollIntervalMs = source.PollIntervalMs; DuplicateIntervalSeconds = source.DuplicateIntervalSeconds; Normalize(); }
+    public void CopyFrom(DayZEventNotificationSettings source) { Enabled = source.Enabled; BackendUrl = source.BackendUrl; DeviceTokenProtected = source.DeviceTokenProtected; ConnectedUser = source.ConnectedUser; DeviceId = source.DeviceId; LastDeliveryAt = source.LastDeliveryAt; LastError = source.LastError; MilitaryConvoy = source.MilitaryConvoy; Camp = source.Camp; SectantRitual = source.SectantRitual; ChemicalAccident = source.ChemicalAccident; Loading = source.Loading; AreaClearance = source.AreaClearance; WindowTitle = source.WindowTitle; TopLeftZone = source.TopLeftZone?.Clone() ?? new(.04, .06, .30, .11); TopCenterZone = source.TopCenterZone?.Clone() ?? new(.38, .06, .24, .11); PollIntervalMs = source.PollIntervalMs; DuplicateIntervalSeconds = source.DuplicateIntervalSeconds; Normalize(); }
     private static bool IsLegacyZone(DayZCaptureZone zone, double x, double y, double width, double height) => Math.Abs(zone.X - x) < .001 && Math.Abs(zone.Y - y) < .001 && Math.Abs(zone.Width - width) < .001 && Math.Abs(zone.Height - height) < .001;
 }
 
@@ -201,15 +202,17 @@ internal sealed class DayZEventNotifications : IDisposable
             if ((first ? topLeftHash : topCenterHash) == hash) continue; if (first) topLeftHash = hash; else topCenterHash = hash;
             var text = await OcrAsync(image); var type = Classify(text); if (type is null) { LogUnrecognizedOcr(text); continue; } if (!Enabled(type)) { AddLog("filtered", $"{EventName(type)}: отключено в настройках."); continue; }
             if (!duplicateGate.TryAccept(type, DateTimeOffset.Now, TimeSpan.FromSeconds(settings.DuplicateIntervalSeconds))) { AddLog("filtered", $"{EventName(type)}: повтор отфильтрован."); continue; } AddLog("detected", $"Распознано: {EventName(type)}.");
-            await SendEventAsync(type, CleanEventText(type, text), settings.SendFullFrame ? (Bitmap)frame.Clone() : (Bitmap)image.Clone(), ct);
+            await SendEventAsync(type, (Bitmap)image.Clone(), ct);
         }
     }
-    internal async Task SendEventAsync(string type, string text, Bitmap image, CancellationToken ct)
+    internal async Task SendEventAsync(string type, Bitmap image, CancellationToken ct)
     {
         using (image)
         using (var request = Authorized(HttpMethod.Post, "companion/events"))
         {
-            var form = new MultipartFormDataContent { { new StringContent(type), "event_type" }, { new StringContent(text), "text" }, { new StringContent(DateTimeOffset.UtcNow.ToString("O")), "detected_at" } };
+            // OCR and event metadata are used locally only to decide whether an
+            // event should be delivered. The Discord notification is the image.
+            var form = new MultipartFormDataContent();
             var file = new ByteArrayContent(Png(image)); file.Headers.ContentType = new MediaTypeHeaderValue("image/png"); form.Add(file, "image", "dayz-event.png"); request.Content = form;
             using var response = await http.SendAsync(request, ct); HandleServerRevocation(response); if (!response.IsSuccessStatusCode) throw new DayZCompanionException("Событие не доставлено: " + Problem(await response.Content.ReadAsStringAsync(ct)));
         }
@@ -232,9 +235,9 @@ internal sealed class DayZEventNotifications : IDisposable
         settings.LastError = "";
     }
     private string Token() { try { return string.IsNullOrEmpty(settings.DeviceTokenProtected) ? "" : Encoding.UTF8.GetString(ProtectedData.Unprotect(Convert.FromBase64String(settings.DeviceTokenProtected), null, DataProtectionScope.CurrentUser)); } catch { return ""; } }
-    private bool Enabled(string type) => type switch { "military_convoy" => settings.MilitaryConvoy, "camp" => settings.Camp, "loading" => settings.Loading, "area_clearance" => settings.AreaClearance, _ => false };
-    private static string EventName(string type) => type switch { "military_convoy" => "Военный конвой", "camp" => "Лагерь", "loading" => "Погрузка", "area_clearance" => "Зачистка местности", _ => type };
-    internal static string? Classify(string text) { var value = Normalize(text); if (value.Contains("военн") && value.Contains("конво")) return "military_convoy"; if (value.Contains("лагер")) return "camp"; if (value.Contains("погруз")) return "loading"; return value.Contains("зачист") && value.Contains("местност") ? "area_clearance" : null; }
+    private bool Enabled(string type) => type switch { "military_convoy" => settings.MilitaryConvoy, "camp" => settings.Camp, "sectant_ritual" => settings.SectantRitual, "chemical_accident" => settings.ChemicalAccident, "loading" => settings.Loading, "area_clearance" => settings.AreaClearance, _ => false };
+    private static string EventName(string type) => type switch { "military_convoy" => "Военный конвой", "camp" => "Военный лагерь", "sectant_ritual" => "Ритуал сектантов", "chemical_accident" => "Химическая авария", "loading" => "Погрузка", "area_clearance" => "Зачистка местности", _ => type };
+    internal static string? Classify(string text) { var value = Normalize(text); if (value.Contains("военн") && value.Contains("конво")) return "military_convoy"; if (value.Contains("военн") && value.Contains("лагер")) return "camp"; if (value.Contains("ритуал") && value.Contains("сектант")) return "sectant_ritual"; if (value.Contains("химическ") && value.Contains("авари")) return "chemical_accident"; if (value.Contains("погруз")) return "loading"; return value.Contains("зачист") && value.Contains("местност") ? "area_clearance" : null; }
     internal static string CleanEventText(string type, string text)
     {
         var lines = text.Replace('\r', '\n').Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
@@ -290,7 +293,7 @@ internal sealed class DayZEventNotifications : IDisposable
     private static byte[] Png(Bitmap image) { using var stream = new MemoryStream(); image.Save(stream, ImageFormat.Png); return stream.ToArray(); }
     private static ulong Hash(Bitmap source) { using var image = new Bitmap(8, 8); using (var g = Graphics.FromImage(image)) g.DrawImage(source, 0, 0, 8, 8); var values = new byte[64]; var sum = 0; for (var y = 0; y < 8; y++) for (var x = 0; x < 8; x++) { var c = image.GetPixel(x, y); values[y * 8 + x] = (byte)((c.R * 299 + c.G * 587 + c.B * 114) / 1000); sum += values[y * 8 + x]; } ulong hash = 0; for (var i = 0; i < 64; i++) if (values[i] >= sum / 64) hash |= 1UL << i; return hash; }
     private static string Problem(string body) { try { using var json = JsonDocument.Parse(body); return json.RootElement.TryGetProperty("detail", out var value) ? value.GetString() ?? "Ошибка сервера" : "Ошибка сервера"; } catch { return "Ошибка сервера"; } }
-    private void LogUnrecognizedOcr(string text) { var normalized = Normalize(text); if (string.IsNullOrEmpty(normalized) || !new[] { "военн", "конво", "лагер", "погруз", "зачист", "местност" }.Any(normalized.Contains)) return; var key = "ocr:" + normalized; if (recent.TryGetValue(key, out var at) && DateTimeOffset.Now - at < TimeSpan.FromSeconds(15)) return; recent[key] = DateTimeOffset.Now; var shown = text.Trim().Replace('\r', ' ').Replace('\n', ' '); if (shown.Length > 180) shown = shown[..180] + "…"; AddLog("ocr", "OCR: похожее на событие, но нераспознанное: " + shown); }
+    private void LogUnrecognizedOcr(string text) { var normalized = Normalize(text); if (string.IsNullOrEmpty(normalized) || !new[] { "военн", "конво", "лагер", "ритуал", "сектант", "химическ", "авари", "погруз", "зачист", "местност" }.Any(normalized.Contains)) return; var key = "ocr:" + normalized; if (recent.TryGetValue(key, out var at) && DateTimeOffset.Now - at < TimeSpan.FromSeconds(15)) return; recent[key] = DateTimeOffset.Now; var shown = text.Trim().Replace('\r', ' ').Replace('\n', ' '); if (shown.Length > 180) shown = shown[..180] + "…"; AddLog("ocr", "OCR: похожее на событие, но нераспознанное: " + shown); }
     private void AddLog(string kind, string message) { lock (logLock) { log.Insert(0, new DayZEventLogEntry(DateTimeOffset.Now, kind, message)); if (log.Count > 100) log.RemoveRange(100, log.Count - 100); } }
     public void Dispose() { Stop(); http.Dispose(); }
 }
