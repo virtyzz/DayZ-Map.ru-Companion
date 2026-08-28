@@ -7,6 +7,11 @@ namespace CrosshairMarker;
 internal sealed class BattlePassOverlayForm : Form
 {
     private const int WmNcHitTest = 0x0084;
+    private const int WmMouseActivate = 0x0021;
+    private const int CollapsedHeight = 52;
+    private const int WsExNoActivate = 0x08000000;
+    private const int WsExToolWindow = 0x00000080;
+    private static readonly IntPtr MaNoActivate = new(3);
     private static readonly IntPtr HtClient = new(1);
     private BattlePassSettings settings = new();
     private BattlePassSnapshot snapshot = new();
@@ -15,6 +20,9 @@ internal sealed class BattlePassOverlayForm : Form
     private Point dragOrigin;
     private bool dragging;
     private bool resizing;
+    private ResizeEdges resizeEdges;
+    private Rectangle resizeStartBounds;
+    private Point resizeStartScreen;
     private readonly Dictionary<string, Rectangle> taskBounds = [];
     private readonly Dictionary<string, Rectangle> actionBounds = [];
     private string? clickedAction;
@@ -27,6 +35,11 @@ internal sealed class BattlePassOverlayForm : Form
     private readonly Dictionary<string, ManualTaskEditors> manualEditors = [];
     private BattlePassTask? clickedTask;
     private Point mouseDownPoint;
+    private string? interceptedAction;
+    private bool actionInputArmed;
+
+    [Flags]
+    private enum ResizeEdges { None = 0, Left = 1, Top = 2, Right = 4, Bottom = 8 }
 
     public event Action<BattlePassSettings>? SettingsChanged;
     public event Action<BattlePassSettings>? SettingsPersistRequested;
@@ -35,6 +48,32 @@ internal sealed class BattlePassOverlayForm : Form
     public event Action<IReadOnlyList<ManualTask>>? ManualTasksChanged;
     public bool Editing => editing;
 
+    public bool TryInterceptActionMouseDown(Point screenPoint)
+    {
+        if (!Visible) return false;
+        var action = HitTestAction(PointToClient(screenPoint));
+        if (action is null || (action != "manual:add" && !action.StartsWith("scan:", StringComparison.Ordinal))) return false;
+        ArmActionInput();
+        interceptedAction = action;
+        AppRuntimeLog.Info($"Battle Pass mouse down intercepted for {action}.");
+        return true;
+    }
+
+    public bool TryInterceptActionMouseUp(Point screenPoint)
+    {
+        var action = interceptedAction;
+        if (action is null) return false;
+        interceptedAction = null;
+        if (HitTestAction(PointToClient(screenPoint)) != action)
+        {
+            AppRuntimeLog.Info($"Battle Pass mouse up intercepted outside {action}.");
+            return true;
+        }
+        AppRuntimeLog.Info($"Battle Pass mouse up intercepted for {action}.");
+        BeginInvoke(() => ActivateAction(action));
+        return true;
+    }
+
     public BattlePassOverlayForm()
     {
         FormBorderStyle = FormBorderStyle.None;
@@ -42,6 +81,7 @@ internal sealed class BattlePassOverlayForm : Form
         TopMost = true;
         StartPosition = FormStartPosition.Manual;
         DoubleBuffered = true;
+        ResizeRedraw = true;
         BackColor = Color.Black;
         Opacity = .9;
         MouseDown += OnMouseDown;
@@ -52,12 +92,24 @@ internal sealed class BattlePassOverlayForm : Form
 
     protected override bool ShowWithoutActivation => !editing;
 
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var parameters = base.CreateParams;
+            parameters.ExStyle |= WsExToolWindow;
+            if (!editing && !actionInputArmed) parameters.ExStyle |= WsExNoActivate;
+            return parameters;
+        }
+    }
+
     public void Apply(BattlePassSettings next, BattlePassSnapshot nextSnapshot, IEnumerable<ManualTask>? nextManualTasks = null)
     {
         settings = next.Clone(); settings.Normalize(); snapshot = nextSnapshot;
         if (nextManualTasks is not null) manualTasks = nextManualTasks.ToList();
         var screen = MonitorInfo.ResolveScreen(settings.MonitorDeviceName);
-        Bounds = new Rectangle(screen.Bounds.Left + settings.Left, screen.Bounds.Top + settings.Top, settings.Width, settings.Height);
+        var height = settings.OverlayCollapsed ? CollapsedHeight : settings.Height;
+        Bounds = new Rectangle(screen.Bounds.Left + settings.Left, screen.Bounds.Top + settings.Top, settings.Width, height);
         ConstrainToVirtualDesktop();
         Opacity = settings.Opacity / 255d;
         Invalidate();
@@ -67,6 +119,7 @@ internal sealed class BattlePassOverlayForm : Form
     {
         if (editing == value) return;
         editing = value;
+        Cursor = Cursors.Default;
         RecreateHandle();
         Invalidate();
     }
@@ -81,15 +134,30 @@ internal sealed class BattlePassOverlayForm : Form
     {
         base.OnPaint(e);
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        e.Graphics.Clear(Color.Black);
         using var background = new SolidBrush(Color.FromArgb(218, 14, 16, 18));
         e.Graphics.FillRectangle(background, ClientRectangle);
         if (editing) using (var pen = new Pen(Color.FromArgb(255, 255, 142, 0), 2)) e.Graphics.DrawRectangle(pen, 1, 1, Width - 3, Height - 3);
 
+        taskBounds.Clear();
+        actionBounds.Clear();
         var tasks = FilteredTasks().ToList();
         using var titleFont = new Font("Segoe UI", settings.FontSize + 2, FontStyle.Bold);
         using var taskFont = new Font("Segoe UI", settings.FontSize, FontStyle.Regular);
         using var smallFont = new Font("Segoe UI", Math.Max(9, settings.FontSize - 2), FontStyle.Regular);
         e.Graphics.DrawString("BATTLE PASS", titleFont, Brushes.Orange, 14, 10);
+        var titleWidth = (int)Math.Ceiling(e.Graphics.MeasureString("BATTLE PASS", titleFont).Width);
+        var collapseButton = new Rectangle(14 + titleWidth + 4, 10, 24, settings.FontSize + 10);
+        actionBounds["toggle:overlay"] = collapseButton;
+        e.Graphics.DrawString(settings.OverlayCollapsed ? "▶" : "▼", titleFont, Brushes.Orange, collapseButton.Left, collapseButton.Top);
+        if (settings.OverlayCollapsed)
+        {
+            scrollOffset = 0;
+            contentHeight = Height;
+            scrollTrack = scrollThumb = Rectangle.Empty;
+            HideUnusedManualEditors(new HashSet<string>());
+            return;
+        }
         var sync = snapshot.UpdatedAt.HasValue ? $"обновлено {snapshot.UpdatedAt.Value.LocalDateTime:HH:mm}" : "нет синхронизации";
         e.Graphics.DrawString(sync, smallFont, Brushes.LightGray, 16, 38);
 
@@ -99,7 +167,6 @@ internal sealed class BattlePassOverlayForm : Form
         var contentClip = e.Graphics.Save();
         e.Graphics.SetClip(new Rectangle(0, 60, Width, Math.Max(0, Height - 60)));
         var y = 60 - scrollOffset;
-        taskBounds.Clear(); actionBounds.Clear();
         y = DrawGroup("daily", "ЕЖЕДНЕВНЫЕ ЗАДАНИЯ", tasks.Where(task => task.Page == BattlePassPage.Daily), settings.DailyCollapsed, ["scan:Daily"]);
         y = DrawGroup("weekly", "ЕЖЕНЕДЕЛЬНЫЕ ЗАДАНИЯ", tasks.Where(task => task.Page is BattlePassPage.WeeklyPage1 or BattlePassPage.WeeklyPage2), settings.WeeklyCollapsed, ["scan:WeeklyPage1", "scan:WeeklyPage2"]);
         y = DrawGroup("seasonal", "СЕЗОННЫЕ ЗАДАНИЯ", tasks.Where(task => task.Page == BattlePassPage.Seasonal), settings.SeasonalCollapsed, ["scan:Seasonal"]);
@@ -197,7 +264,7 @@ internal sealed class BattlePassOverlayForm : Form
 
     private IEnumerable<BattlePassTask> FilteredTasks() => snapshot.Tasks
         .Where(task => task.Page switch { BattlePassPage.Daily => settings.ShowDaily, BattlePassPage.Seasonal => settings.ShowSeasonal, _ => settings.ShowWeekly })
-        .Where(task => settings.DisplayMode switch { BattlePassDisplayMode.Pinned => task.Pinned, BattlePassDisplayMode.Unfinished => !task.Completed, _ => settings.ShowCompleted || !task.Completed })
+        .Where(task => settings.ShowCompleted || !task.Completed)
         .OrderBy(task => task.Page).ThenBy(task => task.Slot);
 
     private int CalculateHeight()
@@ -332,6 +399,7 @@ internal sealed class BattlePassOverlayForm : Form
         // a group header after that click changed the layout.
         dragging = false;
         resizing = false;
+        resizeEdges = ResizeEdges.None;
         clickedAction = null;
         clickedTask = null;
         if (scrollTrack.Contains(e.Location))
@@ -357,8 +425,17 @@ internal sealed class BattlePassOverlayForm : Form
             clickedTask = HitTestTask(e.Location);
             return;
         }
-        resizing = e.X >= Width - 22 && e.Y >= Height - 22;
-        if (!resizing && e.Y >= 60)
+        resizeEdges = settings.OverlayCollapsed ? ResizeEdges.None : HitTestResizeEdges(e.Location);
+        resizing = resizeEdges != ResizeEdges.None;
+        if (resizing)
+        {
+            resizeStartBounds = Bounds;
+            resizeStartScreen = PointToScreen(e.Location);
+            Capture = true;
+            mouseDownPoint = e.Location;
+            return;
+        }
+        if (e.Y >= 60)
         {
             // Content is reserved for task/group interactions. Do not turn a
             // missed first hit-test after repaint into a window drag.
@@ -393,6 +470,7 @@ internal sealed class BattlePassOverlayForm : Form
         var wasClick = clickedTask is not null && !resizing && Math.Abs(e.X - mouseDownPoint.X) < 4 && Math.Abs(e.Y - mouseDownPoint.Y) < 4;
         var shouldSaveLocation = dragging || resizing;
         resizing = false;
+        resizeEdges = ResizeEdges.None;
         dragging = false;
         if (wasClick && settings.ShowTaskDescriptions)
         {
@@ -408,9 +486,28 @@ internal sealed class BattlePassOverlayForm : Form
         ? null
         : FilteredTasks().FirstOrDefault(task => taskBounds.TryGetValue(task.Id, out var bounds) && bounds.Contains(point));
 
-    private string? HitTestAction(Point point) => point.Y < 60
-        ? null
-        : actionBounds.FirstOrDefault(item => item.Value.Contains(point)).Key;
+    private string? HitTestAction(Point point) => actionBounds.FirstOrDefault(item => item.Value.Contains(point)).Key;
+
+    private ResizeEdges HitTestResizeEdges(Point point)
+    {
+        const int border = 8;
+        const int rightBorder = 3;
+        var result = ResizeEdges.None;
+        if (point.X <= border) result |= ResizeEdges.Left;
+        else if (point.X >= Width - rightBorder) result |= ResizeEdges.Right;
+        if (point.Y <= border) result |= ResizeEdges.Top;
+        else if (point.Y >= Height - border) result |= ResizeEdges.Bottom;
+        return result;
+    }
+
+    private static Cursor ResizeCursor(ResizeEdges edges) => edges switch
+    {
+        ResizeEdges.Left or ResizeEdges.Right => Cursors.SizeWE,
+        ResizeEdges.Top or ResizeEdges.Bottom => Cursors.SizeNS,
+        ResizeEdges.Top | ResizeEdges.Left or ResizeEdges.Bottom | ResizeEdges.Right => Cursors.SizeNWSE,
+        ResizeEdges.Top | ResizeEdges.Right or ResizeEdges.Bottom | ResizeEdges.Left => Cursors.SizeNESW,
+        _ => Cursors.Default
+    };
 
     private void DrawScrollBar(Graphics graphics)
     {
@@ -450,19 +547,39 @@ internal sealed class BattlePassOverlayForm : Form
     {
         if (action == "manual:add")
         {
-            manualTasks.Add(new ManualTask { IsEditing = true });
-            Invalidate();
+            BeginInvoke(() =>
+            {
+                manualTasks.Add(new ManualTask { IsEditing = true });
+                Invalidate();
+            });
             return;
         }
         if (action.StartsWith("scan:", StringComparison.Ordinal) && Enum.TryParse<BattlePassPage>(action[5..], out var page))
         {
             SyncCurrentBoundsToSettings();
             SettingsPersistRequested?.Invoke(settings.Clone());
-            ScanRequested?.Invoke(page);
+            BeginInvoke(() =>
+            {
+                actionInputArmed = false;
+                RecreateHandle();
+                ScanRequested?.Invoke(page);
+            });
             return;
         }
         switch (action)
         {
+            case "toggle:overlay":
+                // Keep the actual constrained position as the anchor while
+                // changing height, otherwise Apply can restore stale bounds.
+                SyncCurrentBoundsToSettings();
+                settings.OverlayCollapsed = !settings.OverlayCollapsed;
+                scrollOffset = 0;
+                var location = Location;
+                Height = settings.OverlayCollapsed ? CollapsedHeight : settings.Height;
+                Location = location;
+                Invalidate();
+                SettingsPersistRequested?.Invoke(settings.Clone());
+                return;
             case "toggle:daily": settings.DailyCollapsed = !settings.DailyCollapsed; break;
             case "toggle:weekly": settings.WeeklyCollapsed = !settings.WeeklyCollapsed; break;
             case "toggle:seasonal": settings.SeasonalCollapsed = !settings.SeasonalCollapsed; break;
@@ -485,6 +602,13 @@ internal sealed class BattlePassOverlayForm : Form
 
     protected override void WndProc(ref Message m)
     {
+        if (!editing && !actionInputArmed && m.Msg == WmMouseActivate)
+        {
+            // Keep DayZ focused, but retain the mouse message in this overlay
+            // rather than handing it to the window underneath.
+            m.Result = MaNoActivate;
+            return;
+        }
         if (m.Msg == WmNcHitTest)
         {
             // The overlay owns every mouse hit in its bounds.  Passing empty
@@ -498,23 +622,63 @@ internal sealed class BattlePassOverlayForm : Form
     }
     private void OnMouseMove(object? sender, MouseEventArgs e)
     {
+        ArmActionInputIfNeeded(e.Location);
         if (scrolling && e.Button == MouseButtons.Left)
         {
             UpdateScrollFromPointer(e.Y);
             return;
         }
-        if (!editing || e.Button != MouseButtons.Left) return;
-        if (resizing)
+        if (!editing) return;
+        if (resizing && e.Button == MouseButtons.Left)
         {
-            Width = Math.Clamp(e.X, 220, 900);
-            settings.Width = Width;
-            Height = Math.Clamp(e.Y, 92, 850);
-            settings.Height = Height;
+            ResizeFromPointer(PointToScreen(e.Location));
             return;
         }
+        if (e.Button != MouseButtons.Left)
+        {
+            Cursor = settings.OverlayCollapsed ? Cursors.Default : ResizeCursor(HitTestResizeEdges(e.Location));
+            return;
+        }
+        if (resizing) return;
         if (!dragging) return;
         Location = new Point(Left + e.X - dragOrigin.X, Top + e.Y - dragOrigin.Y);
         ConstrainToVirtualDesktop();
+    }
+
+    private void ArmActionInputIfNeeded(Point point)
+    {
+        if (editing || actionInputArmed || !Visible) return;
+        var action = HitTestAction(point);
+        if (action is null || (action != "manual:add" && !action.StartsWith("scan:", StringComparison.Ordinal))) return;
+        ArmActionInput();
+    }
+
+    private void ArmActionInput()
+    {
+        if (editing || actionInputArmed || !Visible) return;
+        actionInputArmed = true;
+        RecreateHandle();
+        Activate();
+        AppRuntimeLog.Info("Battle Pass overlay activated for an action button.");
+    }
+
+    private void ResizeFromPointer(Point screenPoint)
+    {
+        var deltaX = screenPoint.X - resizeStartScreen.X;
+        var deltaY = screenPoint.Y - resizeStartScreen.Y;
+        var left = resizeStartBounds.Left;
+        var top = resizeStartBounds.Top;
+        var right = resizeStartBounds.Right;
+        var bottom = resizeStartBounds.Bottom;
+        if (resizeEdges.HasFlag(ResizeEdges.Left)) left = Math.Clamp(left + deltaX, right - 900, right - 220);
+        if (resizeEdges.HasFlag(ResizeEdges.Right)) right = Math.Clamp(right + deltaX, left + 220, left + 900);
+        if (resizeEdges.HasFlag(ResizeEdges.Top)) top = Math.Clamp(top + deltaY, bottom - 850, bottom - 92);
+        if (resizeEdges.HasFlag(ResizeEdges.Bottom)) bottom = Math.Clamp(bottom + deltaY, top + 92, top + 850);
+        Bounds = Rectangle.FromLTRB(left, top, right, bottom);
+        ConstrainToVirtualDesktop();
+        settings.Width = Width;
+        settings.Height = Height;
+        Invalidate();
     }
     private void SaveLocation()
     {
@@ -528,7 +692,7 @@ internal sealed class BattlePassOverlayForm : Form
         var screen = MonitorInfo.ResolveScreen(settings.MonitorDeviceName);
         settings.Left = Math.Max(0, Left - screen.Bounds.Left); settings.Top = Math.Max(0, Top - screen.Bounds.Top);
         settings.Width = Width;
-        settings.Height = Height;
+        if (!settings.OverlayCollapsed) settings.Height = Height;
     }
 
     private void ConstrainToVirtualDesktop()

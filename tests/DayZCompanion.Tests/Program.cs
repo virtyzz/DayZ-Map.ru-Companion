@@ -32,7 +32,8 @@ var tests = new (string Name, Action Run)[]
     ("доставка события отправляет multipart через mock API", CompanionDeliveryUsesMockApi),
     ("отозванная сервером сессия удаляется локально", RevokedCompanionSessionIsCleared),
     ("отключение Companion отзывает устройство на сервере", CompanionDisconnectRevokesDevice),
-    ("Battle Pass settings normalise OCR layout", BattlePassSettingsNormalize)
+    ("Battle Pass settings normalise OCR layout", BattlePassSettingsNormalize),
+    ("Battle Pass scan hotkey is reset once", BattlePassScanHotkeyIsResetOnce)
 };
 
 var failures = new List<string>();
@@ -451,13 +452,24 @@ static ImportRequest Request(string server, string mode, string markers)
 
 static void BattlePassSettingsNormalize()
 {
-    var settings = new BattlePassSettings { TitleX = -1, TitleWidth = 5, ProgressX = 8, FirstRowY = -4, RowStep = 2, Width = 1, DisplayMode = (BattlePassDisplayMode)99, ShowDaily = false, ShowWeekly = false };
+    var settings = new BattlePassSettings { TitleX = -1, TitleWidth = 5, ProgressX = 8, FirstRowY = -4, RowStep = 2, Width = 1, ShowDaily = false, ShowWeekly = false };
     settings.Normalize();
     Equal(0d, settings.TitleX, "TitleX должен быть ограничен");
     True(settings.TitleWidth <= 1, "ширина OCR-зоны не должна выходить за экран");
     True(settings.ProgressX <= .95, "ProgressX должен быть ограничен");
-    Equal(BattlePassDisplayMode.Unfinished, settings.DisplayMode, "некорректный режим должен быть заменён");
     True(settings.ShowDaily || settings.ShowWeekly || settings.ShowSeasonal, "должен остаться хотя бы один тип задач");
+}
+
+static void BattlePassScanHotkeyIsResetOnce()
+{
+    var config = new AppConfig { Hotkeys = new HotkeyBindings { ScanBattlePass = new HotkeyBinding { Enabled = true, Key = "F9" } } };
+    config.Normalize();
+    True(!config.Hotkeys.ScanBattlePass.Enabled, "старый хоткей сканирования не отключён");
+    True(config.ScanBattlePassHotkeyResetApplied, "миграция хоткея не помечена как выполненная");
+
+    config.Hotkeys.ScanBattlePass = new HotkeyBinding { Enabled = true, Key = "F8" };
+    config.Normalize();
+    True(config.Hotkeys.ScanBattlePass.Enabled, "назначенный пользователем хоткей был повторно сброшен");
 }
 
 static void Equal<T>(T expected, T actual, string message)

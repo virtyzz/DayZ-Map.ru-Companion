@@ -46,7 +46,9 @@ internal sealed class ConfigStore
         {
             var json = File.ReadAllText(configPath);
             var config = JsonSerializer.Deserialize<AppConfig>(json, JsonOptions) ?? new AppConfig();
+            var resetScanBattlePassHotkey = !config.ScanBattlePassHotkeyResetApplied;
             config.Normalize();
+            if (resetScanBattlePassHotkey) SaveAtomic(config);
             return config;
         }
         catch

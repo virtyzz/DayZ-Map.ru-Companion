@@ -55,8 +55,6 @@ internal sealed class ManualTask
     }
 }
 
-internal enum BattlePassDisplayMode { All, Unfinished, Pinned }
-
 internal sealed class BattlePassSettings
 {
     public bool OverlayVisible { get; set; } = true;
@@ -67,6 +65,7 @@ internal sealed class BattlePassSettings
     public int Height { get; set; } = 470;
     public int Opacity { get; set; } = 230;
     public int FontSize { get; set; } = 14;
+    public bool OverlayCollapsed { get; set; }
     public bool ShowCompleted { get; set; }
     public bool ShowDaily { get; set; } = true;
     public bool ShowWeekly { get; set; } = true;
@@ -75,9 +74,7 @@ internal sealed class BattlePassSettings
     public bool WeeklyCollapsed { get; set; }
     public bool SeasonalCollapsed { get; set; }
     public BattlePassPage CapturePage { get; set; } = BattlePassPage.Daily;
-    public BattlePassDisplayMode DisplayMode { get; set; } = BattlePassDisplayMode.Unfinished;
     public bool SaveDebugScreenshot { get; set; }
-    public bool DescriptionsCollapsed { get; set; } = true;
     public bool ShowTaskDescriptions { get; set; } = true;
     public bool OverlayEditingEnabled { get; set; }
     public double TitleX { get; set; } = .135;
@@ -97,7 +94,6 @@ internal sealed class BattlePassSettings
         FontSize = Math.Clamp(FontSize, 9, 28);
         if (!ShowDaily && !ShowWeekly && !ShowSeasonal) ShowDaily = true;
         if (!Enum.IsDefined(CapturePage)) CapturePage = BattlePassPage.Daily;
-        if (!Enum.IsDefined(DisplayMode)) DisplayMode = BattlePassDisplayMode.Unfinished;
         TitleX = Math.Clamp(TitleX, 0, .8);
         TitleWidth = Math.Clamp(TitleWidth, .1, 1 - TitleX);
         ProgressX = Math.Clamp(ProgressX, 0, .95);
@@ -105,6 +101,15 @@ internal sealed class BattlePassSettings
         RowStep = Math.Clamp(RowStep, .05, .2);
         OcrLayout ??= BattlePassOcrLayout.FromLegacy(this);
         OcrLayout.Normalize();
+    }
+
+    public void ResetOverlayBounds()
+    {
+        Left = 24;
+        Top = 160;
+        Width = 360;
+        Height = 470;
+        OverlayCollapsed = false;
     }
 
     public BattlePassSettings Clone() => (BattlePassSettings)MemberwiseClone();
@@ -125,11 +130,11 @@ internal sealed class BattlePassOcrZone
 internal sealed class BattlePassOcrLayout
 {
     // Base layout matching the current Battle Pass screen at normal UI scale.
-    public BattlePassOcrZone Title { get; set; } = new(.135, .245, .43, .047);
-    public BattlePassOcrZone Description { get; set; } = new(.135, .297, .43, .06);
-    public BattlePassOcrZone Progress { get; set; } = new(.885, .270, .09, .045);
-    public BattlePassOcrZone Experience { get; set; } = new(.64, .248, .09, .035);
-    public BattlePassOcrZone Status { get; set; } = new(.79, .248, .15, .035);
+    public BattlePassOcrZone Title { get; set; } = new(.1318354430379747, .2352370990237099, .43, .047);
+    public BattlePassOcrZone Description { get; set; } = new(.135, .297, .46401898734177216, .06557880055788005);
+    public BattlePassOcrZone Progress { get; set; } = new(.885, .29231520223152024, .06784810126582279, .03942119944211995);
+    public BattlePassOcrZone Experience { get; set; } = new(.6344620253164557, .2619470013947001, .09, .035);
+    public BattlePassOcrZone Status { get; set; } = new(.7820886075949367, .2605523012552301, .15, .035);
     public double RowStep { get; set; } = .137;
     public void Normalize() { Title ??= new(); Description ??= new(); Progress ??= new(); Experience ??= new(); Status ??= new(); Title.Normalize(); Description.Normalize(); Progress.Normalize(); Experience.Normalize(); Status.Normalize(); RowStep = Math.Clamp(RowStep, .05, .2); }
     public BattlePassOcrLayout Clone() => new() { Title = Title.Clone(), Description = Description.Clone(), Progress = Progress.Clone(), Experience = Experience.Clone(), Status = Status.Clone(), RowStep = RowStep };

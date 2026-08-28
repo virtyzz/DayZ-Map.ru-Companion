@@ -16,6 +16,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
     private readonly BattlePassStore battlePassStore;
     private readonly BattlePassTracker battlePassTracker;
     private readonly BattlePassOverlayForm battlePassOverlay;
+    private readonly GlobalMouseClickInterceptor battlePassClickInterceptor;
     private BattlePassSettings battlePassSettings;
     private EditorForm? editor;
     private AppConfig config;
@@ -41,8 +42,6 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             onOpenEditor: OpenEditor,
             onOpenUpdates: OpenUpdates,
             onSelectProfile: SelectProfile,
-            onOpenBattlePass: OpenBattlePassSettings,
-            onScanBattlePass: () => ScanBattlePass(),
             onExit: ExitApplication);
         tray.SetOverlayVisible(config.OverlayVisible);
         tray.SetProfiles(config.Profiles, config.ActiveProfileId);
@@ -52,6 +51,9 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         battlePassSettings = battlePassStore.LoadSettings();
         battlePassTracker = new BattlePassTracker(battlePassStore);
         battlePassOverlay = new BattlePassOverlayForm();
+        battlePassClickInterceptor = new GlobalMouseClickInterceptor(
+            battlePassOverlay.TryInterceptActionMouseDown,
+            battlePassOverlay.TryInterceptActionMouseUp);
         battlePassOverlay.SettingsChanged += SaveBattlePassSettings;
         battlePassOverlay.SettingsPersistRequested += PersistBattlePassSettings;
         battlePassOverlay.SnapshotChanged += snapshot =>
@@ -98,11 +100,6 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
 
         tray.SetOverlayVisible(config.OverlayVisible);
         store.SaveAtomic(config);
-    }
-
-    private void OpenBattlePassSettings()
-    {
-        OpenEditor("tasks");
     }
 
     private void OpenBattlePassTasks()
@@ -216,7 +213,14 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             case "showBattlePassDebug": OpenBattlePassDebugScreenshot(); break;
             case "previewBattlePassZones": PreviewBattlePassZones(); break;
             case "calibrateBattlePassZones": CalibrateBattlePassZones(); break;
+            case "resetBattlePassOverlayBounds": ResetBattlePassOverlayBounds(); break;
         }
+    }
+
+    private void ResetBattlePassOverlayBounds()
+    {
+        battlePassSettings.ResetOverlayBounds();
+        SaveBattlePassSettings(battlePassSettings);
     }
 
     private void CalibrateBattlePassZones()
@@ -301,6 +305,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             tray.SetProfiles(config.Profiles, config.ActiveProfileId);
             RegisterConfiguredHotkeys();
             store.SaveAtomic(config);
+            editor?.ApplyExternalConfig(config);
         };
         editor.MonitorChanged += deviceName =>
         {
@@ -386,44 +391,42 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
     private void RegisterConfiguredHotkeys()
     {
         hotkeys.UnregisterAll();
-        RegisterHotkey(config.Hotkeys.ToggleOverlay, ToggleOverlay);
-        RegisterHotkey(config.Hotkeys.NextProfile, () => SelectAdjacentProfile(1));
-        RegisterHotkey(config.Hotkeys.PreviousProfile, () => SelectAdjacentProfile(-1));
-        RegisterHotkey(config.Hotkeys.OpacityUp, () => AdjustOpacity(15));
-        RegisterHotkey(config.Hotkeys.OpacityDown, () => AdjustOpacity(-15));
-        RegisterHotkey(config.Hotkeys.SizeUp, () => AdjustSize(1));
-        RegisterHotkey(config.Hotkeys.SizeDown, () => AdjustSize(-1));
-        RegisterHotkey(config.Hotkeys.ToggleBattlePassOverlay, ToggleBattlePassOverlay);
-        RegisterHotkey(config.Hotkeys.ScanBattlePass, () => ScanBattlePass());
-        RegisterHotkey(config.Hotkeys.NextBattlePassDisplayMode, NextBattlePassDisplayMode);
-        RegisterHotkey(config.Hotkeys.ToggleBattlePassDescriptions, ToggleBattlePassDescriptions);
-    }
-
-    private void NextBattlePassDisplayMode()
-    {
-        battlePassSettings.DisplayMode = battlePassSettings.DisplayMode switch
-        {
-            BattlePassDisplayMode.All => BattlePassDisplayMode.Unfinished,
-            BattlePassDisplayMode.Unfinished => BattlePassDisplayMode.Pinned,
-            _ => BattlePassDisplayMode.All
-        };
-        SaveBattlePassSettings(battlePassSettings);
+        config.HotkeyRegistrationErrors.Clear();
+        var signatures = new HashSet<string>(StringComparer.Ordinal);
+        RegisterHotkey(nameof(HotkeyBindings.ToggleOverlay), config.Hotkeys.ToggleOverlay, ToggleOverlay, signatures);
+        RegisterHotkey(nameof(HotkeyBindings.NextProfile), config.Hotkeys.NextProfile, () => SelectAdjacentProfile(1), signatures);
+        RegisterHotkey(nameof(HotkeyBindings.PreviousProfile), config.Hotkeys.PreviousProfile, () => SelectAdjacentProfile(-1), signatures);
+        RegisterHotkey(nameof(HotkeyBindings.OpacityUp), config.Hotkeys.OpacityUp, () => AdjustOpacity(15), signatures);
+        RegisterHotkey(nameof(HotkeyBindings.OpacityDown), config.Hotkeys.OpacityDown, () => AdjustOpacity(-15), signatures);
+        RegisterHotkey(nameof(HotkeyBindings.SizeUp), config.Hotkeys.SizeUp, () => AdjustSize(1), signatures);
+        RegisterHotkey(nameof(HotkeyBindings.SizeDown), config.Hotkeys.SizeDown, () => AdjustSize(-1), signatures);
+        RegisterHotkey(nameof(HotkeyBindings.ToggleBattlePassOverlay), config.Hotkeys.ToggleBattlePassOverlay, ToggleBattlePassOverlay, signatures);
+        RegisterHotkey(nameof(HotkeyBindings.ScanBattlePass), config.Hotkeys.ScanBattlePass, () => ScanBattlePass(), signatures);
+        RegisterHotkey(nameof(HotkeyBindings.ToggleBattlePassDescriptions), config.Hotkeys.ToggleBattlePassDescriptions, ToggleBattlePassDescriptions, signatures);
     }
 
     private void ToggleBattlePassDescriptions()
     {
-        battlePassSettings.DescriptionsCollapsed = !battlePassSettings.DescriptionsCollapsed;
+        battlePassSettings.ShowTaskDescriptions = !battlePassSettings.ShowTaskDescriptions;
         SaveBattlePassSettings(battlePassSettings);
     }
 
-    private void RegisterHotkey(HotkeyBinding binding, Action action)
+    private void RegisterHotkey(string name, HotkeyBinding binding, Action action, ISet<string> signatures)
     {
         if (!binding.Enabled || !binding.TryGetKeys(out var key))
         {
             return;
         }
 
-        hotkeys.Register(key, binding.ToModifiers(), action);
+        if (!signatures.Add(binding.Signature))
+        {
+            config.HotkeyRegistrationErrors[name] = "Занята другой горячей клавишей Companion.";
+            return;
+        }
+        if (!hotkeys.Register(key, binding.ToModifiers(), action))
+        {
+            config.HotkeyRegistrationErrors[name] = "Недоступна: занята Windows или другим приложением.";
+        }
     }
 
     private void SelectAdjacentProfile(int direction)
@@ -486,6 +489,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         battlePassStore.SaveSettings(battlePassSettings);
         dayZCompanion.Dispose();
         eventNotifications.Dispose();
+        battlePassClickInterceptor.Dispose();
         hotkeys.Dispose();
         tray.Dispose();
         overlay.Close();

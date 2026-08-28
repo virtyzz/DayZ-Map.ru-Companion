@@ -279,6 +279,7 @@ internal sealed class EditorForm : Form
             case "showBattlePassDebug":
             case "previewBattlePassZones":
             case "calibrateBattlePassZones":
+            case "resetBattlePassOverlayBounds":
                 if (name is not null) BattlePassCommandRequested?.Invoke(name);
                 break;
             case "connectEventNotifications":
@@ -439,6 +440,7 @@ internal sealed class EditorForm : Form
             update = updateInfo,
             dayZ = new { settings = dayZSettings, status = dayZStatus },
             battlePass = new { settings = battlePassSettings, snapshot = battlePassSnapshot },
+            hotkeyErrors = config.HotkeyRegistrationErrors,
             eventNotifications = new
             {
                 settings = eventNotifications.Settings,
@@ -689,6 +691,10 @@ button, input, select {
   min-width: 0;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+.hotkey-warning {
+  color: #ffb454;
+  margin-top: 6px;
 }
 .editor {
   padding: 14px;
@@ -1032,10 +1038,9 @@ const defaultHotkeys = {
   SizeUp: { Enabled: true, Key: "PageUp", Control: true, Alt: true, Shift: false, Win: false },
   SizeDown: { Enabled: true, Key: "PageDown", Control: true, Alt: true, Shift: false, Win: false },
   ToggleBattlePassOverlay: { Enabled: true, Key: "F8", Control: true, Alt: true, Shift: false, Win: false },
-  ScanBattlePass: { Enabled: true, Key: "F9", Control: true, Alt: true, Shift: false, Win: false },
-  EditBattlePassOverlay: { Enabled: true, Key: "F10", Control: true, Alt: true, Shift: false, Win: false }
-  , NextBattlePassDisplayMode: { Enabled: true, Key: "F11", Control: true, Alt: true, Shift: false, Win: false }
-  , ToggleBattlePassDescriptions: { Enabled: true, Key: "F12", Control: true, Alt: true, Shift: false, Win: false }
+  ScanBattlePass: { Enabled: false, Key: "None", Control: true, Alt: true, Shift: false, Win: false },
+  EditBattlePassOverlay: { Enabled: true, Key: "F10", Control: true, Alt: true, Shift: false, Win: false },
+  ToggleBattlePassDescriptions: { Enabled: true, Key: "F12", Control: true, Alt: true, Shift: false, Win: false }
 };
 
 const navigation = [
@@ -1303,6 +1308,7 @@ function renderDataChanged(previous, next) {
     update: value.update,
     dayZSettings: value.dayZ?.settings,
     battlePass: value.battlePass,
+    hotkeyErrors: value.hotkeyErrors,
     eventNotifications: value.eventNotifications,
     monitors: value.monitors,
     preview: value.preview
@@ -1540,7 +1546,7 @@ function renderHotkeys() {
   return `<h2>Горячие клавиши</h2>` + keys.map(([key, label]) => {
     const binding = state.config.Hotkeys[key];
     return field(label, {
-      input: `<div class="actions"><button class="action" data-hotkey="${key}">${displayHotkey(binding)}</button><button class="action" data-hotkey-clear="${key}">Очистить</button></div>`
+      input: `<div class="actions"><button class="action" data-hotkey="${key}">${displayHotkey(binding)}</button><button class="action" data-hotkey-clear="${key}">Очистить</button></div>${hotkeyRegistrationWarning(key)}`
     });
   }).join("");
 }
@@ -1571,6 +1577,7 @@ function renderBattlePass() {
     ${field("Размер", { input: `<label>Ширина <input type="number" min="220" max="900" value="${s.Width || 360}" data-bp-number="Width"></label> <label>Высота <input type="number" min="92" max="850" value="${s.Height || 470}" data-bp-number="Height"></label> <label>Шрифт <input type="number" min="9" max="28" value="${s.FontSize || 14}" data-bp-number="FontSize"></label> <label>Прозрачность <input type="number" min="40" max="255" value="${s.Opacity || 230}" data-bp-number="Opacity"></label>` })}
     <div class="limit">Для точной настройки используйте «Настроить зоны на экране»: зоны можно перетаскивать и менять их размер прямо поверх текущего изображения Battle Pass.</div>
     <div class="actions"><button class="action primary" data-command="calibrateBattlePassZones">Настроить зоны на экране</button><button class="action" data-command="previewBattlePassZones">Предпросмотр зон</button><button class="action primary" data-command="scanBattlePass">Считать экран</button><button class="action" data-command="editBattlePassTasks">Проверить и исправить</button><button class="action" data-command="showBattlePassDebug">Открыть отладочный снимок</button><button class="action danger" data-command="clearBattlePass">Очистить данные</button></div>
+    <div class="actions"><button class="action" data-command="resetBattlePassOverlayBounds">Сбросить положение и размер оверлея</button></div>
     <div class="update-status">Последнее обновление: ${bp.snapshot?.UpdatedAt ? escapeHtml(new Date(bp.snapshot.UpdatedAt).toLocaleString()) : "ещё не выполнялось"}. Сохранено заданий: ${tasks.length}.</div>
   `;
 }
@@ -1583,7 +1590,7 @@ function renderBattlePassHotkeys() {
   ];
   return `<h2>Отслеживание заданий — горячие клавиши</h2>` + keys.map(([key, label]) => {
     const binding = state.config.Hotkeys[key];
-    return field(label, { input: `<div class="actions"><button class="action" data-hotkey="${key}">${displayHotkey(binding)}</button><button class="action" data-hotkey-clear="${key}">Очистить</button></div>` });
+    return field(label, { input: `<div class="actions"><button class="action" data-hotkey="${key}">${displayHotkey(binding)}</button><button class="action" data-hotkey-clear="${key}">Очистить</button></div>${hotkeyRegistrationWarning(key)}` });
   }).join("");
 }
 
@@ -2027,6 +2034,11 @@ function mutateImage(layer, action) {
 function displayHotkey(binding) {
   if (!binding || !binding.Enabled || !binding.Key || binding.Key === "None") return "Отключено";
   return [binding.Control && "Ctrl", binding.Alt && "Alt", binding.Shift && "Shift", binding.Win && "Win", binding.Key].filter(Boolean).join("+");
+}
+
+function hotkeyRegistrationWarning(key) {
+  const message = state.hotkeyErrors?.[key];
+  return message ? `<div class="limit hotkey-warning">⚠ ${escapeHtml(message)}</div>` : "";
 }
 
 function currentPreset(p) {

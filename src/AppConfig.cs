@@ -14,8 +14,12 @@ internal sealed class AppConfig
     public EditorWindowBounds? EditorWindowBounds { get; set; }
     public string ActiveProfileId { get; set; } = "default";
     public string? LastPromptedUpdateVersion { get; set; }
+    public bool ScanBattlePassHotkeyResetApplied { get; set; }
     public List<CrosshairProfile> Profiles { get; set; } = [CrosshairProfile.Default()];
     public HotkeyBindings Hotkeys { get; set; } = new();
+
+    [JsonIgnore]
+    public Dictionary<string, string> HotkeyRegistrationErrors { get; set; } = [];
 
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public CrosshairProfile? ActiveProfile { get; set; }
@@ -42,6 +46,11 @@ internal sealed class AppConfig
 
         Hotkeys ??= new HotkeyBindings();
         Hotkeys.Normalize();
+        if (!ScanBattlePassHotkeyResetApplied)
+        {
+            Hotkeys.ScanBattlePass = HotkeyBindings.DefaultScanBattlePass();
+            ScanBattlePassHotkeyResetApplied = true;
+        }
 
         if (!Enum.IsDefined(OverlayWindowSize))
         {
@@ -95,8 +104,10 @@ internal sealed class AppConfig
         EditorWindowBounds = EditorWindowBounds?.Clone(),
         ActiveProfileId = ActiveProfileId,
         LastPromptedUpdateVersion = LastPromptedUpdateVersion,
+        ScanBattlePassHotkeyResetApplied = ScanBattlePassHotkeyResetApplied,
         Profiles = Profiles.Select(profile => profile.Clone()).ToList(),
-        Hotkeys = Hotkeys.Clone()
+        Hotkeys = Hotkeys.Clone(),
+        HotkeyRegistrationErrors = new Dictionary<string, string>(HotkeyRegistrationErrors)
     };
 
     private static int NormalizeAngle(int angle)
