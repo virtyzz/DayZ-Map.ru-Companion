@@ -24,7 +24,8 @@ internal sealed class EditorForm : Form
     private AppConfig config;
     private DayZCompanionSettings dayZSettings;
     private DayZCompanionStatus dayZStatus;
-    private readonly DayZEventNotifications eventNotifications;
+    private OcrStatus? ocrStatus;
+    private Size previewSize = new(720, 420);
     private BattlePassSettings battlePassSettings;
     private BattlePassSnapshot battlePassSnapshot;
     private UpdateInfo? updateInfo;
@@ -40,7 +41,7 @@ internal sealed class EditorForm : Form
     public event Action<BattlePassSettings>? BattlePassSettingsChanged;
     public event Action<string>? BattlePassCommandRequested;
 
-    public EditorForm(AppConfig source, UpdateService updateService, DayZCompanionSettings dayZSettings, DayZCompanionStatus dayZStatus, DayZEventNotifications eventNotifications, BattlePassSettings battlePassSettings, BattlePassSnapshot battlePassSnapshot, string? initialTab = null)
+    public EditorForm(AppConfig source, UpdateService updateService, DayZCompanionSettings dayZSettings, DayZCompanionStatus dayZStatus, BattlePassSettings battlePassSettings, BattlePassSnapshot battlePassSnapshot, string? initialTab = null)
     {
         this.updateService = updateService;
         pendingTab = initialTab;
@@ -49,7 +50,6 @@ internal sealed class EditorForm : Form
         this.dayZSettings = dayZSettings;
         this.dayZSettings.Normalize();
         this.dayZStatus = dayZStatus;
-        this.eventNotifications = eventNotifications;
         this.battlePassSettings = battlePassSettings.Clone();
         this.battlePassSnapshot = battlePassSnapshot;
 
@@ -129,17 +129,6 @@ internal sealed class EditorForm : Form
         _ = SendStateAsync();
     }
 
-    public void ApplyEventNotificationState(DayZEventNotificationSettings settings, bool monitoring)
-    {
-        if (IsHandleCreated && InvokeRequired)
-        {
-            BeginInvoke(new Action(() => ApplyEventNotificationState(settings, monitoring)));
-            return;
-        }
-        dayZSettings.EventNotifications = settings;
-        _ = SendStateAsync();
-    }
-
     private async Task InitializeWebViewAsync()
     {
         try
@@ -184,6 +173,17 @@ internal sealed class EditorForm : Form
                     break;
                 case "previewConfig":
                     await ApplyPreviewConfigFromWebAsync(root.GetProperty("config"));
+                    break;
+                case "previewSize":
+                    var nextSize = new Size(
+                        Math.Clamp(root.GetProperty("width").GetInt32(), 1, 8192),
+                        Math.Clamp(root.GetProperty("height").GetInt32(), 1, 8192));
+                    if (nextSize != previewSize)
+                    {
+                        previewSize = nextSize;
+                        var previewJson = JsonSerializer.Serialize(RenderPreviewDataUri(config.CurrentProfile), JsonOptions);
+                        await webView.CoreWebView2.ExecuteScriptAsync($"window.DayZMapCompanion.receivePreview({previewJson});");
+                    }
                     break;
                 case "updateDayZSettings":
                     ApplyDayZSettingsFromWeb(root.GetProperty("settings"));
@@ -282,27 +282,12 @@ internal sealed class EditorForm : Form
             case "resetBattlePassOverlayBounds":
                 if (name is not null) BattlePassCommandRequested?.Invoke(name);
                 break;
-            case "connectEventNotifications":
-                if (!dayZStatus.Port.HasValue) throw new DayZCompanionException("Локальный API Companion не запущен.");
-                Process.Start(new ProcessStartInfo(eventNotifications.BeginPairing(dayZStatus.Port.Value)) { UseShellExecute = true });
+            case "installOcr":
+                TesseractOcr.Install();
                 break;
-            case "testEventNotifications":
-                await eventNotifications.SendTestAsync(CancellationToken.None);
-                break;
-            case "disconnectEventNotifications":
-                await eventNotifications.DisconnectAsync(CancellationToken.None);
-                break;
-            case "installEventOcr":
-                eventNotifications.InstallOcr();
-                break;
-            case "refreshEventOcr":
-                eventNotifications.RefreshOcrStatus();
-                break;
-            case "previewEventCapture":
-                eventNotifications.RefreshCapturePreview();
-                break;
-            case "clearEventLog":
-                eventNotifications.ClearLog();
+            case "refreshOcr":
+                ocrStatus = TesseractOcr.Detect();
+                await SendStateAsync();
                 break;
         }
     }
@@ -439,17 +424,8 @@ internal sealed class EditorForm : Form
             openTab,
             update = updateInfo,
             dayZ = new { settings = dayZSettings, status = dayZStatus },
-            battlePass = new { settings = battlePassSettings, snapshot = battlePassSnapshot },
+            battlePass = new { settings = battlePassSettings, snapshot = battlePassSnapshot, ocr = ocrStatus ??= TesseractOcr.Detect() },
             hotkeyErrors = config.HotkeyRegistrationErrors,
-            eventNotifications = new
-            {
-                settings = eventNotifications.Settings,
-                monitoring = eventNotifications.IsMonitoring,
-                windows = GameWindows.Find().Select(window => new { window.Title, width = window.Bounds.Width, height = window.Bounds.Height }),
-                log = eventNotifications.GetLog(),
-                ocr = eventNotifications.GetOcrStatus(),
-                capturePreview = eventNotifications.GetCapturePreview()
-            },
             monitors = MonitorInfo.GetAll().Select(monitor => new
             {
                 monitor.DeviceName,
@@ -479,9 +455,9 @@ internal sealed class EditorForm : Form
         await webView.CoreWebView2.ExecuteScriptAsync($"window.DayZMapCompanion.showError({json});");
     }
 
-    private static string RenderPreviewDataUri(CrosshairProfile profile)
+    private string RenderPreviewDataUri(CrosshairProfile profile)
     {
-        using var bitmap = new Bitmap(720, 420, PixelFormat.Format32bppPArgb);
+        using var bitmap = new Bitmap(previewSize.Width, previewSize.Height, PixelFormat.Format32bppPArgb);
         using (var graphics = Graphics.FromImage(bitmap))
         {
             graphics.Clear(Color.FromArgb(14, 14, 16));
@@ -612,8 +588,15 @@ button, input, select {
   min-height: 0;
   min-width: 0;
   display: grid;
-  grid-template-columns: 250px minmax(460px, 1fr) minmax(320px, .7fr);
+  grid-template-columns: 250px minmax(460px, 1fr);
   gap: 12px;
+}
+.layout.with-crosshair-preview {
+  grid-template-columns: 250px minmax(0, 760px) minmax(320px, 1fr);
+  justify-content: start;
+}
+.layout:not(.with-crosshair-preview) .preview-wrap {
+  display: none;
 }
 .panel {
   min-height: 0;
@@ -743,6 +726,11 @@ button, input, select {
 .control-group + .control-group {
   margin-top: 4px;
 }
+.control-group.separated {
+  margin-top: 20px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
+}
 .group-title {
   color: var(--accent);
   font-size: 12px;
@@ -838,6 +826,90 @@ input[type="color"] {
   border-color: #6e4c1b;
   color: var(--accent);
 }
+.layout:not(.with-crosshair-preview) .editor {
+  container-type: inline-size;
+}
+.layout:not(.with-crosshair-preview) .section {
+  width: 100%;
+  max-width: 1180px;
+  min-width: 0;
+  align-content: start;
+}
+.layout:not(.with-crosshair-preview) .editor[data-page="general"] .section,
+.layout:not(.with-crosshair-preview) .editor[data-page="taskhotkeys"] .section {
+  max-width: 760px;
+}
+.layout:not(.with-crosshair-preview) .section.updates-section {
+  align-content: stretch;
+}
+.layout:not(.with-crosshair-preview) .actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.layout:not(.with-crosshair-preview) .actions .action {
+  max-width: 100%;
+  padding-inline: 16px;
+  overflow-wrap: anywhere;
+}
+.layout:not(.with-crosshair-preview) .field-row {
+  grid-template-columns: auto auto;
+  justify-content: start;
+}
+.layout:not(.with-crosshair-preview) input[type="number"] {
+  width: 120px;
+  max-width: 100%;
+  height: 36px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #101014;
+  color: var(--text);
+}
+.layout:not(.with-crosshair-preview) input:disabled {
+  color: var(--faint);
+}
+.layout:not(.with-crosshair-preview) .field select {
+  max-width: 420px;
+}
+.layout:not(.with-crosshair-preview) .field > label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.layout:not(.with-crosshair-preview) .field > label input[type="checkbox"] {
+  flex: 0 0 auto;
+}
+.layout:not(.with-crosshair-preview) .update-status {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.settings-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+.settings-card {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--soft);
+  border-radius: 10px;
+}
+.settings-card h3 {
+  margin: 0 0 2px;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 650;
+}
+@container (min-width: 900px) {
+  .settings-columns {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
 .action.danger {
   color: #f0aab1;
 }
@@ -864,42 +936,6 @@ input[type="color"] {
 }
 .update-status {
   display: grid;
-  gap: 8px;
-  color: var(--text);
-}
-.event-log {
-  max-height: 280px;
-  overflow-y: auto;
-  overflow-x: hidden;
-  padding-right: 8px;
-  align-content: start;
-  word-break: break-word;
-  scrollbar-color: #6e4c1b #17171a;
-}
-.event-zone-settings {
-  display: grid;
-  gap: 12px;
-  padding: 12px;
-  background: #1d1d21;
-  border: 1px solid var(--soft);
-  border-radius: 10px;
-}
-.event-zone-settings summary {
-  cursor: pointer;
-  color: var(--text);
-  font-weight: 700;
-}
-.event-notification-actions .danger {
-  grid-column: 1;
-}
-.event-toggles {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px 16px;
-}
-.event-toggles label {
-  display: flex;
-  align-items: center;
   gap: 8px;
   color: var(--text);
 }
@@ -998,7 +1034,7 @@ input[type="color"] {
     <div class="brand"><strong>DayZ-Map.ru Companion</strong></div>
   </header>
 
-  <main class="layout">
+  <main class="layout with-crosshair-preview" id="layout">
     <aside class="panel sidebar">
       <div class="nav" id="nav"></div>
       <button class="action danger" id="exitApplication">Выйти из приложения</button>
@@ -1022,7 +1058,6 @@ const bridge = window.chrome.webview;
 let state = null;
 let activeTab = "crosshair";
 let hotkeyCapture = null;
-let eventZoneSettingsOpen = false;
 let pendingConfig = null;
 let pendingConfigTimer = null;
 let selectedProfileId = null;
@@ -1045,7 +1080,6 @@ const defaultHotkeys = {
 
 const navigation = [
   { tab: ["dayz", "Синхронизация меток"] },
-  { tab: ["events", "Уведомления о событиях"] },
   { id: "tasks", label: "Отслеживание заданий", tabs: [
     ["tasks", "Настройки"],
     ["taskhotkeys", "Горячие клавиши"]
@@ -1287,6 +1321,8 @@ function renderMarkdown(markdown) {
 
 function render() {
   if (!state) return;
+  const showPreview = navigation.find(item => item.id === "crosshair").tabs.some(([id]) => id === activeTab);
+  document.getElementById("layout").classList.toggle("with-crosshair-preview", showPreview);
   renderSidebar();
   renderEditor();
   document.getElementById("preview").src = state.preview || "";
@@ -1309,7 +1345,6 @@ function renderDataChanged(previous, next) {
     dayZSettings: value.dayZ?.settings,
     battlePass: value.battlePass,
     hotkeyErrors: value.hotkeyErrors,
-    eventNotifications: value.eventNotifications,
     monitors: value.monitors,
     preview: value.preview
   });
@@ -1319,6 +1354,7 @@ function renderDataChanged(previous, next) {
 function keepEditedState(previous, next) {
   return {
     ...previous,
+    preview: next.preview,
     dayZ: next.dayZ ? { ...previous.dayZ, status: next.dayZ.status } : previous.dayZ
   };
 }
@@ -1350,12 +1386,12 @@ function renderEditor() {
     taskhotkeys: renderBattlePassHotkeys(),
     monitor: renderMonitor(),
     dayz: renderDayZ(),
-    events: renderEvents(),
     tasks: renderBattlePass(),
     profiles: renderProfiles(),
     updates: renderUpdates()
   };
   const editor = document.getElementById("editor");
+  editor.dataset.page = activeTab;
   editor.classList.toggle("updates-editor", activeTab === "updates");
   editor.innerHTML = `<div class="section active ${activeTab === "updates" ? "updates-section" : ""}">${sections[activeTab]}</div>`;
   if (activeTab === "crosshair") {
@@ -1402,6 +1438,8 @@ function organizeCrosshairSection() {
   const crosshairGroup = createGroup("Перекрестие");
   const dotGroup = createGroup("Точка");
   const outlineGroup = createGroup("Обводка");
+  dotGroup.classList.add("separated");
+  outlineGroup.classList.add("separated");
   const crosshairOpacity = byPath("[data-slider='Color.A']");
   const crosshairColor = byPath("[data-color-role='crosshair']");
   const dotColor = byPath("[data-color-role='dot']");
@@ -1503,13 +1541,7 @@ function renderGeneral() {
     <h2>Общие</h2>
     ${field("Запускать вместе с Windows", { value: `<input type="checkbox" ${state.config.StartWithWindows ? "checked" : ""} data-general-check="StartWithWindows">`, input: `` })}
     ${field("Запускать свёрнутым в трей", { value: `<input type="checkbox" ${state.config.StartMinimizedToTray ? "checked" : ""} data-general-check="StartMinimizedToTray">`, input: `` })}
-    ${field("Размер окна прицела", { input: `<select data-overlay-size>
-      <option value="0" ${state.config.OverlayWindowSize === 0 ? "selected" : ""}>200 × 200 (по умолчанию)</option>
-      <option value="1" ${state.config.OverlayWindowSize === 1 ? "selected" : ""}>25% экрана</option>
-      <option value="2" ${state.config.OverlayWindowSize === 2 ? "selected" : ""}>50% экрана</option>
-      <option value="3" ${state.config.OverlayWindowSize === 3 ? "selected" : ""}>75% экрана</option>
-      <option value="4" ${state.config.OverlayWindowSize === 4 ? "selected" : ""}>100% экрана</option>
-    </select>` })}
+    ${field("Размер окна оверлея, % экрана", { input: `<input type="number" min="5" max="100" step="1" value="${state.config.OverlayWindowPercent ?? 50}" data-overlay-percent><div class="limit">Процент ширины и высоты выбранного для прицела монитора. Например, 50% экрана 2560 × 1440 — окно 1280 × 720. Размер самого прицела не меняется.</div>` })}
   `;
 }
 
@@ -1566,19 +1598,32 @@ function renderMonitor() {
 function renderBattlePass() {
   const bp = state.battlePass || { settings: {}, snapshot: { Tasks: [] } };
   const s = bp.settings;
+  const ocr = bp.ocr;
   const tasks = bp.snapshot?.Tasks || [];
   const monitors = [{ DeviceName: "", DisplayName: "Основной монитор" }, ...state.monitors];
   const monitorOptions = monitors.map(m => `<option value="${m.DeviceName}" ${m.DeviceName === (s.MonitorDeviceName || "") ? "selected" : ""}>${escapeHtml(m.DisplayName)}</option>`).join("");
   return `
     <h2>Отслеживание заданий</h2>
+    ${field("Tesseract OCR", { input: `<div class="update-status">${escapeHtml(ocr?.Message || "Проверка OCR ещё не выполнена.")}</div><div class="actions"><button class="action primary" data-command="installOcr" ${ocr?.Ready ? "disabled" : ""}>Установить Tesseract</button><button class="action" data-command="refreshOcr">Проверить снова</button></div>` })}
     <div class="limit">Откройте Battle Pass в DayZ, выберите тип страницы ниже и нажмите «Считать экран». Для еженедельных заданий повторите для страниц 1 и 2.</div>
     ${field("Монитор", { input: `<select data-bp-select="MonitorDeviceName">${monitorOptions}</select>` })}
+    <div class="settings-columns">
+    <div class="settings-card">
+    <h3>Отображение заданий</h3>
     ${field("Оверлей", { input: `<label><input type="checkbox" data-bp-check="OverlayVisible" ${s.OverlayVisible ? "checked" : ""}> Показывать</label> <label><input type="checkbox" data-bp-check="ShowCompleted" ${s.ShowCompleted ? "checked" : ""}> Выполненные</label> <label><input type="checkbox" data-bp-check="ShowSeasonal" ${s.ShowSeasonal ? "checked" : ""}> Сезонные</label> <label><input type="checkbox" data-bp-check="ShowTaskDescriptions" ${s.ShowTaskDescriptions ? "checked" : ""}> Показывать описания</label> <label><input type="checkbox" data-bp-check="OverlayEditingEnabled" ${s.OverlayEditingEnabled ? "checked" : ""}> Перемещение и изменение размера</label> <label><input type="checkbox" data-bp-check="SaveDebugScreenshot" ${s.SaveDebugScreenshot ? "checked" : ""}> Сохранять отладочный снимок</label>` })}
+    </div>
+    <div class="settings-card">
+    <h3>Размер и оформление</h3>
     ${field("Размер", { input: `<label>Ширина <input type="number" min="220" max="900" value="${s.Width || 360}" data-bp-number="Width"></label> <label>Высота <input type="number" min="92" max="850" value="${s.Height || 470}" data-bp-number="Height"></label> <label>Шрифт <input type="number" min="9" max="28" value="${s.FontSize || 14}" data-bp-number="FontSize"></label> <label>Прозрачность <input type="number" min="40" max="255" value="${s.Opacity || 230}" data-bp-number="Opacity"></label>` })}
+    </div>
+    </div>
+    <div class="settings-card">
+    <h3>Сканирование и данные</h3>
     <div class="limit">Для точной настройки используйте «Настроить зоны на экране»: зоны можно перетаскивать и менять их размер прямо поверх текущего изображения Battle Pass.</div>
     <div class="actions"><button class="action primary" data-command="calibrateBattlePassZones">Настроить зоны на экране</button><button class="action" data-command="previewBattlePassZones">Предпросмотр зон</button><button class="action primary" data-command="scanBattlePass">Считать экран</button><button class="action" data-command="editBattlePassTasks">Проверить и исправить</button><button class="action" data-command="showBattlePassDebug">Открыть отладочный снимок</button><button class="action danger" data-command="clearBattlePass">Очистить данные</button></div>
     <div class="actions"><button class="action" data-command="resetBattlePassOverlayBounds">Сбросить положение и размер оверлея</button></div>
     <div class="update-status">Последнее обновление: ${bp.snapshot?.UpdatedAt ? escapeHtml(new Date(bp.snapshot.UpdatedAt).toLocaleString()) : "ещё не выполнялось"}. Сохранено заданий: ${tasks.length}.</div>
+    </div>
   `;
 }
 
@@ -1637,6 +1682,8 @@ function renderDayZ() {
   const actionFeedback = dayZActionFeedback || "Нажмите «Проверить», чтобы обновить статус файла и API.";
   return `
     <h2>Метки DayZ</h2>
+    <div class="settings-card">
+    <h3>Подключение и файл</h3>
     ${field("Статус API", { input: `<div class="update-status">${escapeHtml(status.ServiceStatus)}<span>${escapeHtml(address)} · обновляется автоматически</span></div>` })}
     ${field("Последняя операция", { input: `<div class="update-status">${escapeHtml(status.LastOperation || "Операций с метками пока не было.")}</div>` })}
     ${field("Состояние DayZ", { input: `<div class="update-status">${escapeHtml(dayZWarning)}</div>` })}
@@ -1649,63 +1696,23 @@ function renderDayZ() {
       <button class="action" data-command="openDayZMarkersFolder">Открыть папку</button>
       <button class="action" data-command="openRuntimeLog">Открыть журнал</button>
     </div>
+    </div>
+    <div class="settings-columns">
+    <div class="settings-card">
+    <h3>Параметры API</h3>
     ${field("Автоматически выбрать порт", { value: `<input type="checkbox" ${settings.AutoPort ? "checked" : ""} data-dayz-check="AutoPort">`, input: `` })}
     ${field("Порт API", { input: `<input type="number" min="1" max="65535" value="${settings.Port}" ${settings.AutoPort ? "disabled" : ""} data-dayz-number="Port">` })}
     ${field("Разрешить localhost:8000", { value: `<input type="checkbox" ${settings.AllowDevelopmentOrigin ? "checked" : ""} data-dayz-check="AllowDevelopmentOrigin">`, input: `` })}
     ${field("Запрещать запись при запущенном DayZ", { value: `<input type="checkbox" ${settings.BlockWritesWhenDayZRunning ? "checked" : ""} data-dayz-check="BlockWritesWhenDayZRunning">`, input: `` })}
+    </div>
+    <div class="settings-card">
+    <h3>Резервные копии</h3>
     ${field("Максимум резервных копий", { input: `<input type="number" min="1" max="100" value="${settings.BackupLimit}" data-dayz-number="BackupLimit">` })}
     ${field("Хранить backup, дней", { input: `<input type="number" min="1" max="3650" value="${settings.BackupMaxAgeDays}" data-dayz-number="BackupMaxAgeDays">` })}
     ${field("Последние backup", { input: `<div class="update-status">${backupList}</div>` })}
+    </div>
+    </div>
     <div class="limit">DayZ-Map.ru Companion не аффилирован и не авторизован Bohemia Interactive a.s. DAYZ является товарным знаком Bohemia Interactive a.s.</div>
-  `;
-}
-
-function renderCaptureZone(label, property, zone) {
-  const percent = value => Math.round(Number(value) * 100);
-  const input = (name, title) => `<label class="limit">${title}<input type="number" min="0" max="100" step="1" value="${percent(zone[name])}" data-event-zone="${property}" data-event-zone-value="${name}"></label>`;
-  return field(label, { input: `<div class="update-status"><div class="actions">${input("X", "Слева, %")}${input("Y", "Сверху, %")}${input("Width", "Ширина, %")}${input("Height", "Высота, %")}</div><span>На предпросмотре зону можно перетаскивать мышью, а её размер — менять за маркер в правом нижнем углу.</span></div>` });
-}
-
-function renderCaptureCalibration(preview, settings) {
-  if (!preview?.DataUri) return "";
-  const zone = (property, label, color) => {
-    const value = settings[property];
-    const style = `left:${Number(value.X) * 100}%;top:${Number(value.Y) * 100}%;width:${Number(value.Width) * 100}%;height:${Number(value.Height) * 100}%;border-color:${color};`;
-    return `<div data-event-calibration-zone="${property}" style="position:absolute;box-sizing:border-box;border:2px solid ${color};background:transparent;cursor:move;touch-action:none;${style}"><span style="position:absolute;left:0;top:0;padding:2px 5px;background:${color};color:#101014;font-size:11px;line-height:14px;white-space:nowrap;pointer-events:none">${label}</span><span data-event-calibration-resize="${property}" title="Изменить размер" style="position:absolute;right:-7px;bottom:-7px;width:14px;height:14px;border:2px solid #101014;border-radius:50%;background:${color};cursor:nwse-resize"></span></div>`;
-  };
-  return `<div data-event-calibrator style="position:relative;width:100%;margin-top:10px;line-height:0;user-select:none"><img src="${preview.DataUri}" alt="Предпросмотр зон DayZ" draggable="false" style="display:block;width:100%;height:auto;border:1px solid #414146;border-radius:6px">${zone("TopLeftZone", "Верхняя левая", "#ffb547")}${zone("TopCenterZone", "Верхняя центральная", "#55c4ff")}</div>`;
-}
-
-function renderEvents() {
-  const settings = state.eventNotifications.settings;
-  const windows = state.eventNotifications.windows || [];
-  const log = state.eventNotifications.log || [];
-  const ocr = state.eventNotifications.ocr;
-  const capturePreview = state.eventNotifications.capturePreview;
-  const isConnected = Boolean(settings.DeviceId && settings.ConnectedUser);
-  const connected = isConnected ? `Подключено: ${settings.ConnectedUser}` : "Устройство не подключено";
-  const delivery = settings.LastDeliveryAt ? new Date(settings.LastDeliveryAt).toLocaleString() : "Пока нет";
-  const error = settings.LastError ? `Ошибка: ${settings.LastError}` : (state.eventNotifications.monitoring ? "Мониторинг запущен" : "Мониторинг выключен");
-  return `
-    <h2>Уведомления о событиях</h2>
-    ${field("Связь DayZ-Map / Discord", { input: `<div class="update-status">${escapeHtml(connected)}<span>${escapeHtml(error)}</span><span>Последняя доставка: ${escapeHtml(delivery)}</span></div>` })}
-    ${field("Мониторить игровые уведомления", { value: `<input type="checkbox" ${settings.Enabled ? "checked" : ""} data-event-check="Enabled">`, input: `` })}
-    ${field("Изображение", { input: `<div class="limit">В Discord отправляется только скриншот области уведомления.</div>` })}
-    <div class="actions event-notification-actions"><button class="action primary" data-command="connectEventNotifications" ${isConnected ? "disabled" : ""}>${isConnected ? "DayZ-Map подключён" : "Войти через DayZ-Map"}</button><button class="action" data-command="testEventNotifications" ${isConnected ? "" : "disabled"}>Проверить Discord-уведомление</button><button class="action danger" data-command="disconnectEventNotifications" ${isConnected ? "" : "disabled"}>Отключить</button></div>
-    ${field("Tesseract OCR", { input: `<div class="update-status">${escapeHtml(ocr?.Message || "Проверка OCR ещё не выполнена.")}</div><div class="actions"><button class="action primary" data-command="installEventOcr" ${ocr?.Ready ? "disabled" : ""}>Установить Tesseract</button><button class="action" data-command="refreshEventOcr">Проверить снова</button></div>` })}
-    ${field("Окно DayZ", { input: `<select data-event-text="WindowTitle"><option value="" ${!settings.WindowTitle ? "selected" : ""}>Автоматически: первое найденное окно</option>${windows.map(window => `<option value="${escapeHtml(window.Title)}" ${window.Title === settings.WindowTitle ? "selected" : ""}>${escapeHtml(window.Title)} (${window.width}×${window.height})</option>`).join("")}</select><div class="limit">Список обновляется при открытии вкладки. Если выбранное окно закрыто, мониторинг остановится с понятной ошибкой.</div>` })}
-    <details class="event-zone-settings" data-event-zone-settings ${eventZoneSettingsOpen ? "open" : ""}>
-      <summary>Настройка зон</summary>
-      ${renderCaptureZone("Зона: верхняя левая", "TopLeftZone", settings.TopLeftZone)}
-      ${renderCaptureZone("Зона: верхняя центральная", "TopCenterZone", settings.TopCenterZone)}
-      ${field("Предпросмотр зон", { input: `<div class="update-status">${escapeHtml(capturePreview?.Message || "Предпросмотр ещё не создан.")}${renderCaptureCalibration(capturePreview, settings)}</div><div class="actions"><button class="action" data-command="previewEventCapture">Обновить предпросмотр</button><button class="action" data-event-reset-zones>Сбросить зоны</button></div>` })}
-    </details>
-    ${field("Интервал проверки, мс", { input: `<input type="number" min="200" max="2000" value="${settings.PollIntervalMs}" data-event-number="PollIntervalMs">` })}
-    ${field("Минимальный повтор, сек", { input: `<input type="number" min="5" max="3600" value="${settings.DuplicateIntervalSeconds}" data-event-number="DuplicateIntervalSeconds">` })}
-    ${field("События", { input: `<div class="event-toggles"><label><input type="checkbox" ${settings.MilitaryConvoy ? "checked" : ""} data-event-check="MilitaryConvoy">Военный конвой</label><label><input type="checkbox" ${settings.Camp ? "checked" : ""} data-event-check="Camp">Военный лагерь</label><label><input type="checkbox" ${settings.SectantRitual ? "checked" : ""} data-event-check="SectantRitual">Ритуал сектантов</label><label><input type="checkbox" ${settings.ChemicalAccident ? "checked" : ""} data-event-check="ChemicalAccident">Химическая авария</label><label><input type="checkbox" ${settings.Loading ? "checked" : ""} data-event-check="Loading">Погрузка</label><label><input type="checkbox" ${settings.AreaClearance ? "checked" : ""} data-event-check="AreaClearance">Зачистка местности</label></div>` })}
-    ${field("Адрес DayZ-Map API", { input: `<input type="url" value="${escapeHtml(settings.BackendUrl)}" data-event-text="BackendUrl">` })}
-    ${field("Локальный журнал", { input: `<div class="update-status event-log">${log.length ? log.map(item => `<span>${escapeHtml(new Date(item.At).toLocaleTimeString())} — ${escapeHtml(item.Message)}</span>`).join("") : "Событий в этой сессии пока нет."}</div><div class="actions"><button class="action" data-command="clearEventLog" ${log.length ? "" : "disabled"}>Очистить журнал</button></div>` })}
-    <div class="limit">Захват выполняется только из двух зон окна DayZ: верхней левой и верхней центральной. Нужен установленный Tesseract OCR с языками rus и eng. Companion не читает память игры и не эмулирует ввод.</div>
   `;
 }
 
@@ -1799,19 +1806,12 @@ function bindEditorEvents() {
   document.querySelectorAll("[data-bp-select]").forEach(input => input.addEventListener("change", () => updateBattlePass(settings => settings[input.dataset.bpSelect] = input.value || null)));
   document.querySelectorAll("[data-bp-number]").forEach(input => input.addEventListener("change", () => updateBattlePass(settings => settings[input.dataset.bpNumber] = Number(input.value))));
   document.querySelectorAll("[data-bp-percent]").forEach(input => input.addEventListener("change", () => updateBattlePass(settings => settings[input.dataset.bpPercent] = Number(input.value) / 100)));
-  document.querySelectorAll("[data-event-check]").forEach(input => input.addEventListener("change", () => updateDayZ(settings => settings.EventNotifications[input.dataset.eventCheck] = input.checked)));
-  document.querySelectorAll("[data-event-number]").forEach(input => input.addEventListener("change", () => updateDayZ(settings => settings.EventNotifications[input.dataset.eventNumber] = Math.min(Number(input.max), Math.max(Number(input.min), Number(input.value || input.min))))));
-  document.querySelectorAll("[data-event-text]").forEach(input => input.addEventListener("change", () => updateDayZ(settings => settings.EventNotifications[input.dataset.eventText] = input.value.trim())));
-  document.querySelectorAll("[data-event-zone]").forEach(input => input.addEventListener("change", () => updateDayZ(settings => settings.EventNotifications[input.dataset.eventZone][input.dataset.eventZoneValue] = Math.min(100, Math.max(0, Number(input.value || 0))) / 100)));
-  const zoneSettings = document.querySelector("[data-event-zone-settings]");
-  if (zoneSettings) zoneSettings.addEventListener("toggle", () => eventZoneSettingsOpen = zoneSettings.open);
-  document.querySelectorAll("[data-event-reset-zones]").forEach(button => button.addEventListener("click", () => updateDayZ(settings => {
-    settings.EventNotifications.TopLeftZone = { X: .04, Y: .06, Width: .30, Height: .11 };
-    settings.EventNotifications.TopCenterZone = { X: .38, Y: .06, Width: .24, Height: .11 };
-  })));
-  bindCaptureCalibration();
-  document.querySelectorAll("[data-overlay-size]").forEach(input => {
-    input.addEventListener("change", () => update(config => config.OverlayWindowSize = Number(input.value)));
+  document.querySelectorAll("[data-overlay-percent]").forEach(input => {
+    input.addEventListener("change", () => {
+      const percent = Math.min(100, Math.max(5, Math.round(Number(input.value) || 50)));
+      input.value = percent;
+      update(config => config.OverlayWindowPercent = percent, { render: false });
+    });
   });
   document.querySelectorAll("[data-select]").forEach(input => {
     input.addEventListener("change", () => updateProfile(p => setPath(p, input.dataset.select, Number(input.value))));
@@ -1908,67 +1908,6 @@ function bindEditorEvents() {
   if (name) name.addEventListener("change", flushPendingConfig);
   const monitor = document.getElementById("monitorSelect");
   if (monitor) monitor.addEventListener("change", () => update(config => config.TargetMonitorDeviceName = monitor.value));
-}
-
-function bindCaptureCalibration() {
-  document.querySelectorAll("[data-event-calibrator]").forEach(calibrator => {
-    const image = calibrator.querySelector("img");
-    const updateZoneDisplay = (property, value) => {
-      const element = calibrator.querySelector(`[data-event-calibration-zone="${property}"]`);
-      if (element) {
-        element.style.left = `${value.X * 100}%`;
-        element.style.top = `${value.Y * 100}%`;
-        element.style.width = `${value.Width * 100}%`;
-        element.style.height = `${value.Height * 100}%`;
-      }
-      document.querySelectorAll(`[data-event-zone="${property}"]`).forEach(input => {
-        input.value = Math.round(Number(value[input.dataset.eventZoneValue]) * 100);
-      });
-    };
-    calibrator.querySelectorAll("[data-event-calibration-zone]").forEach(element => {
-      element.addEventListener("pointerdown", event => {
-        const property = element.dataset.eventCalibrationZone;
-        const resizing = event.target.closest("[data-event-calibration-resize]")?.dataset.eventCalibrationResize === property;
-        const initial = clone(state.dayZ.settings.EventNotifications[property]);
-        const bounds = () => image.getBoundingClientRect();
-        const start = { x: event.clientX, y: event.clientY };
-        let current = initial;
-        event.preventDefault();
-        element.setPointerCapture(event.pointerId);
-        const move = moveEvent => {
-          const rect = bounds();
-          if (!rect.width || !rect.height) return;
-          const dx = (moveEvent.clientX - start.x) / rect.width;
-          const dy = (moveEvent.clientY - start.y) / rect.height;
-          if (resizing) {
-            current = {
-              X: initial.X,
-              Y: initial.Y,
-              Width: Math.min(1 - initial.X, Math.max(.05, initial.Width + dx)),
-              Height: Math.min(1 - initial.Y, Math.max(.05, initial.Height + dy))
-            };
-          } else {
-            current = {
-              X: Math.min(1 - initial.Width, Math.max(0, initial.X + dx)),
-              Y: Math.min(1 - initial.Height, Math.max(0, initial.Y + dy)),
-              Width: initial.Width,
-              Height: initial.Height
-            };
-          }
-          updateZoneDisplay(property, current);
-        };
-        const finish = () => {
-          element.removeEventListener("pointermove", move);
-          element.removeEventListener("pointerup", finish);
-          element.removeEventListener("pointercancel", finish);
-          updateDayZ(settings => settings.EventNotifications[property] = current);
-        };
-        element.addEventListener("pointermove", move);
-        element.addEventListener("pointerup", finish);
-        element.addEventListener("pointercancel", finish);
-      });
-    });
-  });
 }
 
 function updateDayZ(mutator) {
@@ -2187,6 +2126,10 @@ document.addEventListener("click", event => {
 });
 
 window.DayZMapCompanion = {
+  receivePreview(preview) {
+    if (state) state.preview = preview;
+    document.getElementById("preview").src = preview;
+  },
   receiveState(next) {
     const previous = state;
     const wasDayZStatusPending = dayZStatusPending;
@@ -2227,6 +2170,24 @@ window.DayZMapCompanion = {
   }
 };
 
+let previewResizeTimer;
+let lastPreviewSize = "";
+function schedulePreviewResize() {
+  clearTimeout(previewResizeTimer);
+  previewResizeTimer = setTimeout(() => {
+    const preview = document.getElementById("preview");
+    if (!preview.clientWidth || !preview.clientHeight) return;
+    const ratio = window.devicePixelRatio || 1;
+    const width = Math.min(8192, Math.max(1, Math.round(preview.clientWidth * ratio)));
+    const height = Math.min(8192, Math.max(1, Math.round(preview.clientHeight * ratio)));
+    const key = `${width}x${height}`;
+    if (key === lastPreviewSize) return;
+    lastPreviewSize = key;
+    post({ type: "previewSize", width, height });
+  }, 120);
+}
+new ResizeObserver(schedulePreviewResize).observe(document.getElementById("preview"));
+window.addEventListener("resize", schedulePreviewResize);
 post({ type: "ready" });
 </script>
 </body>

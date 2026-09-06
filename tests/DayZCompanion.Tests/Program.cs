@@ -20,20 +20,15 @@ var tests = new (string Name, Action Run)[]
     ("рестарт API требуется только при смене порта", SettingsRestartOnlyForPortChanges),
     ("размер окна хранится в настройках Companion", CompanionSettingsKeepWindowBounds),
     ("настройки Companion сохраняются и восстанавливаются", CompanionSettingsStoreRoundTrips),
+    ("старые настройки событий не сбрасывают настройки Companion", LegacyEventSettingsAreIgnored),
     ("выбор портов соблюдает auto и manual режимы", PortSelectionHonorsModes),
     ("ошибка записи в каталог файла диагностируется", FileAccessProbeReportsWriteFailure),
     ("старая позиция окна переносится в настройки Companion", LegacyWindowBoundsAreMigrated),
     ("API проверяет Origin и PNA preflight", ApiChecksOriginAndPreflight),
-    ("OCR классифицирует все игровые события", OcrClassifiesGameEvents),
-    ("очистка OCR убирает HUD и заголовок", OcrCleanupRemovesHudAndTitle),
-    ("дедупликация независима для разных типов", EventDeduplicationIsPerType),
-    ("стартовые зоны мигрируют к точным областям", EventZonesMigrateToPreciseDefaults),
-    ("привязка Companion обменивает код через mock API", CompanionPairingUsesMockApi),
-    ("доставка события отправляет multipart через mock API", CompanionDeliveryUsesMockApi),
-    ("отозванная сервером сессия удаляется локально", RevokedCompanionSessionIsCleared),
-    ("отключение Companion отзывает устройство на сервере", CompanionDisconnectRevokesDevice),
     ("Battle Pass settings normalise OCR layout", BattlePassSettingsNormalize),
-    ("Battle Pass scan hotkey is reset once", BattlePassScanHotkeyIsResetOnce)
+    ("Battle Pass scan hotkey is reset once", BattlePassScanHotkeyIsResetOnce),
+    ("overlay percentage migrates and persists", OverlayPercentageMigratesAndPersists),
+    ("overlay percentage follows monitor bounds", OverlayPercentageFollowsMonitorBounds)
 };
 
 var failures = new List<string>();
@@ -78,135 +73,30 @@ static void MergeDeduplicatesAndUpdates()
     Equal(1, result.Updated, "неверно посчитаны обновлённые метки");
 }
 
-static void OcrClassifiesGameEvents()
+static void LegacyEventSettingsAreIgnored()
 {
-    Equal("military_convoy", DayZEventNotifications.Classify("Военный конвой остановился"), "конвой не распознан");
-    Equal("camp", DayZEventNotifications.Classify("Военный лагерь обнаружен"), "военный лагерь не распознан");
-    Equal(null, DayZEventNotifications.Classify("Лагерь обнаружен"), "обычный лагерь не должен распознаваться");
-    Equal("sectant_ritual", DayZEventNotifications.Classify("Сектанты начинают ритуал"), "ритуал сектантов не распознан");
-    Equal("chemical_accident", DayZEventNotifications.Classify("Химическая авария произошла"), "химическая авария не распознана");
-    Equal("loading", DayZEventNotifications.Classify("Погрузка завершена"), "погрузка не распознана");
-    Equal("area_clearance", DayZEventNotifications.Classify("Зачистка местности завершена"), "зачистка не распознана");
-}
-
-static void OcrCleanupRemovesHudAndTitle()
-{
-    var text = "Virtyzz\nВоенный конвой\nПовторяю...Военный конвой находится вблизи деревни Пуста.";
-    Equal("Повторяю...Военный конвой находится вблизи деревни Пуста.", DayZEventNotifications.CleanEventText("military_convoy", text), "очистка оставила HUD или заголовок");
-}
-
-static void EventDeduplicationIsPerType()
-{
-    var gate = new DayZEventDuplicateGate();
-    var at = DateTimeOffset.Parse("2026-08-25T00:00:00Z");
-    True(gate.TryAccept("military_convoy", at, TimeSpan.FromSeconds(15)), "первое событие отклонено");
-    True(!gate.TryAccept("military_convoy", at.AddSeconds(10), TimeSpan.FromSeconds(15)), "повтор не отфильтрован");
-    True(gate.TryAccept("area_clearance", at.AddSeconds(10), TimeSpan.FromSeconds(15)), "другой тип ошибочно заблокирован");
-    True(gate.TryAccept("military_convoy", at.AddSeconds(15), TimeSpan.FromSeconds(15)), "событие после интервала отклонено");
-}
-
-static void EventZonesMigrateToPreciseDefaults()
-{
-    var settings = new DayZEventNotificationSettings
+    using var fixture = new MarkersFixture("[]");
+    var store = new DayZCompanionSettingsStore(fixture.DirectoryPath);
+    File.WriteAllText(store.SettingsPath, JsonSerializer.Serialize(new
     {
-        TopLeftZone = new DayZCaptureZone(.03, .05, .32, .14),
-        TopCenterZone = new DayZCaptureZone(.35, .05, .30, .14)
-    };
-    settings.Normalize();
-    Equal(.04, settings.TopLeftZone.X, "левая зона не мигрировала");
-    Equal(.38, settings.TopCenterZone.X, "центральная зона не мигрировала");
+        PrivateMarkersPath = fixture.Path,
+        AutoPort = false,
+        Port = 49965,
+        BackupLimit = 7,
+        BackupMaxAgeDays = 120,
+        EventNotifications = new { Enabled = true, DeviceTokenProtected = "legacy-token", TopLeftZone = new { X = .04 } }
+    }));
+    var settings = store.Load();
+    Equal(fixture.Path, settings.PrivateMarkersPath, "путь к меткам сброшен");
+    True(!settings.AutoPort, "режим порта сброшен");
+    Equal(49965, settings.Port, "порт сброшен");
+    Equal(7, settings.BackupLimit, "число резервных копий сброшено");
+    Equal(120, settings.BackupMaxAgeDays, "срок хранения сброшен");
+    store.Save(settings);
+    using var saved = JsonDocument.Parse(File.ReadAllText(store.SettingsPath));
+    True(!saved.RootElement.TryGetProperty("EventNotifications", out _), "настройки событий сохранены повторно");
+    Equal(fixture.Path, store.Load().PrivateMarkersPath, "повторная загрузка потеряла путь");
 }
-
-static void CompanionPairingUsesMockApi()
-{
-    using var handler = new MockHttpHandler(request =>
-    {
-        Equal(HttpMethod.Post, request.Method, "неверный метод привязки");
-        Equal("/profiles-api/companion/pairings/consume", request.RequestUri!.AbsolutePath, "неверный endpoint привязки");
-        True(request.Headers.ConnectionClose == true, "привязка должна использовать новое HTTP-соединение");
-        var body = request.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
-        True(body.Contains("one-time-code", StringComparison.Ordinal), "код не передан на backend");
-        return JsonResponse("""{"token":"device-token","device_id":"device-7","display_name":"Тестер"}""");
-    });
-    var settings = new DayZEventNotificationSettings { BackendUrl = "https://mock.dayz-map.test/profiles-api" };
-    using var notifications = new DayZEventNotifications(settings, handler);
-    var link = notifications.BeginPairing(49950);
-    var state = Uri.UnescapeDataString(new Uri(link).Query.Split('&').Single(part => part.StartsWith("state=", StringComparison.Ordinal))[6..]);
-    notifications.CompletePairingAsync("one-time-code", state, CancellationToken.None).GetAwaiter().GetResult();
-    Equal("device-7", settings.DeviceId, "идентификатор устройства не сохранён");
-    Equal("Тестер", settings.ConnectedUser, "имя пользователя не сохранено");
-    True(!string.IsNullOrEmpty(settings.DeviceTokenProtected), "токен не защищён и не сохранён");
-    Equal(1, handler.Requests.Count, "привязка выполнила лишние запросы");
-}
-
-static void CompanionDeliveryUsesMockApi()
-{
-    using var handler = new MockHttpHandler(request =>
-    {
-        Equal(HttpMethod.Post, request.Method, "неверный метод доставки");
-        Equal("/profiles-api/companion/events", request.RequestUri!.AbsolutePath, "неверный endpoint доставки");
-        Equal("Bearer", request.Headers.Authorization?.Scheme, "отсутствует Bearer-авторизация");
-        Equal("device-token", request.Headers.Authorization?.Parameter, "передан неверный токен");
-        var content = request.Content as MultipartFormDataContent;
-        True(content is not null, "событие передано не как multipart");
-        var parts = content!.ToList();
-        Equal(1, parts.Count, "в Discord должен отправляться только скриншот");
-        var image = parts.Single();
-        Equal("image", image.Headers.ContentDisposition?.Name?.Trim('"'), "скриншот передан в неверном поле");
-        Equal("image/png", image.Headers.ContentType?.MediaType, "изображение передано в неверном формате");
-        return new HttpResponseMessage(HttpStatusCode.OK);
-    });
-    var settings = new DayZEventNotificationSettings { BackendUrl = "https://mock.dayz-map.test/profiles-api", DeviceTokenProtected = Protect("device-token") };
-    using var notifications = new DayZEventNotifications(settings, handler);
-    using var image = new System.Drawing.Bitmap(2, 2);
-    notifications.SendEventAsync("military_convoy", (System.Drawing.Bitmap)image.Clone(), CancellationToken.None).GetAwaiter().GetResult();
-    True(settings.LastDeliveryAt is not null, "успешная доставка не записала время");
-    Equal(1, handler.Requests.Count, "доставка выполнила лишние запросы");
-}
-
-static void RevokedCompanionSessionIsCleared()
-{
-    using var handler = new MockHttpHandler(_ => new HttpResponseMessage(HttpStatusCode.Unauthorized) { Content = new StringContent("""{"detail":"token revoked"}""") });
-    var settings = new DayZEventNotificationSettings
-    {
-        BackendUrl = "https://mock.dayz-map.test/profiles-api",
-        DeviceTokenProtected = Protect("revoked-token"),
-        DeviceId = "revoked-device",
-        ConnectedUser = "Тестер"
-    };
-    using var notifications = new DayZEventNotifications(settings, handler);
-    _ = Throws<DayZCompanionException>(() => notifications.SendTestAsync(CancellationToken.None).GetAwaiter().GetResult());
-    Equal("", settings.DeviceTokenProtected, "отозванный токен не удалён");
-    Equal("", settings.DeviceId, "отозванное устройство осталось подключённым");
-    True(settings.LastError.Contains("отозвана", StringComparison.OrdinalIgnoreCase), "не показано состояние отзыва сервером");
-}
-
-static void CompanionDisconnectRevokesDevice()
-{
-    using var handler = new MockHttpHandler(request =>
-    {
-        Equal(HttpMethod.Delete, request.Method, "отключение должно использовать DELETE");
-        Equal("/profiles-api/companion/devices/current", request.RequestUri!.AbsolutePath, "неверный endpoint самоотзыва");
-        Equal("device-token", request.Headers.Authorization?.Parameter, "самоотзыв не авторизован токеном устройства");
-        return new HttpResponseMessage(HttpStatusCode.NoContent);
-    });
-    var settings = new DayZEventNotificationSettings
-    {
-        BackendUrl = "https://mock.dayz-map.test/profiles-api",
-        DeviceTokenProtected = Protect("device-token"),
-        DeviceId = "device-7",
-        ConnectedUser = "Тестер"
-    };
-    using var notifications = new DayZEventNotifications(settings, handler);
-    notifications.DisconnectAsync(CancellationToken.None).GetAwaiter().GetResult();
-    Equal("", settings.DeviceTokenProtected, "токен не удалён после отзыва");
-    Equal("", settings.DeviceId, "устройство осталось привязанным после отзыва");
-    Equal(1, handler.Requests.Count, "самоотзыв выполнил лишние запросы");
-}
-
-static string Protect(string value) => Convert.ToBase64String(System.Security.Cryptography.ProtectedData.Protect(System.Text.Encoding.UTF8.GetBytes(value), null, System.Security.Cryptography.DataProtectionScope.CurrentUser));
-
-static HttpResponseMessage JsonResponse(string json) => new(HttpStatusCode.OK) { Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json") };
 
 static void ReplacePreservesOtherServers()
 {
@@ -472,6 +362,41 @@ static void BattlePassScanHotkeyIsResetOnce()
     True(config.Hotkeys.ScanBattlePass.Enabled, "назначенный пользователем хоткей был повторно сброшен");
 }
 
+static void OverlayPercentageMigratesAndPersists()
+{
+    foreach (var (legacy, expected) in new[]
+    {
+        (OverlayWindowSize.Compact200, 50), (OverlayWindowSize.QuarterScreen, 25),
+        (OverlayWindowSize.HalfScreen, 50), (OverlayWindowSize.ThreeQuartersScreen, 75),
+        (OverlayWindowSize.FullScreen, 100)
+    })
+    {
+        var config = new AppConfig { OverlayWindowSize = legacy };
+        config.Normalize();
+        Equal(expected, config.OverlayWindowPercent!.Value, "legacy size migration");
+        config.OverlayWindowPercent = 37;
+        config.Normalize();
+        var restored = JsonSerializer.Deserialize<AppConfig>(JsonSerializer.Serialize(config.Clone()))!;
+        restored.Normalize();
+        Equal(37, restored.OverlayWindowPercent!.Value, "custom percentage must persist");
+    }
+    var invalid = new AppConfig { OverlayWindowPercent = -10 };
+    invalid.Normalize();
+    Equal(5, invalid.OverlayWindowPercent!.Value, "minimum percentage");
+    invalid.OverlayWindowPercent = 150;
+    invalid.Normalize();
+    Equal(100, invalid.OverlayWindowPercent!.Value, "maximum percentage");
+}
+
+static void OverlayPercentageFollowsMonitorBounds()
+{
+    var screen = new System.Drawing.Rectangle(0, 0, 2560, 1440);
+    Equal(new System.Drawing.Rectangle(640, 360, 1280, 720), OverlayForm.GetOverlayBounds(screen, 50), "half-screen overlay");
+    Equal(screen, OverlayForm.GetOverlayBounds(screen, 100), "full-screen overlay");
+    var secondary = new System.Drawing.Rectangle(-1920, -200, 1920, 1080);
+    Equal(new System.Drawing.Rectangle(-1200, 205, 480, 270), OverlayForm.GetOverlayBounds(secondary, 25), "secondary monitor origin");
+}
+
 static void Equal<T>(T expected, T actual, string message)
 {
     if (!EqualityComparer<T>.Default.Equals(expected, actual)) throw new InvalidOperationException($"{message}: ожидалось {expected}, получено {actual}");
@@ -511,14 +436,3 @@ sealed class MarkersFixture : IDisposable
 }
 
 sealed class TestSkippedException(string message) : Exception(message);
-
-sealed class MockHttpHandler(Func<HttpRequestMessage, HttpResponseMessage> respond) : HttpMessageHandler
-{
-    public List<HttpRequestMessage> Requests { get; } = [];
-
-    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
-    {
-        Requests.Add(request);
-        return Task.FromResult(respond(request));
-    }
-}

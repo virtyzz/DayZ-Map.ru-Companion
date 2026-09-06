@@ -10,6 +10,7 @@ internal sealed class AppConfig
     public bool StartMinimizedToTray { get; set; } = true;
     public string? TargetMonitorDeviceName { get; set; }
     public OverlayWindowSize OverlayWindowSize { get; set; } = OverlayWindowSize.Compact200;
+    public int? OverlayWindowPercent { get; set; }
     public string? EditorMonitorDeviceName { get; set; }
     public EditorWindowBounds? EditorWindowBounds { get; set; }
     public string ActiveProfileId { get; set; } = "default";
@@ -57,6 +58,14 @@ internal sealed class AppConfig
             OverlayWindowSize = OverlayWindowSize.Compact200;
         }
 
+        OverlayWindowPercent = Math.Clamp(OverlayWindowPercent ?? (OverlayWindowSize switch
+        {
+            OverlayWindowSize.QuarterScreen => 25,
+            OverlayWindowSize.ThreeQuartersScreen => 75,
+            OverlayWindowSize.FullScreen => 100,
+            _ => 50
+        }), 5, 100);
+
         EditorWindowBounds?.Normalize();
 
         foreach (var profile in Profiles)
@@ -100,6 +109,7 @@ internal sealed class AppConfig
         StartMinimizedToTray = StartMinimizedToTray,
         TargetMonitorDeviceName = TargetMonitorDeviceName,
         OverlayWindowSize = OverlayWindowSize,
+        OverlayWindowPercent = OverlayWindowPercent,
         EditorMonitorDeviceName = EditorMonitorDeviceName,
         EditorWindowBounds = EditorWindowBounds?.Clone(),
         ActiveProfileId = ActiveProfileId,

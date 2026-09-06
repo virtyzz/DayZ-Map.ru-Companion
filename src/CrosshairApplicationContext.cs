@@ -12,7 +12,6 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
     private readonly DayZCompanionSettingsStore dayZSettingsStore;
     private DayZCompanionServer dayZCompanion;
     private DayZCompanionSettings dayZSettings;
-    private readonly DayZEventNotifications eventNotifications;
     private readonly BattlePassStore battlePassStore;
     private readonly BattlePassTracker battlePassTracker;
     private readonly BattlePassOverlayForm battlePassOverlay;
@@ -29,7 +28,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         StartupManager.SetEnabled(config.StartWithWindows);
         overlay = new OverlayForm();
         overlay.ApplyMonitor(config.TargetMonitorDeviceName);
-        overlay.ApplyWindowSize(config.OverlayWindowSize);
+        overlay.ApplyWindowSize(config.OverlayWindowPercent ?? 50);
         overlay.ApplyProfile(config.CurrentProfile);
 
         if (config.OverlayVisible)
@@ -73,11 +72,8 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         {
             dayZSettingsStore.Save(dayZSettings);
         }
-        eventNotifications = new DayZEventNotifications(dayZSettings.EventNotifications);
-        eventNotifications.Changed += OnEventNotificationsChanged;
-        dayZCompanion = new DayZCompanionServer(dayZSettings, eventNotifications);
+        dayZCompanion = new DayZCompanionServer(dayZSettings);
         dayZCompanion.Start();
-        eventNotifications.Start();
         _ = CheckForStartupUpdateAsync();
 
         if (!config.StartMinimizedToTray)
@@ -289,7 +285,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             return;
         }
 
-        editor = new EditorForm(config, updateService, dayZSettings, dayZCompanion.GetStatus(), eventNotifications, battlePassSettings, battlePassStore.LoadSnapshot(), initialTab);
+        editor = new EditorForm(config, updateService, dayZSettings, dayZCompanion.GetStatus(), battlePassSettings, battlePassStore.LoadSnapshot(), initialTab);
         editor.ConfigChanged += nextConfig =>
         {
             var startupChanged = config.StartWithWindows != nextConfig.StartWithWindows;
@@ -300,7 +296,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
                 StartupManager.SetEnabled(config.StartWithWindows);
             }
             overlay.ApplyMonitor(config.TargetMonitorDeviceName);
-            overlay.ApplyWindowSize(config.OverlayWindowSize);
+            overlay.ApplyWindowSize(config.OverlayWindowPercent ?? 50);
             overlay.ApplyProfile(config.CurrentProfile);
             tray.SetProfiles(config.Profiles, config.ActiveProfileId);
             RegisterConfiguredHotkeys();
@@ -325,11 +321,10 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             var restartHttp = dayZSettings.RequiresHttpRestart(nextSettings);
             dayZSettings.CopyFrom(nextSettings);
             dayZSettingsStore.Save(dayZSettings);
-            if (dayZSettings.EventNotifications.Enabled) eventNotifications.Start(); else eventNotifications.Stop();
             if (restartHttp)
             {
                 dayZCompanion.Dispose();
-                dayZCompanion = new DayZCompanionServer(dayZSettings, eventNotifications);
+                dayZCompanion = new DayZCompanionServer(dayZSettings);
                 dayZCompanion.Start();
             }
             editor?.ApplyDayZState(dayZSettings, dayZCompanion.GetStatus());
@@ -339,12 +334,6 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         editor.BattlePassCommandRequested += HandleBattlePassCommand;
         editor.ExitRequested += ExitApplication;
         editor.Show();
-    }
-
-    private void OnEventNotificationsChanged()
-    {
-        dayZSettingsStore.Save(dayZSettings);
-        editor?.ApplyEventNotificationState(eventNotifications.Settings, eventNotifications.IsMonitoring);
     }
 
     private async Task CheckForStartupUpdateAsync()
@@ -488,7 +477,6 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         store.SaveAtomic(config);
         battlePassStore.SaveSettings(battlePassSettings);
         dayZCompanion.Dispose();
-        eventNotifications.Dispose();
         battlePassClickInterceptor.Dispose();
         hotkeys.Dispose();
         tray.Dispose();
