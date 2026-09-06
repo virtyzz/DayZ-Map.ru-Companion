@@ -3,6 +3,7 @@ bin/
 obj/
 _build_check/
 artifacts/
+tests/DayZCompanion.Tests/build-check-tests/
 
 # IDE/user-local files
 .vs/
