@@ -16,7 +16,7 @@ internal sealed class OverlayForm : Form
     private readonly System.Windows.Forms.Timer watchdogTimer = new();
     private CrosshairProfile profile = CrosshairProfile.Default();
     private string? targetMonitorDeviceName;
-    private int windowPercent = 50;
+    private OverlayWindowSize windowSize = OverlayWindowSize.Compact200;
     private DateTime lastWatchdogLogUtc = DateTime.MinValue;
 
     public OverlayForm()
@@ -63,9 +63,9 @@ internal sealed class OverlayForm : Form
         }
     }
 
-    public void ApplyWindowSize(int percent)
+    public void ApplyWindowSize(OverlayWindowSize nextWindowSize)
     {
-        windowPercent = Math.Clamp(percent, 5, 100);
+        windowSize = nextWindowSize;
         if (IsHandleCreated)
         {
             PinToDesktop();
@@ -183,13 +183,31 @@ internal sealed class OverlayForm : Form
     private void PinToDesktop()
     {
         var screen = MonitorInfo.ResolveScreen(targetMonitorDeviceName);
-        Bounds = GetOverlayBounds(screen.Bounds, windowPercent);
+        Bounds = GetOverlayBounds(screen);
         SetOverlayTopmost();
     }
 
-    internal static Rectangle GetOverlayBounds(Rectangle bounds, int percent)
+    private Rectangle GetOverlayBounds(Screen screen)
     {
-        var scale = Math.Clamp(percent, 5, 100) / 100.0;
+        var bounds = screen.Bounds;
+        var scale = windowSize switch
+        {
+            OverlayWindowSize.QuarterScreen => 0.25,
+            OverlayWindowSize.HalfScreen => 0.5,
+            OverlayWindowSize.ThreeQuartersScreen => 0.75,
+            OverlayWindowSize.FullScreen => 1.0,
+            _ => 0.0
+        };
+
+        if (scale == 0.0)
+        {
+            const int compactSize = 200;
+            return new Rectangle(
+                bounds.Left + (bounds.Width - compactSize) / 2,
+                bounds.Top + (bounds.Height - compactSize) / 2,
+                compactSize,
+                compactSize);
+        }
 
         var width = Math.Max(1, (int)Math.Round(bounds.Width * scale));
         var height = Math.Max(1, (int)Math.Round(bounds.Height * scale));
@@ -232,7 +250,7 @@ internal sealed class OverlayForm : Form
             return;
         }
 
-        var expectedBounds = MonitorInfo.ResolveScreen(targetMonitorDeviceName).Bounds;
+        var expectedBounds = GetOverlayBounds(MonitorInfo.ResolveScreen(targetMonitorDeviceName));
         if (Bounds != expectedBounds)
         {
             AppRuntimeLog.Info($"Overlay bounds drifted from {Bounds} to {expectedBounds}; correcting.");

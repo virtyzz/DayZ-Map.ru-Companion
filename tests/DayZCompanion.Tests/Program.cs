@@ -26,9 +26,7 @@ var tests = new (string Name, Action Run)[]
     ("старая позиция окна переносится в настройки Companion", LegacyWindowBoundsAreMigrated),
     ("API проверяет Origin и PNA preflight", ApiChecksOriginAndPreflight),
     ("Battle Pass settings normalise OCR layout", BattlePassSettingsNormalize),
-    ("Battle Pass scan hotkey is reset once", BattlePassScanHotkeyIsResetOnce),
-    ("overlay percentage migrates and persists", OverlayPercentageMigratesAndPersists),
-    ("overlay percentage follows monitor bounds", OverlayPercentageFollowsMonitorBounds)
+    ("Battle Pass scan hotkey is reset once", BattlePassScanHotkeyIsResetOnce)
 };
 
 var failures = new List<string>();
@@ -360,41 +358,6 @@ static void BattlePassScanHotkeyIsResetOnce()
     config.Hotkeys.ScanBattlePass = new HotkeyBinding { Enabled = true, Key = "F8" };
     config.Normalize();
     True(config.Hotkeys.ScanBattlePass.Enabled, "назначенный пользователем хоткей был повторно сброшен");
-}
-
-static void OverlayPercentageMigratesAndPersists()
-{
-    foreach (var (legacy, expected) in new[]
-    {
-        (OverlayWindowSize.Compact200, 50), (OverlayWindowSize.QuarterScreen, 25),
-        (OverlayWindowSize.HalfScreen, 50), (OverlayWindowSize.ThreeQuartersScreen, 75),
-        (OverlayWindowSize.FullScreen, 100)
-    })
-    {
-        var config = new AppConfig { OverlayWindowSize = legacy };
-        config.Normalize();
-        Equal(expected, config.OverlayWindowPercent!.Value, "legacy size migration");
-        config.OverlayWindowPercent = 37;
-        config.Normalize();
-        var restored = JsonSerializer.Deserialize<AppConfig>(JsonSerializer.Serialize(config.Clone()))!;
-        restored.Normalize();
-        Equal(37, restored.OverlayWindowPercent!.Value, "custom percentage must persist");
-    }
-    var invalid = new AppConfig { OverlayWindowPercent = -10 };
-    invalid.Normalize();
-    Equal(5, invalid.OverlayWindowPercent!.Value, "minimum percentage");
-    invalid.OverlayWindowPercent = 150;
-    invalid.Normalize();
-    Equal(100, invalid.OverlayWindowPercent!.Value, "maximum percentage");
-}
-
-static void OverlayPercentageFollowsMonitorBounds()
-{
-    var screen = new System.Drawing.Rectangle(0, 0, 2560, 1440);
-    Equal(new System.Drawing.Rectangle(640, 360, 1280, 720), OverlayForm.GetOverlayBounds(screen, 50), "half-screen overlay");
-    Equal(screen, OverlayForm.GetOverlayBounds(screen, 100), "full-screen overlay");
-    var secondary = new System.Drawing.Rectangle(-1920, -200, 1920, 1080);
-    Equal(new System.Drawing.Rectangle(-1200, 205, 480, 270), OverlayForm.GetOverlayBounds(secondary, 25), "secondary monitor origin");
 }
 
 static void Equal<T>(T expected, T actual, string message)

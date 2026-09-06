@@ -1537,11 +1537,18 @@ function renderCrosshair() {
 }
 
 function renderGeneral() {
+  const overlaySize = state.config.OverlayWindowSize;
   return `
     <h2>Общие</h2>
     ${field("Запускать вместе с Windows", { value: `<input type="checkbox" ${state.config.StartWithWindows ? "checked" : ""} data-general-check="StartWithWindows">`, input: `` })}
     ${field("Запускать свёрнутым в трей", { value: `<input type="checkbox" ${state.config.StartMinimizedToTray ? "checked" : ""} data-general-check="StartMinimizedToTray">`, input: `` })}
-    ${field("Размер окна оверлея, % экрана", { input: `<input type="number" min="5" max="100" step="1" value="${state.config.OverlayWindowPercent ?? 50}" data-overlay-percent><div class="limit">Процент ширины и высоты выбранного для прицела монитора. Например, 50% экрана 2560 × 1440 — окно 1280 × 720. Размер самого прицела не меняется.</div>` })}
+    ${field("Размер окна прицела", { input: `<select data-overlay-size>
+      <option value="Compact200" ${overlaySize === "Compact200" ? "selected" : ""}>200 × 200 (по умолчанию)</option>
+      <option value="QuarterScreen" ${overlaySize === "QuarterScreen" ? "selected" : ""}>25% экрана</option>
+      <option value="HalfScreen" ${overlaySize === "HalfScreen" ? "selected" : ""}>50% экрана</option>
+      <option value="ThreeQuartersScreen" ${overlaySize === "ThreeQuartersScreen" ? "selected" : ""}>75% экрана</option>
+      <option value="FullScreen" ${overlaySize === "FullScreen" ? "selected" : ""}>100% экрана</option>
+    </select>` })}
   `;
 }
 
@@ -1806,12 +1813,8 @@ function bindEditorEvents() {
   document.querySelectorAll("[data-bp-select]").forEach(input => input.addEventListener("change", () => updateBattlePass(settings => settings[input.dataset.bpSelect] = input.value || null)));
   document.querySelectorAll("[data-bp-number]").forEach(input => input.addEventListener("change", () => updateBattlePass(settings => settings[input.dataset.bpNumber] = Number(input.value))));
   document.querySelectorAll("[data-bp-percent]").forEach(input => input.addEventListener("change", () => updateBattlePass(settings => settings[input.dataset.bpPercent] = Number(input.value) / 100)));
-  document.querySelectorAll("[data-overlay-percent]").forEach(input => {
-    input.addEventListener("change", () => {
-      const percent = Math.min(100, Math.max(5, Math.round(Number(input.value) || 50)));
-      input.value = percent;
-      update(config => config.OverlayWindowPercent = percent, { render: false });
-    });
+  document.querySelectorAll("[data-overlay-size]").forEach(input => {
+    input.addEventListener("change", () => update(config => config.OverlayWindowSize = input.value));
   });
   document.querySelectorAll("[data-select]").forEach(input => {
     input.addEventListener("change", () => updateProfile(p => setPath(p, input.dataset.select, Number(input.value))));

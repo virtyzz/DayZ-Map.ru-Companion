@@ -28,7 +28,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         StartupManager.SetEnabled(config.StartWithWindows);
         overlay = new OverlayForm();
         overlay.ApplyMonitor(config.TargetMonitorDeviceName);
-        overlay.ApplyWindowSize(config.OverlayWindowPercent ?? 50);
+        overlay.ApplyWindowSize(config.OverlayWindowSize);
         overlay.ApplyProfile(config.CurrentProfile);
 
         if (config.OverlayVisible)
@@ -296,7 +296,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
                 StartupManager.SetEnabled(config.StartWithWindows);
             }
             overlay.ApplyMonitor(config.TargetMonitorDeviceName);
-            overlay.ApplyWindowSize(config.OverlayWindowPercent ?? 50);
+            overlay.ApplyWindowSize(config.OverlayWindowSize);
             overlay.ApplyProfile(config.CurrentProfile);
             tray.SetProfiles(config.Profiles, config.ActiveProfileId);
             RegisterConfiguredHotkeys();
