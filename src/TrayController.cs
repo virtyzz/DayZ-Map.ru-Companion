@@ -15,6 +15,7 @@ internal sealed class TrayController : IDisposable
         Action onToggleOverlay,
         Action onOpenEditor,
         Action onOpenUpdates,
+        Action onOpenTreasures,
         Action<string> onSelectProfile,
         Action onExit)
     {
@@ -26,10 +27,12 @@ internal sealed class TrayController : IDisposable
         var exitItem = new ToolStripMenuItem("Выход", null, (_, _) => onExit());
 
         menu = new ContextMenuStrip();
+        var treasuresItem = new ToolStripMenuItem("\u041a\u043b\u0430\u0434\u044b", null, (_, _) => onOpenTreasures());
         menu.Items.Add(toggleItem);
         menu.Items.Add(profilesItem);
         menu.Items.Add(editorItem);
         menu.Items.Add(updatesItem);
+        menu.Items.Add(treasuresItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(exitItem);
 

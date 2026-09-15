@@ -19,6 +19,9 @@ internal sealed class EditorForm : Form
 
     private readonly AssetStore assetStore = new();
     private readonly UpdateService updateService;
+    private readonly TreasureCaptureStore treasureStore;
+    private readonly TreasureCaptureService treasureCaptureService;
+    private readonly TreasureMapBridge treasureMapBridge;
     private readonly WebView2 webView = new();
     private readonly System.Windows.Forms.Timer dayZStatusTimer = new() { Interval = 2500 };
     private AppConfig config;
@@ -31,6 +34,10 @@ internal sealed class EditorForm : Form
     private UpdateInfo? updateInfo;
     private string? pendingTab;
     private bool webReady;
+    private bool treasureCaptureInProgress;
+    private readonly Queue<string> treasureOcrQueue = new();
+    private bool treasureOcrWorkerRunning;
+    private string? treasureFeedback;
 
     public event Action<AppConfig>? ConfigChanged;
     public event Action<string?>? MonitorChanged;
@@ -41,9 +48,14 @@ internal sealed class EditorForm : Form
     public event Action<BattlePassSettings>? BattlePassSettingsChanged;
     public event Action<string>? BattlePassCommandRequested;
 
-    public EditorForm(AppConfig source, UpdateService updateService, DayZCompanionSettings dayZSettings, DayZCompanionStatus dayZStatus, BattlePassSettings battlePassSettings, BattlePassSnapshot battlePassSnapshot, string? initialTab = null)
+    public EditorForm(AppConfig source, UpdateService updateService, DayZCompanionSettings dayZSettings, DayZCompanionStatus dayZStatus, BattlePassSettings battlePassSettings, BattlePassSnapshot battlePassSnapshot, TreasureCaptureStore treasureStore, TreasureCaptureService treasureCaptureService, TreasureMapBridge treasureMapBridge, string? initialTab = null)
     {
         this.updateService = updateService;
+        this.treasureStore = treasureStore;
+        this.treasureCaptureService = treasureCaptureService;
+        this.treasureMapBridge = treasureMapBridge;
+        foreach (var capture in treasureStore.Load().Where(item => item.Status is TreasureRecognitionStatus.Queued or TreasureRecognitionStatus.Recognizing)) treasureOcrQueue.Enqueue(capture.Id);
+        _ = ProcessTreasureQueueAsync();
         pendingTab = initialTab;
         config = source.Clone();
         config.Normalize();
@@ -129,6 +141,66 @@ internal sealed class EditorForm : Form
         _ = SendStateAsync();
     }
 
+    public async Task CaptureTreasureAsync()
+    {
+        if (treasureCaptureInProgress) return;
+        treasureCaptureInProgress = true;
+        await SendStateAsync();
+        Hide();
+        try
+        {
+            await Task.Delay(100);
+            var capture = treasureCaptureService.CaptureImage();
+            if (capture is null) return;
+            var captures = treasureStore.Load();
+            captures.Insert(0, capture);
+            treasureStore.Save(captures);
+            treasureOcrQueue.Enqueue(capture.Id);
+            _ = ProcessTreasureQueueAsync();
+        }
+        finally
+        {
+            treasureCaptureInProgress = false;
+            Show();
+            Activate();
+            await SendStateAsync();
+        }
+    }
+
+    private async Task ProcessTreasureQueueAsync()
+    {
+        if (treasureOcrWorkerRunning) return;
+        treasureOcrWorkerRunning = true;
+        try
+        {
+            while (treasureOcrQueue.TryDequeue(out var id))
+            {
+                var captures = treasureStore.Load();
+                var capture = captures.SingleOrDefault(item => item.Id == id);
+                if (capture is null || !File.Exists(capture.ImagePath)) continue;
+                capture.Status = TreasureRecognitionStatus.Recognizing;
+                treasureStore.Save(captures);
+                await SendStateAsync();
+                try
+                {
+                    await treasureCaptureService.RecognizeCaptureAsync(capture);
+                }
+                catch (Exception ex)
+                {
+                    AppRuntimeLog.Error("Treasure OCR failed", ex);
+                    capture.Status = TreasureRecognitionStatus.Ambiguous;
+                    capture.RawText = "OCR error: " + ex.Message;
+                }
+                treasureStore.Save(captures);
+                await SendStateAsync();
+            }
+        }
+        finally
+        {
+            treasureOcrWorkerRunning = false;
+        }
+    }
+
     private async Task InitializeWebViewAsync()
     {
         try
@@ -137,7 +209,7 @@ internal sealed class EditorForm : Form
             webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
             webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
             webView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
-            webView.CoreWebView2.NavigateToString(EditorHtml);
+            webView.CoreWebView2.NavigateToString(GetEditorHtml());
         }
         catch (Exception ex)
         {
@@ -193,6 +265,10 @@ internal sealed class EditorForm : Form
                     break;
                 case "command":
                     await HandleCommandAsync(root.GetProperty("name").GetString());
+                    break;
+                case "treasure":
+                    HandleTreasureFromWeb(root);
+                    await SendStateAsync();
                     break;
                 case "window":
                     HandleWindowCommand(root.GetProperty("name").GetString());
@@ -289,6 +365,12 @@ internal sealed class EditorForm : Form
                 ocrStatus = TesseractOcr.Detect();
                 await SendStateAsync();
                 break;
+            case "captureTreasure":
+                await CaptureTreasureAsync();
+                break;
+            case "openTreasureCapturesFolder":
+                OpenFileLocation(treasureStore.ImagesDirectory);
+                break;
         }
     }
 
@@ -299,6 +381,76 @@ internal sealed class EditorForm : Form
         next.Normalize();
         dayZSettings = next;
         DayZSettingsChanged?.Invoke(next);
+    }
+
+    private void HandleTreasureFromWeb(JsonElement root)
+    {
+        var id = GetString(root, "id");
+        var captures = treasureStore.Load();
+        var capture = captures.SingleOrDefault(item => item.Id == id);
+        switch (GetString(root, "action"))
+        {
+            case "delete":
+                if (capture is not null) captures.Remove(capture);
+                break;
+            case "retry":
+                if (capture is not null)
+                {
+                    capture.Status = TreasureRecognitionStatus.Queued;
+                    treasureOcrQueue.Enqueue(capture.Id);
+                    _ = ProcessTreasureQueueAsync();
+                }
+                break;
+            case "clear":
+                captures.Clear();
+                break;
+            case "clearErrors":
+                foreach (var item in captures.Where(item => item.Status == TreasureRecognitionStatus.Ambiguous).ToList())
+                {
+                    captures.Remove(item);
+                }
+                break;
+            case "edit":
+                if (capture is not null && root.TryGetProperty("x", out var x) && root.TryGetProperty("z", out var z) && x.TryGetInt32(out var xValue) && z.TryGetInt32(out var zValue))
+                {
+                    capture.X = xValue; capture.Z = zValue; capture.ManuallyEdited = true; capture.Status = TreasureRecognitionStatus.Recognized; capture.SentAt = null; capture.DeliveryResult = "";
+                }
+                break;
+            case "send":
+                treasureMapBridge.Queue(
+                    GetString(root, "mapId"),
+                    GetString(root, "profileId"),
+                    GetString(root, "markerName"),
+                    GetString(root, "markerType"),
+                    GetString(root, "markerColor"),
+                    captures);
+                treasureFeedback = "Пакет подтверждённых координат передан карте. Ожидаю импорт во вкладке браузера…";
+                break;
+        }
+        treasureStore.Save(captures);
+    }
+
+    private static string GetString(JsonElement root, string name) => root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() ?? "" : "";
+
+    private object[] PrepareTreasureCapturesForView()
+    {
+        var captures = treasureStore.Load();
+        var outcomes = treasureMapBridge.GetDeliveryOutcomes();
+        var changed = false;
+        foreach (var capture in captures.Where(item => outcomes.ContainsKey(item.Id)))
+        {
+            var outcome = outcomes[capture.Id];
+            capture.DeliveryResult = outcome.Message;
+            if (!string.Equals(outcome.Result, "error", StringComparison.OrdinalIgnoreCase)) capture.SentAt = DateTimeOffset.Now;
+            changed = true;
+        }
+        if (changed) treasureStore.Save(captures);
+        return captures.Select(capture => (object)new
+        {
+            capture.Id, capture.CapturedAt, capture.RawText, capture.X, capture.Z, capture.Status,
+            capture.ManuallyEdited, capture.SentAt, capture.DeliveryResult,
+            preview = TreasurePreviewDataUri(capture.ImagePath)
+        }).ToArray();
     }
 
     private void ApplyBattlePassSettingsFromWeb(JsonElement settingsElement)
@@ -425,6 +577,7 @@ internal sealed class EditorForm : Form
             update = updateInfo,
             dayZ = new { settings = dayZSettings, status = dayZStatus },
             battlePass = new { settings = battlePassSettings, snapshot = battlePassSnapshot, ocr = ocrStatus ??= TesseractOcr.Detect() },
+            treasures = new { captures = PrepareTreasureCapturesForView(), destination = treasureMapBridge.GetSession(), selecting = treasureCaptureInProgress, processing = treasureOcrWorkerRunning, queued = treasureOcrQueue.Count, feedback = treasureMapBridge.GetDeliveryFeedback() ?? treasureFeedback },
             hotkeyErrors = config.HotkeyRegistrationErrors,
             monitors = MonitorInfo.GetAll().Select(monitor => new
             {
@@ -486,6 +639,27 @@ internal sealed class EditorForm : Form
         return "data:image/png;base64," + Convert.ToBase64String(stream.ToArray());
     }
 
+    private static string? TreasurePreviewDataUri(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return null;
+        try
+        {
+            using var source = Image.FromFile(path);
+            var width = Math.Min(420, source.Width);
+            var height = Math.Max(1, source.Height * width / source.Width);
+            using var thumbnail = new Bitmap(width, height);
+            using (var graphics = Graphics.FromImage(thumbnail)) graphics.DrawImage(source, new Rectangle(0, 0, width, height));
+            using var stream = new MemoryStream();
+            thumbnail.Save(stream, ImageFormat.Png);
+            return "data:image/png;base64," + Convert.ToBase64String(stream.ToArray());
+        }
+        catch (Exception ex)
+        {
+            AppRuntimeLog.Error("Could not create treasure preview", ex);
+            return null;
+        }
+    }
+
     private static void SetAnchorToImageCenter(ImageLayer layer)
     {
         if (!TryGetImageSize(layer.Path, out var size))
@@ -518,6 +692,13 @@ internal sealed class EditorForm : Form
         {
             return false;
         }
+    }
+
+    private static string GetEditorHtml()
+    {
+        var spritePath = Path.Combine(AppContext.BaseDirectory, "assets", "marker-icons.svg");
+        var sprite = File.Exists(spritePath) ? File.ReadAllText(spritePath) : "";
+        return EditorHtml.Replace("<!-- marker-icons -->", sprite, StringComparison.Ordinal);
     }
 
     private const string EditorHtml = """
@@ -726,6 +907,20 @@ button, input, select {
 .control-group + .control-group {
   margin-top: 4px;
 }
+.treasure-preview {
+  display: block;
+  width: min(420px, 100%);
+  max-height: 220px;
+  object-fit: contain;
+  object-position: left center;
+  margin: 8px 0;
+  border: 1px solid #3d4046;
+  border-radius: 6px;
+  background: #090a0c;
+  cursor: zoom-in;
+}
+.treasure-image-modal { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 24px; background: rgba(0,0,0,.76); cursor: zoom-out; }
+.treasure-image-modal img { max-width: 96vw; max-height: 92vh; object-fit: contain; border: 1px solid var(--line); border-radius: 8px; background: #090a0c; }
 .control-group.separated {
   margin-top: 20px;
   padding-top: 20px;
@@ -793,6 +988,27 @@ input[type="color"] {
   border-radius: 8px;
   background: #101014;
 }
+.treasure-destination-grid { display: grid; grid-template-columns: minmax(180px, 420px) minmax(180px, 420px); gap: 8px; align-items: end; }
+.treasure-destination-grid label, .treasure-template-label { display: grid; gap: 5px; }
+.treasure-template-row { display: grid; grid-template-columns: minmax(110px, 1fr) minmax(170px, 250px) 38px; gap: 8px; align-items: center; }
+.treasure-template-row input[type="text"] { min-width: 0; }
+.treasure-color-picker { width: 38px !important; height: 38px !important; padding: 3px !important; cursor: pointer; }
+.treasure-type-picker { position: relative; min-width: 0; }
+.treasure-choice-picker { position: relative; min-width: 0; }
+.treasure-type-trigger { width: 100%; height: 38px; display: flex; align-items: center; gap: 8px; padding: 0 10px; color: var(--text); background: #101014; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; text-align: left; }
+.treasure-choice-trigger { width: 100%; height: 38px; display: flex; align-items: center; padding: 0 10px; color: var(--text); background: #101014; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; text-align: left; }
+.treasure-type-trigger::after { content: "⌄"; margin-left: auto; color: var(--faint); }
+.treasure-choice-trigger::after { content: "⌄"; margin-left: auto; color: var(--faint); }
+.treasure-type-icon { width: 18px; height: 18px; flex: 0 0 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.treasure-type-menu, .treasure-choice-menu { position: absolute; z-index: 20; top: calc(100% + 4px); left: 0; right: 0; display: grid; max-height: 264px; overflow-y: auto; padding: 4px; background: #101014; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 12px 24px rgba(0,0,0,.35); }
+.treasure-type-picker.open-up .treasure-type-menu, .treasure-choice-picker.open-up .treasure-choice-menu { top: auto; bottom: calc(100% + 4px); }
+.treasure-type-menu[hidden] { display: none; }
+.treasure-choice-menu[hidden] { display: none; }
+.treasure-type-option { height: 32px; display: flex; align-items: center; gap: 8px; padding: 0 8px; border: 0; border-radius: 5px; color: var(--text); background: transparent; cursor: pointer; text-align: left; }
+.treasure-choice-option { height: 32px; display: flex; align-items: center; padding: 0 8px; border: 0; border-radius: 5px; color: var(--text); background: transparent; cursor: pointer; text-align: left; }
+.treasure-type-option:hover, .treasure-type-option.active { background: #3a3a3e; }
+.treasure-choice-option:hover, .treasure-choice-option.active { background: #3a3a3e; }
+@media (max-width: 700px) { .treasure-destination-grid { grid-template-columns: 1fr; } .treasure-template-row { grid-template-columns: minmax(90px, 1fr) minmax(150px, 1fr) 38px; } }
 .actions {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -1053,10 +1269,58 @@ input[type="color"] {
 </div>
 <div class="toast" id="toast"></div>
 
+<!-- marker-icons -->
 <script>
 const bridge = window.chrome.webview;
 let state = null;
 let activeTab = "crosshair";
+let treasureMapId = null;
+let treasureProfileId = null;
+const treasureTemplateDrafts = new Map();
+const treasureCoordinateTimers = new Map();
+let treasurePreviewUri = null;
+let treasureTypeMenuOpen = false;
+let treasureMapMenuOpen = false;
+let treasureProfileMenuOpen = false;
+let treasureTypeMenuUp = false;
+let treasureMapMenuUp = false;
+let treasureProfileMenuUp = false;
+const treasureMarkerTypes = [
+  ["default", "⌖", "Обычный маркер", "#3498db"], ["cross", "×", "X", "#3498db"], ["home", "⌂", "Дом", "#e74c3c"], ["camp", "△", "Лагерь", "#27ae60"], ["safezone", "♢", "Безопасная зона", "#2ecc71"], ["blackmarket", "▣", "Чёрный рынок", "#34495e"], ["hospital", "+", "Госпиталь", "#e74c8c"], ["sniper", "⊙", "Снайпер", "#c0392b"], ["player", "♙", "Игрок", "#9b59b6"], ["flag", "⚑", "Флаг", "#d35400"], ["star", "☆", "Звезда", "#f1c40f"], ["car", "▰", "Авто", "#16a085"], ["parking", "P", "Парковка", "#7f8c8d"], ["heli", "✈", "Вертолёт", "#2980b9"], ["rail", "▤", "Железная дорога", "#8e44ad"], ["ship", "⚓", "Корабль", "#3498db"], ["scooter", "◉", "Скутер", "#1abc9c"], ["bank", "¤", "Банк", "#f39c12"], ["restaurant", "●", "Ресторан", "#e67e22"], ["post", "✉", "Почта", "#95a5a6"], ["castle", "♜", "Замок", "#7d3c98"], ["ranger-station", "♲", "Станция рейнджера", "#27ae60"], ["water", "♒", "Вода", "#3498db"], ["triangle", "▲", "Треугольник", "#e74c3c"], ["cow", "♧", "Корова", "#8b4513"], ["bear", "♛", "Медведь", "#2c3e50"], ["car-repair", "⚒", "Ремонт авто", "#d35400"], ["communications", "⌁", "Коммуникации", "#9b59b6"], ["roadblock", "▰", "Блокпост", "#c0392b"], ["stadium", "▭", "Стадион", "#f1c40f"], ["skull", "☠", "Череп", "#2c3e50"], ["rocket", "▲", "Ракета", "#e74c3c"], ["bbq", "♨", "BBQ", "#d35400"], ["ping", "●", "Пинг", "#2ecc71"], ["circle", "●", "Круг", "#3498db"]
+].map(([id, icon, name, color]) => ({ id, icon, name, color }));
+const treasureMarkerIcon = (type, color) => `<svg class="treasure-type-icon" style="color:${color}" viewBox="0 0 24 24" aria-hidden="true"><use href="#${type}"></use></svg>`;
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape") {
+    const hadPreview = Boolean(treasurePreviewUri);
+    treasurePreviewUri = null;
+    treasureMapMenuOpen = false;
+    treasureProfileMenuOpen = false;
+    treasureTypeMenuOpen = false;
+    document.querySelectorAll(".treasure-choice-menu, .treasure-type-menu").forEach(menu => { menu.hidden = true; });
+    if (hadPreview) render();
+    event.preventDefault();
+    event.stopPropagation();
+    return;
+  }
+  if (event.key !== "ArrowDown" && event.key !== "ArrowUp" && event.key !== "Enter") return;
+  const menu = [...document.querySelectorAll(".treasure-choice-menu:not([hidden]), .treasure-type-menu:not([hidden])")][0];
+  if (!menu) return;
+  const options = [...menu.querySelectorAll("button")];
+  if (!options.length) return;
+  if (event.key === "Enter" && document.activeElement?.matches(".treasure-choice-option, .treasure-type-option")) {
+    event.preventDefault();
+    document.activeElement.click();
+    event.stopPropagation();
+    return;
+  }
+  if (event.key !== "Enter") {
+    event.preventDefault();
+    const current = options.indexOf(document.activeElement);
+    const next = current < 0 ? options.findIndex(item => item.classList.contains("active")) : current + (event.key === "ArrowUp" ? -1 : 1);
+    options[(next + options.length) % options.length].focus();
+    event.stopPropagation();
+  }
+}, true);
 let hotkeyCapture = null;
 let pendingConfig = null;
 let pendingConfigTimer = null;
@@ -1075,10 +1339,12 @@ const defaultHotkeys = {
   ToggleBattlePassOverlay: { Enabled: true, Key: "F8", Control: true, Alt: true, Shift: false, Win: false },
   ScanBattlePass: { Enabled: false, Key: "None", Control: true, Alt: true, Shift: false, Win: false },
   EditBattlePassOverlay: { Enabled: true, Key: "F10", Control: true, Alt: true, Shift: false, Win: false },
-  ToggleBattlePassDescriptions: { Enabled: true, Key: "F12", Control: true, Alt: true, Shift: false, Win: false }
+  ToggleBattlePassDescriptions: { Enabled: true, Key: "F12", Control: true, Alt: true, Shift: false, Win: false },
+  CaptureTreasure: { Enabled: true, Key: "F7", Control: true, Alt: true, Shift: false, Win: false }
 };
 
 const navigation = [
+  { tab: ["treasures", "\u041a\u043b\u0430\u0434\u044b"] },
   { tab: ["dayz", "Синхронизация меток"] },
   { id: "tasks", label: "Отслеживание заданий", tabs: [
     ["tasks", "Настройки"],
@@ -1344,6 +1610,7 @@ function renderDataChanged(previous, next) {
     update: value.update,
     dayZSettings: value.dayZ?.settings,
     battlePass: value.battlePass,
+    treasures: value.treasures,
     hotkeyErrors: value.hotkeyErrors,
     monitors: value.monitors,
     preview: value.preview
@@ -1386,6 +1653,7 @@ function renderEditor() {
     taskhotkeys: renderBattlePassHotkeys(),
     monitor: renderMonitor(),
     dayz: renderDayZ(),
+    treasures: renderTreasures(),
     tasks: renderBattlePass(),
     profiles: renderProfiles(),
     updates: renderUpdates()
@@ -1570,6 +1838,49 @@ function renderImage() {
       <button class="action" data-image="reset">Сброс позиции</button>
     </div>
   `;
+}
+
+function renderTreasures() {
+  const items = state.treasures?.captures || [];
+  const readyItems = items.filter(item => Number.isInteger(item.X) && Number.isInteger(item.Z));
+  const duplicateKeys = new Set(readyItems.map(item => `${item.X}:${item.Z}`).filter((key, _, all) => all.filter(value => value === key).length > 1));
+  const errors = items.filter(item => item.Status === "Ambiguous");
+  const cards = items.map(item => {
+    const duplicate = duplicateKeys.has(`${item.X}:${item.Z}`);
+    const result = item.SentAt || item.DeliveryResult ? `<div class="limit ${item.SentAt ? "" : "hotkey-warning"}">${escapeHtml(item.DeliveryResult || "Отправлено")}</div>` : duplicate ? `<div class="limit hotkey-warning">⚠ Дубликат координат в очереди.</div>` : "";
+    const retry = item.Status === "Ambiguous" ? `<button class="action" data-treasure="retry" data-id="${item.Id}">Повторить OCR</button>` : "";
+    return `<div class="field"><div class="field-label">${escapeHtml(new Date(item.CapturedAt).toLocaleString())}</div>${item.preview ? `<img class="treasure-preview" data-treasure-preview src="${item.preview}" alt="Скриншот уведомления">` : ""}<div class="actions"><input class="number" data-treasure-x="${item.Id}" value="${item.X ?? ""}" placeholder="X"><input class="number" data-treasure-z="${item.Id}" value="${item.Z ?? ""}" placeholder="Z">${retry}<button class="action" data-treasure="delete" data-id="${item.Id}">Удалить</button></div>${result}<div class="limit">${escapeHtml(item.RawText || "Ожидание OCR…")}</div></div>`;
+  }).join("") || `<div class="limit">Пока нет захватов.</div>`;
+  const queue = state.treasures?.processing ? `<div class="limit">⏳ Распознаю координаты. В очереди: ${state.treasures.queued}.</div>` : "";
+  const destination = state.treasures?.destination;
+  const maps = destination?.Maps || [];
+  if (!treasureMapId || !maps.some(item => item.Id === treasureMapId)) treasureMapId = maps[0]?.Id || null;
+  const profiles = (destination?.Profiles || []).filter(item => item.MapId === treasureMapId && item.Writable);
+  if (!treasureProfileId || !profiles.some(item => item.Id === treasureProfileId)) treasureProfileId = profiles[0]?.Id || null;
+  const selectedProfile = profiles.find(item => item.Id === treasureProfileId);
+  const templateKey = `${treasureMapId || ""}:${treasureProfileId || ""}`;
+  const profileTemplate = {
+    name: selectedProfile?.MarkerName || "",
+    type: selectedProfile?.MarkerType || "default",
+    color: /^#[0-9a-f]{6}$/i.test(selectedProfile?.MarkerColor || "") ? selectedProfile.MarkerColor : "#3498db"
+  };
+  let storedTemplate = null;
+  try { storedTemplate = JSON.parse(localStorage.getItem(`dayzCompanionTreasureTemplate:${templateKey}`) || "null"); } catch (_) { }
+  const selectedTemplate = treasureTemplateDrafts.get(templateKey) || storedTemplate || profileTemplate;
+  const selectedType = selectedTemplate.type;
+  const selectedColor = selectedTemplate.color;
+  const selectedMarkerType = treasureMarkerTypes.find(item => item.id === selectedType) || treasureMarkerTypes[0];
+  const typeOptions = treasureMarkerTypes.map(item => `<button type="button" class="treasure-type-option ${item.id === selectedMarkerType.id ? "active" : ""}" data-treasure-type-option="${item.id}">${treasureMarkerIcon(item.id, item.color)}<span>${escapeHtml(item.name)}</span></button>`).join("");
+  const choicePicker = (kind, items, value, isOpen, opensUp) => {
+    const selected = items.find(item => item.Id === value);
+    return `<div class="treasure-choice-picker ${opensUp ? "open-up" : ""}"><button type="button" class="treasure-choice-trigger" data-treasure-choice-toggle="${kind}">${escapeHtml(selected?.Name || "Не выбрано")}</button><div class="treasure-choice-menu" ${isOpen ? "" : "hidden"}>${items.map(item => `<button type="button" class="treasure-choice-option ${item.Id === value ? "active" : ""}" data-treasure-choice-option data-treasure-choice-kind="${kind}" data-treasure-choice-value="${item.Id}">${escapeHtml(item.Name)}</button>`).join("")}</div></div>`;
+  };
+  const mapPicker = choicePicker("map", maps, treasureMapId, treasureMapMenuOpen, treasureMapMenuUp);
+  const profilePicker = choicePicker("profile", profiles, treasureProfileId, treasureProfileMenuOpen, treasureProfileMenuUp);
+  const destinationUi = !destination ? `<div class="field"><div class="field-label">Карта</div><div class="limit">Откройте DayZ-Map в браузере: Companion ожидает подключение карты.</div></div>` : `<div class="field"><div class="field-label">Отправка на карту</div><div class="treasure-destination-grid"><label>Карта${mapPicker}</label><label>Профиль${profilePicker}</label></div><div class="treasure-template-label">Настройки метки<div class="treasure-template-row"><input type="text" data-treasure-template-name value="${escapeHtml(selectedTemplate.name)}" placeholder="Название метки" maxlength="300"><div class="treasure-type-picker ${treasureTypeMenuUp ? "open-up" : ""}"><input type="hidden" data-treasure-template-type value="${selectedMarkerType.id}"><button type="button" class="treasure-type-trigger" data-treasure-type-toggle>${treasureMarkerIcon(selectedMarkerType.id, selectedMarkerType.color)}<span>${escapeHtml(selectedMarkerType.name)}</span></button><div class="treasure-type-menu" ${treasureTypeMenuOpen ? "" : "hidden"}>${typeOptions}</div></div><input class="treasure-color-picker" data-treasure-template-color type="color" value="${selectedColor}" title="Цвет метки"></div></div><div><button class="action primary" data-treasure-send ${!treasureProfileId ? "disabled" : ""}>Отправить координаты</button></div><div class="limit">Шаблон задаётся для этой отправки и не изменяет настройки профиля на карте.</div></div>`;
+  const feedback = state.treasures?.feedback ? `<div class="limit">${escapeHtml(state.treasures.feedback)}</div>` : "";
+  const preview = treasurePreviewUri ? `<div class="treasure-image-modal" data-treasure-preview-close><img src="${treasurePreviewUri}" alt="Скриншот уведомления"></div>` : "";
+  return `<h2>Клады</h2><div class="control-group"><div class="field-row"><span>Горячая клавиша захвата</span><button class="action" data-hotkey="CaptureTreasure">${displayHotkey(state.config.Hotkeys.CaptureTreasure)}</button></div>${hotkeyRegistrationWarning("CaptureTreasure")}<div class="actions"><button class="action primary" data-command="captureTreasure" ${state.treasures?.selecting ? "disabled" : ""}>Выделить область уведомления</button><button class="action" data-command="openTreasureCapturesFolder">Открыть папку PNG</button><button class="action" data-treasure="clear" ${items.length ? "" : "disabled"}>Очистить все</button>${errors.length ? `<button class="action" data-treasure="clearErrors">Удалить ошибки OCR (${errors.length})</button>` : ""}</div>${queue}${feedback}${cards}${destinationUi}${preview}</div>`;
 }
 
 function renderHotkeys() {
@@ -1874,6 +2185,122 @@ function bindEditorEvents() {
       button.textContent = "Нажмите сочетание...";
     });
   });
+  document.querySelectorAll("[data-treasure]").forEach(button => {
+    button.addEventListener("click", () => {
+      const id = button.dataset.id;
+      const action = button.dataset.treasure;
+      const x = document.querySelector(`[data-treasure-x="${id}"]`)?.value;
+      const z = document.querySelector(`[data-treasure-z="${id}"]`)?.value;
+      post({ type: "treasure", action, id, x: Number(x), z: Number(z) });
+    });
+  });
+  document.querySelectorAll("[data-treasure-x], [data-treasure-z]").forEach(input => input.addEventListener("input", () => {
+    const id = input.dataset.treasureX || input.dataset.treasureZ;
+    clearTimeout(treasureCoordinateTimers.get(id));
+    treasureCoordinateTimers.set(id, setTimeout(() => {
+      const x = Number(document.querySelector(`[data-treasure-x="${id}"]`)?.value);
+      const z = Number(document.querySelector(`[data-treasure-z="${id}"]`)?.value);
+      if (Number.isInteger(x) && Number.isInteger(z)) post({ type: "treasure", action: "edit", id, x, z });
+    }, 350));
+  }));
+  document.querySelectorAll("[data-treasure-preview]").forEach(image => image.addEventListener("click", () => { treasurePreviewUri = image.src; render(); }));
+  document.querySelector("[data-treasure-preview-close]")?.addEventListener("click", () => { treasurePreviewUri = null; render(); });
+  document.querySelectorAll("[data-treasure-choice-toggle]").forEach(button => button.addEventListener("click", () => {
+    const kind = button.dataset.treasureChoiceToggle;
+    const opens = kind === "map" ? !treasureMapMenuOpen : !treasureProfileMenuOpen;
+    const rect = button.getBoundingClientRect();
+    const opensUp = window.innerHeight - rect.bottom < 268 && rect.top > 268;
+    if (kind === "map") { treasureMapMenuOpen = opens; treasureMapMenuUp = opensUp; }
+    else { treasureProfileMenuOpen = opens; treasureProfileMenuUp = opensUp; }
+    if (kind === "map") treasureProfileMenuOpen = false;
+    else treasureMapMenuOpen = false;
+    render();
+  }));
+  document.querySelectorAll("[data-treasure-choice-option]").forEach(button => button.addEventListener("click", () => {
+    if (button.dataset.treasureChoiceKind === "map") {
+      treasureMapId = button.dataset.treasureChoiceValue;
+      treasureProfileId = null;
+    } else {
+      treasureProfileId = button.dataset.treasureChoiceValue;
+    }
+    treasureMapMenuOpen = false;
+    treasureProfileMenuOpen = false;
+    treasureTypeMenuOpen = false;
+    render();
+  }));
+  document.onpointerdown = event => {
+    if (event.target.closest(".treasure-choice-picker, .treasure-type-picker")) return;
+    treasureMapMenuOpen = false;
+    treasureProfileMenuOpen = false;
+    treasureTypeMenuOpen = false;
+    document.querySelectorAll(".treasure-choice-menu, .treasure-type-menu").forEach(menu => { menu.hidden = true; });
+  };
+  document.onkeydown = event => {
+    if (event.key === "Escape") {
+      treasurePreviewUri = null;
+      treasureMapMenuOpen = false;
+      treasureProfileMenuOpen = false;
+      treasureTypeMenuOpen = false;
+      document.querySelectorAll(".treasure-choice-menu, .treasure-type-menu").forEach(menu => { menu.hidden = true; });
+      return;
+    }
+    if (!["ArrowDown", "ArrowUp", "Enter"].includes(event.key)) return;
+    const visible = [...document.querySelectorAll(".treasure-choice-menu:not([hidden]), .treasure-type-menu:not([hidden])")][0];
+    if (!visible) return;
+    const options = [...visible.querySelectorAll("button")];
+    if (!options.length) return;
+    event.preventDefault();
+    if (event.key === "Enter" && document.activeElement?.matches("button")) { document.activeElement.click(); return; }
+    const current = options.indexOf(document.activeElement);
+    options[(current + (event.key === "ArrowUp" ? -1 : 1) + options.length) % options.length].focus();
+  };
+  const saveTreasureTemplateDraft = () => {
+    const draftKey = `${treasureMapId || ""}:${treasureProfileId || ""}`;
+    const draft = {
+      name: document.querySelector("[data-treasure-template-name]")?.value || "",
+      type: document.querySelector("[data-treasure-template-type]")?.value || "default",
+      color: document.querySelector("[data-treasure-template-color]")?.value || "#3498db"
+    };
+    treasureTemplateDrafts.set(draftKey, draft);
+    try { localStorage.setItem(`dayzCompanionTreasureTemplate:${draftKey}`, JSON.stringify(draft)); } catch (_) { }
+  };
+  document.querySelector("[data-treasure-template-name]")?.addEventListener("input", saveTreasureTemplateDraft);
+  document.querySelector("[data-treasure-template-type]")?.addEventListener("change", saveTreasureTemplateDraft);
+  document.querySelector("[data-treasure-template-color]")?.addEventListener("input", saveTreasureTemplateDraft);
+  document.querySelector("[data-treasure-type-toggle]")?.addEventListener("click", () => {
+    treasureTypeMenuOpen = !treasureTypeMenuOpen;
+    const rect = document.querySelector("[data-treasure-type-toggle]").getBoundingClientRect();
+    treasureTypeMenuUp = window.innerHeight - rect.bottom < 268 && rect.top > 268;
+    render();
+  });
+  document.querySelectorAll("[data-treasure-type-option]").forEach(button => button.addEventListener("click", () => {
+    saveTreasureTemplateDraft();
+    const draftKey = `${treasureMapId || ""}:${treasureProfileId || ""}`;
+    const draft = treasureTemplateDrafts.get(draftKey) || {};
+    treasureTemplateDrafts.set(draftKey, { ...draft, type: button.dataset.treasureTypeOption });
+    treasureTypeMenuOpen = false;
+    render();
+  }));
+  const treasureSend = document.querySelector("[data-treasure-send]");
+  if (treasureSend) {
+    const ready = (state.treasures?.captures || []).filter(item => Number.isInteger(item.X) && Number.isInteger(item.Z));
+    const hasDuplicates = new Set(ready.map(item => `${item.X}:${item.Z}`)).size !== ready.length;
+    treasureSend.textContent = `Отправить координаты (${ready.length})`;
+    treasureSend.disabled = treasureSend.disabled || !ready.length || hasDuplicates;
+    treasureSend.addEventListener("click", () => {
+    saveTreasureTemplateDraft();
+    const template = treasureTemplateDrafts.get(`${treasureMapId || ""}:${treasureProfileId || ""}`);
+    post({
+    type: "treasure",
+    action: "send",
+    mapId: treasureMapId,
+    profileId: treasureProfileId,
+    markerName: template?.name || "",
+    markerType: template?.type || "default",
+    markerColor: template?.color || "#3498db"
+    });
+    });
+  }
   document.querySelectorAll("[data-hotkey-clear]").forEach(button => {
     if (button.previousElementSibling?.dataset?.hotkeyDefault === button.dataset.hotkeyClear) return;
     const defaultButton = document.createElement("button");
@@ -2018,7 +2445,7 @@ function currentPreset(p) {
 }
 
 function normalizeKey(event) {
-  const aliases = { ArrowLeft: "Left", ArrowRight: "Right", ArrowUp: "Up", ArrowDown: "Down", " ": "Space" };
+  const aliases = { ArrowLeft: "Left", ArrowRight: "Right", ArrowUp: "Up", ArrowDown: "Down", " ": "Space", PrintScreen: "Snapshot" };
   if (aliases[event.key]) return aliases[event.key];
   if (/^Key[A-Z]$/.test(event.code)) return event.code.slice(3);
   if (/^Digit[0-9]$/.test(event.code)) return "D" + event.code.slice(5);

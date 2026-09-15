@@ -16,14 +16,16 @@ internal sealed class DayZCompanionServer : IDisposable
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
     };
     private readonly DayZMarkersService markers;
+    private readonly TreasureMapBridge treasureBridge;
     private readonly CancellationTokenSource cancellation = new();
     private HttpListener? listener;
     private Task? worker;
 
-    public DayZCompanionServer(DayZCompanionSettings settings)
+    public DayZCompanionServer(DayZCompanionSettings settings, TreasureMapBridge? treasureBridge = null)
     {
         this.settings = settings;
         markers = new DayZMarkersService(settings);
+        this.treasureBridge = treasureBridge ?? new TreasureMapBridge();
     }
 
     public int? Port { get; private set; }
@@ -122,6 +124,15 @@ internal sealed class DayZCompanionServer : IDisposable
                 case ("POST", "/api/v1/import"):
                     await ImportAsync(context);
                     break;
+                case ("POST", "/api/v1/treasures/session"):
+                    await SetTreasureSessionAsync(context);
+                    break;
+                case ("GET", "/api/v1/treasures/pending"):
+                    await GetTreasureBatchAsync(context);
+                    break;
+                case ("POST", "/api/v1/treasures/ack"):
+                    await AcknowledgeTreasureBatchAsync(context);
+                    break;
                 default:
                     await WriteJsonAsync(context.Response, 404, new { ok = false, message = "Маршрут не найден." });
                     break;
@@ -165,7 +176,41 @@ internal sealed class DayZCompanionServer : IDisposable
         await WriteJsonAsync(context.Response, 200, new { ok = true, imported = result.Imported, updated = result.Updated, backup = result.Backup });
     }
 
+    private async Task SetTreasureSessionAsync(HttpListenerContext context)
+    {
+        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8, false, 1024, leaveOpen: false);
+        using var document = JsonDocument.Parse(await reader.ReadToEndAsync());
+        var root = document.RootElement;
+        if (root.ValueKind != JsonValueKind.Object) throw new DayZCompanionException("Сеанс карты должен быть JSON-объектом.");
+        var maps = root.TryGetProperty("maps", out var mapsElement) && mapsElement.ValueKind == JsonValueKind.Array
+            ? mapsElement.EnumerateArray().Select(item => new TreasureMapOption(GetString(item, "id"), GetString(item, "name"), GetInt(item, "width"), GetInt(item, "height"))).Where(item => !string.IsNullOrWhiteSpace(item.Id)).ToList() : [];
+        var profiles = root.TryGetProperty("profiles", out var profilesElement) && profilesElement.ValueKind == JsonValueKind.Array
+            ? profilesElement.EnumerateArray().Select(item => new TreasureProfileOption(GetString(item, "mapId"), GetString(item, "id"), GetString(item, "name"), !item.TryGetProperty("writable", out var writable) || writable.ValueKind != JsonValueKind.False, GetString(item, "markerName"), GetString(item, "markerType"), GetString(item, "markerColor"))).Where(item => !string.IsNullOrWhiteSpace(item.MapId) && !string.IsNullOrWhiteSpace(item.Id)).ToList() : [];
+        treasureBridge.SetSession(new TreasureDestinationSession(GetString(root, "sessionId"), DateTimeOffset.UtcNow, maps, profiles));
+        await WriteJsonAsync(context.Response, 200, new { ok = true, expiresInSeconds = 300 });
+    }
+
+    private async Task GetTreasureBatchAsync(HttpListenerContext context)
+    {
+        var sessionId = context.Request.QueryString["session"] ?? "";
+        var batch = treasureBridge.GetPending(sessionId);
+        await WriteJsonAsync(context.Response, 200, new { ok = true, batch });
+    }
+
+    private async Task AcknowledgeTreasureBatchAsync(HttpListenerContext context)
+    {
+        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8, false, 1024, leaveOpen: false);
+        using var document = JsonDocument.Parse(await reader.ReadToEndAsync());
+        var root = document.RootElement;
+        var outcomes = root.TryGetProperty("outcomes", out var outcomesElement) && outcomesElement.ValueKind == JsonValueKind.Array
+            ? outcomesElement.EnumerateArray().Select(item => new TreasureDeliveryOutcome(GetString(item, "captureId"), GetString(item, "result"), GetString(item, "message"))).Where(item => !string.IsNullOrWhiteSpace(item.CaptureId)).ToList()
+            : null;
+        treasureBridge.Acknowledge(GetString(root, "sessionId"), root.TryGetProperty("success", out var success) && success.ValueKind == JsonValueKind.True, GetString(root, "message"), outcomes);
+        await WriteJsonAsync(context.Response, 200, new { ok = true });
+    }
+
     private static string GetString(JsonElement root, string name) => root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() ?? "" : "";
+    private static int GetInt(JsonElement root, string name) => root.TryGetProperty(name, out var value) && value.TryGetInt32(out var result) ? result : 0;
     private static List<JsonElement> GetMarkers(JsonElement root) => root.TryGetProperty("markers", out var value) && value.ValueKind == JsonValueKind.Array ? value.EnumerateArray().Select(marker => marker.Clone()).ToList() : [];
     private static void ApplyCors(HttpListenerResponse response, DayZCorsHeaders cors)
     {

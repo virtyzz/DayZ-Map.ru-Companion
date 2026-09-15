@@ -15,6 +15,7 @@ internal sealed class HotkeyBindings
     public HotkeyBinding ScanBattlePass { get; set; } = DefaultScanBattlePass();
     public HotkeyBinding EditBattlePassOverlay { get; set; } = DefaultEditBattlePassOverlay();
     public HotkeyBinding ToggleBattlePassDescriptions { get; set; } = DefaultToggleBattlePassDescriptions();
+    public HotkeyBinding CaptureTreasure { get; set; } = DefaultCaptureTreasure();
 
     public static HotkeyBindings Default() => new();
 
@@ -29,6 +30,7 @@ internal sealed class HotkeyBindings
     public static HotkeyBinding DefaultScanBattlePass() => new() { Enabled = false };
     public static HotkeyBinding DefaultEditBattlePassOverlay() => new(Keys.F10);
     public static HotkeyBinding DefaultToggleBattlePassDescriptions() => new(Keys.F12);
+    public static HotkeyBinding DefaultCaptureTreasure() => new(Keys.F7);
 
     public void Normalize()
     {
@@ -43,6 +45,7 @@ internal sealed class HotkeyBindings
         ScanBattlePass ??= DefaultScanBattlePass();
         EditBattlePassOverlay ??= DefaultEditBattlePassOverlay();
         ToggleBattlePassDescriptions ??= DefaultToggleBattlePassDescriptions();
+        CaptureTreasure ??= DefaultCaptureTreasure();
     }
 
     public HotkeyBindings Clone() => new()
@@ -57,7 +60,8 @@ internal sealed class HotkeyBindings
         ToggleBattlePassOverlay = ToggleBattlePassOverlay.Clone(),
         ScanBattlePass = ScanBattlePass.Clone(),
         EditBattlePassOverlay = EditBattlePassOverlay.Clone(),
-        ToggleBattlePassDescriptions = ToggleBattlePassDescriptions.Clone()
+        ToggleBattlePassDescriptions = ToggleBattlePassDescriptions.Clone(),
+        CaptureTreasure = CaptureTreasure.Clone()
     };
 }
 
@@ -177,6 +181,7 @@ internal sealed class HotkeyBinding
         Keys.Right => "Вправо",
         Keys.Up => "Вверх",
         Keys.Down => "Вниз",
+        Keys.Snapshot => "PrintScreen",
         _ => key.ToString()
     };
 }

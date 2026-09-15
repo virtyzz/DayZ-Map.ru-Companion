@@ -18,6 +18,10 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
     private readonly GlobalMouseClickInterceptor battlePassClickInterceptor;
     private BattlePassSettings battlePassSettings;
     private EditorForm? editor;
+    private readonly TreasureCaptureStore treasureStore;
+    private readonly TreasureCaptureService treasureCaptureService;
+    private readonly TreasureMapBridge treasureMapBridge;
+    private TreasureCapturesForm? treasureForm;
     private AppConfig config;
 
     public CrosshairApplicationContext()
@@ -40,12 +44,16 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             onToggleOverlay: ToggleOverlay,
             onOpenEditor: OpenEditor,
             onOpenUpdates: OpenUpdates,
+            onOpenTreasures: OpenTreasureCaptures,
             onSelectProfile: SelectProfile,
             onExit: ExitApplication);
         tray.SetOverlayVisible(config.OverlayVisible);
         tray.SetProfiles(config.Profiles, config.ActiveProfileId);
 
         hotkeys = new HotkeyManager();
+        treasureStore = new TreasureCaptureStore();
+        treasureCaptureService = new TreasureCaptureService(treasureStore);
+        treasureMapBridge = new TreasureMapBridge();
         battlePassStore = new BattlePassStore();
         battlePassSettings = battlePassStore.LoadSettings();
         battlePassTracker = new BattlePassTracker(battlePassStore);
@@ -72,7 +80,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         {
             dayZSettingsStore.Save(dayZSettings);
         }
-        dayZCompanion = new DayZCompanionServer(dayZSettings);
+        dayZCompanion = new DayZCompanionServer(dayZSettings, treasureMapBridge);
         dayZCompanion.Start();
         _ = CheckForStartupUpdateAsync();
 
@@ -273,6 +281,26 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         OpenEditor("updates");
     }
 
+    private void OpenTreasureCaptures()
+    {
+        if (treasureForm is { IsDisposed: false })
+        {
+            treasureForm.Show();
+            treasureForm.Activate();
+            return;
+        }
+
+        treasureForm = new TreasureCapturesForm(treasureStore, treasureCaptureService, treasureMapBridge);
+        treasureForm.FormClosed += (_, _) => treasureForm = null;
+        treasureForm.Show();
+    }
+
+    private void CaptureTreasure()
+    {
+        OpenEditor("treasures");
+        if (editor is not null) _ = editor.CaptureTreasureAsync();
+    }
+
     private void OpenEditor(string? initialTab)
     {
         if (editor is { IsDisposed: false })
@@ -285,7 +313,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             return;
         }
 
-        editor = new EditorForm(config, updateService, dayZSettings, dayZCompanion.GetStatus(), battlePassSettings, battlePassStore.LoadSnapshot(), initialTab);
+        editor = new EditorForm(config, updateService, dayZSettings, dayZCompanion.GetStatus(), battlePassSettings, battlePassStore.LoadSnapshot(), treasureStore, treasureCaptureService, treasureMapBridge, initialTab);
         editor.ConfigChanged += nextConfig =>
         {
             var startupChanged = config.StartWithWindows != nextConfig.StartWithWindows;
@@ -324,7 +352,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             if (restartHttp)
             {
                 dayZCompanion.Dispose();
-                dayZCompanion = new DayZCompanionServer(dayZSettings);
+                dayZCompanion = new DayZCompanionServer(dayZSettings, treasureMapBridge);
                 dayZCompanion.Start();
             }
             editor?.ApplyDayZState(dayZSettings, dayZCompanion.GetStatus());
@@ -392,6 +420,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         RegisterHotkey(nameof(HotkeyBindings.ToggleBattlePassOverlay), config.Hotkeys.ToggleBattlePassOverlay, ToggleBattlePassOverlay, signatures);
         RegisterHotkey(nameof(HotkeyBindings.ScanBattlePass), config.Hotkeys.ScanBattlePass, () => ScanBattlePass(), signatures);
         RegisterHotkey(nameof(HotkeyBindings.ToggleBattlePassDescriptions), config.Hotkeys.ToggleBattlePassDescriptions, ToggleBattlePassDescriptions, signatures);
+        RegisterHotkey(nameof(HotkeyBindings.CaptureTreasure), config.Hotkeys.CaptureTreasure, CaptureTreasure, signatures);
     }
 
     private void ToggleBattlePassDescriptions()
@@ -482,6 +511,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         tray.Dispose();
         overlay.Close();
         battlePassOverlay.Close();
+        treasureForm?.Close();
         editor?.Close();
         ExitThread();
     }

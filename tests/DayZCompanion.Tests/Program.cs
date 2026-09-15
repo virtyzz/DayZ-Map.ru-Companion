@@ -26,7 +26,9 @@ var tests = new (string Name, Action Run)[]
     ("старая позиция окна переносится в настройки Companion", LegacyWindowBoundsAreMigrated),
     ("API проверяет Origin и PNA preflight", ApiChecksOriginAndPreflight),
     ("Battle Pass settings normalise OCR layout", BattlePassSettingsNormalize),
-    ("Battle Pass scan hotkey is reset once", BattlePassScanHotkeyIsResetOnce)
+    ("Battle Pass scan hotkey is reset once", BattlePassScanHotkeyIsResetOnce),
+    ("Treasure OCR recognizes labeled coordinates", TreasureOcrRecognizesCoordinates),
+    ("Treasure bridge sends coordinates", TreasureBridgeQueuesCoordinates)
 };
 
 var failures = new List<string>();
@@ -358,6 +360,31 @@ static void BattlePassScanHotkeyIsResetOnce()
     config.Hotkeys.ScanBattlePass = new HotkeyBinding { Enabled = true, Key = "F8" };
     config.Normalize();
     True(config.Hotkeys.ScanBattlePass.Enabled, "назначенный пользователем хоткей был повторно сброшен");
+}
+
+static void TreasureOcrRecognizesCoordinates()
+{
+    var recognized = TreasureCaptureService.Parse("Coordinates X=8320 Z=6896");
+    Equal(8320, recognized.X, "X is not recognized");
+    Equal(6896, recognized.Z, "Z is not recognized");
+    True(recognized.Status == TreasureRecognitionStatus.Recognized, "labeled coordinates require review");
+
+    var ambiguous = TreasureCaptureService.Parse("8320 6896");
+    True(ambiguous.Status == TreasureRecognitionStatus.Recognized, "unlabeled coordinate pair was not accepted");
+}
+
+static void TreasureBridgeQueuesCoordinates()
+{
+    var bridge = new TreasureMapBridge();
+    bridge.SetSession(new TreasureDestinationSession("12345678901234567890", DateTimeOffset.UtcNow, [new TreasureMapOption("cherno", "Chernarus")], [new TreasureProfileOption("cherno", "p1", "Main", true, "Treasure", "default", "#f5a623")]));
+    bridge.Queue("cherno", "p1", "Treasure", "default", "#f5a623", [
+        new TreasureCapture { Id = "first", X = 8320, Z = 6896 },
+        new TreasureCapture { Id = "second", X = 1, Z = 2 }
+    ]);
+    var batch = bridge.GetPending("12345678901234567890");
+    Equal(2, batch!.Coordinates.Count, "coordinates were not queued");
+    Equal("first", batch.Coordinates[0].CaptureId, "wrong capture was queued");
+    Equal("Treasure", batch.Template.Name, "marker template was not queued");
 }
 
 static void Equal<T>(T expected, T actual, string message)

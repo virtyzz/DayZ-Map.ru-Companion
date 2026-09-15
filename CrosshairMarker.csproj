@@ -17,6 +17,7 @@
   <ItemGroup>
     <EmbeddedResource Include="assets\dayz-map-companion.ico" LogicalName="DayZMapCompanion.MainIcon" />
     <EmbeddedResource Include="assets\dayz-map-companion-tray.ico" LogicalName="DayZMapCompanion.TrayIcon" />
+    <Content Include="assets\marker-icons.svg" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
   <ItemGroup>
     <Compile Remove="tests\**\*.cs" />
