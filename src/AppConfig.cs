@@ -14,6 +14,7 @@ internal sealed class AppConfig
     public EditorWindowBounds? EditorWindowBounds { get; set; }
     public string ActiveProfileId { get; set; } = "default";
     public string? LastPromptedUpdateVersion { get; set; }
+    public DateTimeOffset? LastUpdatePromptAt { get; set; }
     public bool ScanBattlePassHotkeyResetApplied { get; set; }
     public List<CrosshairProfile> Profiles { get; set; } = [CrosshairProfile.Default()];
     public HotkeyBindings Hotkeys { get; set; } = new();
@@ -104,6 +105,7 @@ internal sealed class AppConfig
         EditorWindowBounds = EditorWindowBounds?.Clone(),
         ActiveProfileId = ActiveProfileId,
         LastPromptedUpdateVersion = LastPromptedUpdateVersion,
+        LastUpdatePromptAt = LastUpdatePromptAt,
         ScanBattlePassHotkeyResetApplied = ScanBattlePassHotkeyResetApplied,
         Profiles = Profiles.Select(profile => profile.Clone()).ToList(),
         Hotkeys = Hotkeys.Clone(),

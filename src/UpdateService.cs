@@ -8,6 +8,7 @@ namespace CrosshairMarker;
 
 internal sealed class UpdateService
 {
+    internal static readonly TimeSpan ReminderInterval = TimeSpan.FromHours(12);
     private const string ReleasesPageUrl = "https://github.com/virtyzz/DayZ-Map.ru-Companion/releases";
     private const string LatestReleaseUrl = "https://api.github.com/repos/virtyzz/DayZ-Map.ru-Companion/releases/latest";
 
@@ -86,6 +87,13 @@ internal sealed class UpdateService
         {
             UseShellExecute = true
         });
+    }
+
+    internal static bool ShouldShowReminder(UpdateInfo info, string? lastPromptedVersion, DateTimeOffset? lastPromptAt, DateTimeOffset now)
+    {
+        if (!info.IsUpdateAvailable || string.IsNullOrWhiteSpace(info.LatestVersion)) return false;
+        if (!string.Equals(lastPromptedVersion, info.LatestVersion, StringComparison.OrdinalIgnoreCase)) return true;
+        return !lastPromptAt.HasValue || now - lastPromptAt.Value >= ReminderInterval;
     }
 
     private static string CurrentVersionText

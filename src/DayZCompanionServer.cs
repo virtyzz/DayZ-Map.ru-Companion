@@ -13,7 +13,8 @@ internal sealed class DayZCompanionServer : IDisposable
     private readonly DayZCompanionSettings settings;
     private static readonly JsonSerializerOptions ResponseJsonOptions = new()
     {
-        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
     private readonly DayZMarkersService markers;
     private readonly TreasureMapBridge treasureBridge;

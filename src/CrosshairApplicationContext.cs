@@ -21,7 +21,8 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
     private readonly TreasureCaptureStore treasureStore;
     private readonly TreasureCaptureService treasureCaptureService;
     private readonly TreasureMapBridge treasureMapBridge;
-    private TreasureCapturesForm? treasureForm;
+    private readonly System.Windows.Forms.Timer updateTimer = new() { Interval = 60 * 60 * 1000 };
+    private bool updateCheckInProgress;
     private AppConfig config;
 
     public CrosshairApplicationContext()
@@ -41,14 +42,11 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         }
 
         tray = new TrayController(
-            onToggleOverlay: ToggleOverlay,
-            onOpenEditor: OpenEditor,
-            onOpenUpdates: OpenUpdates,
+            onOpenGeneral: OpenGeneral,
             onOpenTreasures: OpenTreasureCaptures,
-            onSelectProfile: SelectProfile,
+            onOpenTasks: OpenTasks,
+            onOpenCrosshair: OpenCrosshair,
             onExit: ExitApplication);
-        tray.SetOverlayVisible(config.OverlayVisible);
-        tray.SetProfiles(config.Profiles, config.ActiveProfileId);
 
         hotkeys = new HotkeyManager();
         treasureStore = new TreasureCaptureStore();
@@ -82,7 +80,9 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         }
         dayZCompanion = new DayZCompanionServer(dayZSettings, treasureMapBridge);
         dayZCompanion.Start();
-        _ = CheckForStartupUpdateAsync();
+        updateTimer.Tick += async (_, _) => await CheckForUpdateAsync();
+        updateTimer.Start();
+        _ = CheckForUpdateAsync();
 
         if (!config.StartMinimizedToTray)
         {
@@ -102,7 +102,6 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             overlay.Hide();
         }
 
-        tray.SetOverlayVisible(config.OverlayVisible);
         store.SaveAtomic(config);
     }
 
@@ -276,23 +275,18 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         OpenEditor(null);
     }
 
-    private void OpenUpdates()
+    private void OpenGeneral()
     {
-        OpenEditor("updates");
+        OpenEditor("general");
     }
+
+    private void OpenTasks() => OpenEditor("tasks");
+
+    private void OpenCrosshair() => OpenEditor("crosshair");
 
     private void OpenTreasureCaptures()
     {
-        if (treasureForm is { IsDisposed: false })
-        {
-            treasureForm.Show();
-            treasureForm.Activate();
-            return;
-        }
-
-        treasureForm = new TreasureCapturesForm(treasureStore, treasureCaptureService, treasureMapBridge);
-        treasureForm.FormClosed += (_, _) => treasureForm = null;
-        treasureForm.Show();
+        OpenEditor("treasures");
     }
 
     private void CaptureTreasure()
@@ -326,7 +320,6 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             overlay.ApplyMonitor(config.TargetMonitorDeviceName);
             overlay.ApplyWindowSize(config.OverlayWindowSize);
             overlay.ApplyProfile(config.CurrentProfile);
-            tray.SetProfiles(config.Profiles, config.ActiveProfileId);
             RegisterConfiguredHotkeys();
             store.SaveAtomic(config);
             editor?.ApplyExternalConfig(config);
@@ -364,31 +357,31 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         editor.Show();
     }
 
-    private async Task CheckForStartupUpdateAsync()
+    private async Task CheckForUpdateAsync()
     {
-        var info = await updateService.GetLatestAsync();
-        if (!info.IsUpdateAvailable || string.IsNullOrWhiteSpace(info.LatestVersion))
+        if (updateCheckInProgress) return;
+        updateCheckInProgress = true;
+        try
         {
-            return;
+            var info = await updateService.GetLatestAsync(forceRefresh: true);
+            var now = DateTimeOffset.Now;
+            if (!UpdateService.ShouldShowReminder(info, config.LastPromptedUpdateVersion, config.LastUpdatePromptAt, now)) return;
+
+            config.LastPromptedUpdateVersion = info.LatestVersion;
+            config.LastUpdatePromptAt = now;
+            store.SaveAtomic(config);
+
+            var result = MessageBox.Show(
+                $"Доступна новая версия {AppIdentity.DisplayName} {info.LatestVersion}.\n\nТекущая версия: {info.CurrentVersion}\n\nСкачать установщик?",
+                $"Обновление {AppIdentity.DisplayName}",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Information);
+
+            if (result == DialogResult.Yes) UpdateService.OpenDownload(info);
         }
-
-        if (string.Equals(config.LastPromptedUpdateVersion, info.LatestVersion, StringComparison.OrdinalIgnoreCase))
+        finally
         {
-            return;
-        }
-
-        config.LastPromptedUpdateVersion = info.LatestVersion;
-        store.SaveAtomic(config);
-
-        var result = MessageBox.Show(
-            $"Доступна новая версия {AppIdentity.DisplayName} {info.LatestVersion}.\n\nТекущая версия: {info.CurrentVersion}\n\nСкачать установщик?",
-            $"Обновление {AppIdentity.DisplayName}",
-            MessageBoxButtons.YesNo,
-            MessageBoxIcon.Information);
-
-        if (result == DialogResult.Yes)
-        {
-            UpdateService.OpenDownload(info);
+            updateCheckInProgress = false;
         }
     }
 
@@ -401,7 +394,6 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
 
         config.ActiveProfileId = profileId;
         overlay.ApplyProfile(config.CurrentProfile);
-        tray.SetProfiles(config.Profiles, config.ActiveProfileId);
         store.SaveAtomic(config);
     }
 
@@ -503,6 +495,8 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
 
     private void ExitApplication()
     {
+        updateTimer.Stop();
+        updateTimer.Dispose();
         store.SaveAtomic(config);
         battlePassStore.SaveSettings(battlePassSettings);
         dayZCompanion.Dispose();
@@ -511,7 +505,6 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         tray.Dispose();
         overlay.Close();
         battlePassOverlay.Close();
-        treasureForm?.Close();
         editor?.Close();
         ExitThread();
     }

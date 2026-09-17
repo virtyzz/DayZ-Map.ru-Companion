@@ -27,6 +27,7 @@ var tests = new (string Name, Action Run)[]
     ("API проверяет Origin и PNA preflight", ApiChecksOriginAndPreflight),
     ("Battle Pass settings normalise OCR layout", BattlePassSettingsNormalize),
     ("Battle Pass scan hotkey is reset once", BattlePassScanHotkeyIsResetOnce),
+    ("update reminder observes the 12-hour interval", UpdateReminderObservesInterval),
     ("Treasure OCR recognizes labeled coordinates", TreasureOcrRecognizesCoordinates),
     ("Treasure bridge sends coordinates", TreasureBridgeQueuesCoordinates)
 };
@@ -362,6 +363,17 @@ static void BattlePassScanHotkeyIsResetOnce()
     True(config.Hotkeys.ScanBattlePass.Enabled, "назначенный пользователем хоткей был повторно сброшен");
 }
 
+static void UpdateReminderObservesInterval()
+{
+    var info = new UpdateInfo("0.1.0", "0.2.0", "v0.2.0", true, "https://example.test/release", null, "", null, null);
+    var now = new DateTimeOffset(2026, 9, 17, 12, 0, 0, TimeSpan.Zero);
+    True(UpdateService.ShouldShowReminder(info, null, null, now), "новое обновление не показывается");
+    True(!UpdateService.ShouldShowReminder(info, "0.2.0", now.AddHours(-11), now), "напоминание показывается раньше 12 часов");
+    True(UpdateService.ShouldShowReminder(info, "0.2.0", now.AddHours(-12), now), "напоминание не возобновляется через 12 часов");
+    var newer = info with { LatestVersion = "0.3.0" };
+    True(UpdateService.ShouldShowReminder(newer, "0.2.0", now, now), "новая версия не показывается сразу");
+}
+
 static void TreasureOcrRecognizesCoordinates()
 {
     var recognized = TreasureCaptureService.Parse("Coordinates X=8320 Z=6896");
@@ -385,6 +397,20 @@ static void TreasureBridgeQueuesCoordinates()
     Equal(2, batch!.Coordinates.Count, "coordinates were not queued");
     Equal("first", batch.Coordinates[0].CaptureId, "wrong capture was queued");
     Equal("Treasure", batch.Template.Name, "marker template was not queued");
+    Equal(2, batch.Markers.Count, "DayZ markers were not queued");
+    var marker = batch.Markers[0].Marker;
+    Equal("first", batch.Markers[0].CaptureId, "marker capture id was not preserved");
+    Equal(5, marker.Type, "DayZ marker type is invalid");
+    True(marker.Uid is >= 1_000_000_000 and <= 1_999_999_999, "DayZ marker UID is invalid");
+    Equal("LBmaster_Groups\\gui\\icons\\marker.paa", marker.Icon, "DayZ marker icon is invalid");
+    Equal(3, marker.Position.Count, "DayZ marker position is invalid");
+    Equal(8320d, marker.Position[0], "DayZ marker X is invalid");
+    Equal(0d, marker.Position[1], "DayZ marker height is invalid");
+    Equal(6896d, marker.Position[2], "DayZ marker Z is invalid");
+    Equal(255, marker.CircleColorA, "DayZ marker circle defaults are missing");
+    using var markerJson = JsonDocument.Parse(JsonSerializer.Serialize(marker, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase }));
+    True(markerJson.RootElement.TryGetProperty("creatorSteamID", out _), "DayZ marker uses an invalid JSON field name");
+    True(markerJson.RootElement.TryGetProperty("showAllPlayerNametags", out _), "DayZ marker is missing a required JSON field");
 }
 
 static void Equal<T>(T expected, T actual, string message)

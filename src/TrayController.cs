@@ -6,78 +6,56 @@ namespace CrosshairMarker;
 internal sealed class TrayController : IDisposable
 {
     private readonly NotifyIcon notifyIcon;
-    private readonly ContextMenuStrip menu;
-    private readonly ToolStripMenuItem toggleItem;
-    private readonly ToolStripMenuItem profilesItem;
-    private readonly Action<string> onSelectProfile;
+    private readonly Action onOpenGeneral;
+    private readonly Action onOpenTreasures;
+    private readonly Action onOpenTasks;
+    private readonly Action onOpenCrosshair;
+    private readonly Action onExit;
+    private TrayMenuForm? popup;
 
     public TrayController(
-        Action onToggleOverlay,
-        Action onOpenEditor,
-        Action onOpenUpdates,
+        Action onOpenGeneral,
         Action onOpenTreasures,
-        Action<string> onSelectProfile,
+        Action onOpenTasks,
+        Action onOpenCrosshair,
         Action onExit)
     {
-        this.onSelectProfile = onSelectProfile;
-        toggleItem = new ToolStripMenuItem("Скрыть оверлей", null, (_, _) => onToggleOverlay());
-        var editorItem = new ToolStripMenuItem("Редактор", null, (_, _) => onOpenEditor());
-        var updatesItem = new ToolStripMenuItem("Обновление", null, (_, _) => onOpenUpdates());
-        profilesItem = new ToolStripMenuItem("Профили");
-        var exitItem = new ToolStripMenuItem("Выход", null, (_, _) => onExit());
-
-        menu = new ContextMenuStrip();
-        var treasuresItem = new ToolStripMenuItem("\u041a\u043b\u0430\u0434\u044b", null, (_, _) => onOpenTreasures());
-        menu.Items.Add(toggleItem);
-        menu.Items.Add(profilesItem);
-        menu.Items.Add(editorItem);
-        menu.Items.Add(updatesItem);
-        menu.Items.Add(treasuresItem);
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(exitItem);
+        this.onOpenGeneral = onOpenGeneral;
+        this.onOpenTreasures = onOpenTreasures;
+        this.onOpenTasks = onOpenTasks;
+        this.onOpenCrosshair = onOpenCrosshair;
+        this.onExit = onExit;
 
         notifyIcon = new NotifyIcon
         {
             Text = AppIdentity.DisplayName,
             Icon = AppIcons.Tray(),
-            ContextMenuStrip = menu,
             Visible = true
         };
-        notifyIcon.DoubleClick += (_, _) => onOpenEditor();
-    }
-
-    public void SetOverlayVisible(bool visible)
-    {
-        toggleItem.Text = visible ? "Скрыть оверлей" : "Показать оверлей";
-    }
-
-    public void SetProfiles(IEnumerable<CrosshairProfile> profiles, string activeProfileId)
-    {
-        profilesItem.DropDownItems.Clear();
-
-        foreach (var profile in profiles)
+        notifyIcon.DoubleClick += (_, _) => onOpenGeneral();
+        notifyIcon.MouseUp += (_, eventArgs) =>
         {
-            var item = new ToolStripMenuItem(profile.Name)
-            {
-                Checked = profile.Id == activeProfileId,
-                Tag = profile.Id
-            };
-            item.Click += (_, _) =>
-            {
-                if (item.Tag is string profileId)
-                {
-                    menu.BeginInvoke(() => onSelectProfile(profileId));
-                }
-            };
-            profilesItem.DropDownItems.Add(item);
-        }
-
-        profilesItem.Enabled = profilesItem.DropDownItems.Count > 0;
+            if (eventArgs.Button == MouseButtons.Right) ShowPopup();
+        };
     }
 
     public void Dispose()
     {
+        popup?.Close();
         notifyIcon.Visible = false;
         notifyIcon.Dispose();
+    }
+
+    private void ShowPopup()
+    {
+        popup?.Close();
+        popup = new TrayMenuForm(
+            onOpenGeneral,
+            onOpenTreasures,
+            onOpenTasks,
+            onOpenCrosshair,
+            onExit);
+        popup.FormClosed += (_, _) => popup = null;
+        popup.ShowAboveTaskbar(Cursor.Position);
     }
 }
