@@ -291,8 +291,18 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
 
     private void CaptureTreasure()
     {
+        // The frame must be captured while DayZ still owns the foreground.
+        // Opening the editor first makes fullscreen DayZ show its pause menu
+        // before the screen snapshot can be taken.
+        var capture = treasureCaptureService.CaptureImage();
+        if (capture is null) return;
+        var captures = treasureStore.Load();
+        captures.Insert(0, capture);
+        treasureStore.Save(captures);
+
+        var editorWasOpen = editor is { IsDisposed: false };
         OpenEditor("treasures");
-        if (editor is not null) _ = editor.CaptureTreasureAsync();
+        if (editorWasOpen && editor is not null) editor.QueueTreasureRecognition(capture.Id);
     }
 
     private void OpenEditor(string? initialTab)

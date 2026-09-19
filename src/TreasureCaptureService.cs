@@ -24,13 +24,18 @@ internal sealed class TreasureCaptureService
 
     public TreasureCapture? CaptureImage()
     {
-        var region = ScreenRegionSelector.SelectRegion();
+        var screenBounds = SystemInformation.VirtualScreen;
+        using var screen = Capture(screenBounds);
+        var region = ScreenRegionSelector.SelectRegion(screen);
         if (!region.HasValue) return null;
         var capture = new TreasureCapture { Status = TreasureRecognitionStatus.Queued };
         var imagePath = store.CreateImagePath(capture.Id);
         try
         {
-            using var image = Capture(region.Value);
+            var selection = Rectangle.Intersect(screenBounds, region.Value);
+            if (selection.Width == 0 || selection.Height == 0) return null;
+            var source = new Rectangle(selection.Left - screenBounds.Left, selection.Top - screenBounds.Top, selection.Width, selection.Height);
+            using var image = screen.Clone(source, PixelFormat.Format32bppArgb);
             image.Save(imagePath, ImageFormat.Png);
             capture.ImagePath = imagePath;
             return capture;

@@ -149,7 +149,6 @@ internal sealed class EditorForm : Form
         Hide();
         try
         {
-            await Task.Delay(100);
             var capture = treasureCaptureService.CaptureImage();
             if (capture is null) return;
             var captures = treasureStore.Load();
@@ -165,6 +164,14 @@ internal sealed class EditorForm : Form
             Activate();
             await SendStateAsync();
         }
+    }
+
+    public void QueueTreasureRecognition(string captureId)
+    {
+        if (string.IsNullOrWhiteSpace(captureId) || treasureOcrQueue.Contains(captureId)) return;
+        treasureOcrQueue.Enqueue(captureId);
+        _ = ProcessTreasureQueueAsync();
+        _ = SendStateAsync();
     }
 
     private async Task ProcessTreasureQueueAsync()
