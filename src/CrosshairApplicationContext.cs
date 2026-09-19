@@ -21,8 +21,13 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
     private readonly TreasureCaptureStore treasureStore;
     private readonly TreasureCaptureService treasureCaptureService;
     private readonly TreasureMapBridge treasureMapBridge;
+    private readonly PlayerPositionMapBridge playerPositionMapBridge;
+    private readonly PlayerPositionCaptureService playerPositionCaptureService;
+    private readonly PlayerPositionTrackingController playerPositionTracker;
+    private readonly object playerPositionSettingsSync = new();
     private readonly System.Windows.Forms.Timer updateTimer = new() { Interval = 60 * 60 * 1000 };
     private bool updateCheckInProgress;
+    private bool exitInProgress;
     private AppConfig config;
 
     public CrosshairApplicationContext()
@@ -44,6 +49,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         tray = new TrayController(
             onOpenGeneral: OpenGeneral,
             onOpenTreasures: OpenTreasureCaptures,
+            onOpenPlayerPosition: OpenPlayerPosition,
             onOpenTasks: OpenTasks,
             onOpenCrosshair: OpenCrosshair,
             onExit: ExitApplication);
@@ -52,6 +58,8 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         treasureStore = new TreasureCaptureStore();
         treasureCaptureService = new TreasureCaptureService(treasureStore);
         treasureMapBridge = new TreasureMapBridge();
+        playerPositionMapBridge = new PlayerPositionMapBridge();
+        playerPositionCaptureService = new PlayerPositionCaptureService();
         battlePassStore = new BattlePassStore();
         battlePassSettings = battlePassStore.LoadSettings();
         battlePassTracker = new BattlePassTracker(battlePassStore);
@@ -74,12 +82,52 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         RegisterConfiguredHotkeys();
         dayZSettingsStore = new DayZCompanionSettingsStore();
         dayZSettings = dayZSettingsStore.Load();
+        playerPositionMapBridge.SetTrackingEnabled(dayZSettings.PlayerPositionTracking.Enabled);
+        playerPositionMapBridge.SessionChanged += session =>
+        {
+            lock (playerPositionSettingsSync)
+            {
+                var tracking = dayZSettings.PlayerPositionTracking;
+                var map = session.Maps.SingleOrDefault(item => string.Equals(item.Id, tracking.MapId, StringComparison.Ordinal)
+                    || string.Equals(item.Id, tracking.MapId, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(item.Name, tracking.MapId, StringComparison.OrdinalIgnoreCase));
+                if (map is null && session.Maps.Count == 1) map = session.Maps[0];
+                if (map is null || string.Equals(tracking.MapId, map.Id, StringComparison.Ordinal)) return;
+                tracking.MapId = map.Id;
+                tracking.LastError = "";
+                dayZSettingsStore.Save(dayZSettings);
+                AppRuntimeLog.Info($"Player position map destination synchronized: {map.Id}.");
+            }
+        };
+        playerPositionMapBridge.Delivered += update =>
+        {
+            lock (playerPositionSettingsSync)
+            {
+                if (!string.Equals(dayZSettings.PlayerPositionTracking.TrackingId, update.TrackingId, StringComparison.Ordinal)) return;
+                dayZSettings.PlayerPositionTracking.LastSentAt = DateTimeOffset.Now;
+                dayZSettings.PlayerPositionTracking.LastError = "";
+                dayZSettingsStore.Save(dayZSettings);
+            }
+        };
+        playerPositionTracker = new PlayerPositionTrackingController(playerPositionCaptureService, playerPositionMapBridge, () => dayZSettings.PlayerPositionTracking.Clone(), settings =>
+        {
+            lock (playerPositionSettingsSync)
+            {
+                var current = dayZSettings.PlayerPositionTracking;
+                // Delivery can be acknowledged while OCR is running. Do not let
+                // the older OCR snapshot erase that acknowledgement.
+                if (current.LastSentAt > settings.LastSentAt) settings.LastSentAt = current.LastSentAt;
+                dayZSettings.PlayerPositionTracking = settings.Clone();
+                dayZSettingsStore.Save(dayZSettings);
+            }
+        });
         if (DayZSettingsMigration.ApplyLegacyWindowBounds(config, dayZSettings))
         {
             dayZSettingsStore.Save(dayZSettings);
         }
-        dayZCompanion = new DayZCompanionServer(dayZSettings, treasureMapBridge);
+        dayZCompanion = new DayZCompanionServer(dayZSettings, treasureMapBridge, playerPositionMapBridge);
         dayZCompanion.Start();
+        playerPositionTracker.Refresh();
         updateTimer.Tick += async (_, _) => await CheckForUpdateAsync();
         updateTimer.Start();
         _ = CheckForUpdateAsync();
@@ -289,6 +337,8 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         OpenEditor("treasures");
     }
 
+    private void OpenPlayerPosition() => OpenEditor("player-position");
+
     private void CaptureTreasure()
     {
         // The frame must be captured while DayZ still owns the foreground.
@@ -317,7 +367,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             return;
         }
 
-        editor = new EditorForm(config, updateService, dayZSettings, dayZCompanion.GetStatus(), battlePassSettings, battlePassStore.LoadSnapshot(), treasureStore, treasureCaptureService, treasureMapBridge, initialTab);
+        editor = new EditorForm(config, updateService, dayZSettings, dayZCompanion.GetStatus(), battlePassSettings, battlePassStore.LoadSnapshot(), treasureStore, treasureCaptureService, treasureMapBridge, playerPositionMapBridge, playerPositionCaptureService, initialTab);
         editor.ConfigChanged += nextConfig =>
         {
             var startupChanged = config.StartWithWindows != nextConfig.StartWithWindows;
@@ -349,18 +399,34 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         editor.DayZSettingsChanged += nextSettings =>
         {
             nextSettings.Normalize();
-            var restartHttp = dayZSettings.RequiresHttpRestart(nextSettings);
-            dayZSettings.CopyFrom(nextSettings);
-            dayZSettingsStore.Save(dayZSettings);
+            bool restartHttp;
+            lock (playerPositionSettingsSync)
+            {
+                var runtime = dayZSettings.PlayerPositionTracking.Clone();
+                restartHttp = dayZSettings.RequiresHttpRestart(nextSettings);
+                dayZSettings.CopyFrom(nextSettings);
+                // The editor changes configuration, not telemetry reported by
+                // the OCR worker or map acknowledgement.
+                dayZSettings.PlayerPositionTracking.LastX = runtime.LastX;
+                dayZSettings.PlayerPositionTracking.LastY = runtime.LastY;
+                dayZSettings.PlayerPositionTracking.LastZ = runtime.LastZ;
+                dayZSettings.PlayerPositionTracking.LastSentAt = runtime.LastSentAt;
+                dayZSettings.PlayerPositionTracking.ConsecutiveErrors = runtime.ConsecutiveErrors;
+                dayZSettings.PlayerPositionTracking.LastError = runtime.LastError;
+                playerPositionMapBridge.SetTrackingEnabled(dayZSettings.PlayerPositionTracking.Enabled);
+                dayZSettingsStore.Save(dayZSettings);
+            }
             if (restartHttp)
             {
                 dayZCompanion.Dispose();
-                dayZCompanion = new DayZCompanionServer(dayZSettings, treasureMapBridge);
+                dayZCompanion = new DayZCompanionServer(dayZSettings, treasureMapBridge, playerPositionMapBridge);
                 dayZCompanion.Start();
             }
+            playerPositionTracker.Refresh();
             editor?.ApplyDayZState(dayZSettings, dayZCompanion.GetStatus());
         };
         editor.DayZStatusRequested += () => editor?.ApplyDayZState(dayZSettings, dayZCompanion.GetStatus());
+        editor.PlayerPositionRegionRequested += () => editor?.SelectPlayerPositionRegion();
         editor.BattlePassSettingsChanged += SaveBattlePassSettings;
         editor.BattlePassCommandRequested += HandleBattlePassCommand;
         editor.ExitRequested += ExitApplication;
@@ -505,17 +571,43 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
 
     private void ExitApplication()
     {
-        updateTimer.Stop();
-        updateTimer.Dispose();
-        store.SaveAtomic(config);
-        battlePassStore.SaveSettings(battlePassSettings);
-        dayZCompanion.Dispose();
-        battlePassClickInterceptor.Dispose();
-        hotkeys.Dispose();
-        tray.Dispose();
-        overlay.Close();
-        battlePassOverlay.Close();
-        editor?.Close();
-        ExitThread();
+        if (exitInProgress)
+        {
+            return;
+        }
+
+        exitInProgress = true;
+        AppRuntimeLog.Info("Application shutdown requested.");
+        try
+        {
+            ShutdownStep("player position tracker", () => playerPositionTracker.Dispose());
+            ShutdownStep("update timer", () => { updateTimer.Stop(); updateTimer.Dispose(); });
+            ShutdownStep("application settings", () => store.SaveAtomic(config));
+            ShutdownStep("Battle Pass settings", () => battlePassStore.SaveSettings(battlePassSettings));
+            ShutdownStep("DayZ Companion HTTP service", () => dayZCompanion.Dispose());
+            ShutdownStep("Battle Pass mouse interceptor", () => battlePassClickInterceptor.Dispose());
+            ShutdownStep("hotkeys", () => hotkeys.Dispose());
+            ShutdownStep("tray icon", () => tray.Dispose());
+            ShutdownStep("crosshair overlay", () => overlay.Close());
+            ShutdownStep("Battle Pass overlay", () => battlePassOverlay.Close());
+            ShutdownStep("editor window", () => editor?.Close());
+        }
+        finally
+        {
+            AppRuntimeLog.Info("Application shutdown completed; stopping UI message loop.");
+            ExitThread();
+        }
+    }
+
+    private static void ShutdownStep(string name, Action action)
+    {
+        try
+        {
+            action();
+        }
+        catch (Exception ex)
+        {
+            AppRuntimeLog.Error($"Could not shut down {name}", ex);
+        }
     }
 }

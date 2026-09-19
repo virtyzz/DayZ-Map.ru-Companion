@@ -8,6 +8,7 @@ internal sealed class TrayController : IDisposable
     private readonly NotifyIcon notifyIcon;
     private readonly Action onOpenGeneral;
     private readonly Action onOpenTreasures;
+    private readonly Action onOpenPlayerPosition;
     private readonly Action onOpenTasks;
     private readonly Action onOpenCrosshair;
     private readonly Action onExit;
@@ -16,12 +17,14 @@ internal sealed class TrayController : IDisposable
     public TrayController(
         Action onOpenGeneral,
         Action onOpenTreasures,
+        Action onOpenPlayerPosition,
         Action onOpenTasks,
         Action onOpenCrosshair,
         Action onExit)
     {
         this.onOpenGeneral = onOpenGeneral;
         this.onOpenTreasures = onOpenTreasures;
+        this.onOpenPlayerPosition = onOpenPlayerPosition;
         this.onOpenTasks = onOpenTasks;
         this.onOpenCrosshair = onOpenCrosshair;
         this.onExit = onExit;
@@ -52,6 +55,7 @@ internal sealed class TrayController : IDisposable
         popup = new TrayMenuForm(
             onOpenGeneral,
             onOpenTreasures,
+            onOpenPlayerPosition,
             onOpenTasks,
             onOpenCrosshair,
             onExit);

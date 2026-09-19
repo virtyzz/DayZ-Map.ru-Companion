@@ -18,15 +18,17 @@ internal sealed class DayZCompanionServer : IDisposable
     };
     private readonly DayZMarkersService markers;
     private readonly TreasureMapBridge treasureBridge;
+    private readonly PlayerPositionMapBridge positionBridge;
     private readonly CancellationTokenSource cancellation = new();
     private HttpListener? listener;
     private Task? worker;
 
-    public DayZCompanionServer(DayZCompanionSettings settings, TreasureMapBridge? treasureBridge = null)
+    public DayZCompanionServer(DayZCompanionSettings settings, TreasureMapBridge? treasureBridge = null, PlayerPositionMapBridge? positionBridge = null)
     {
         this.settings = settings;
         markers = new DayZMarkersService(settings);
         this.treasureBridge = treasureBridge ?? new TreasureMapBridge();
+        this.positionBridge = positionBridge ?? new PlayerPositionMapBridge();
     }
 
     public int? Port { get; private set; }
@@ -134,6 +136,15 @@ internal sealed class DayZCompanionServer : IDisposable
                 case ("POST", "/api/v1/treasures/ack"):
                     await AcknowledgeTreasureBatchAsync(context);
                     break;
+                case ("POST", "/api/v1/player-position/session"):
+                    await SetPositionSessionAsync(context);
+                    break;
+                case ("GET", "/api/v1/player-position/pending"):
+                    await GetPositionPendingAsync(context);
+                    break;
+                case ("POST", "/api/v1/player-position/ack"):
+                    await AcknowledgePositionAsync(context);
+                    break;
                 default:
                     await WriteJsonAsync(context.Response, 404, new { ok = false, message = "Маршрут не найден." });
                     break;
@@ -207,6 +218,32 @@ internal sealed class DayZCompanionServer : IDisposable
             ? outcomesElement.EnumerateArray().Select(item => new TreasureDeliveryOutcome(GetString(item, "captureId"), GetString(item, "result"), GetString(item, "message"))).Where(item => !string.IsNullOrWhiteSpace(item.CaptureId)).ToList()
             : null;
         treasureBridge.Acknowledge(GetString(root, "sessionId"), root.TryGetProperty("success", out var success) && success.ValueKind == JsonValueKind.True, GetString(root, "message"), outcomes);
+        await WriteJsonAsync(context.Response, 200, new { ok = true });
+    }
+
+    private async Task SetPositionSessionAsync(HttpListenerContext context)
+    {
+        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8, false, 1024, leaveOpen: false);
+        using var document = JsonDocument.Parse(await reader.ReadToEndAsync());
+        var root = document.RootElement;
+        var maps = root.TryGetProperty("maps", out var mapValues) && mapValues.ValueKind == JsonValueKind.Array ? mapValues.EnumerateArray().Select(item => new TreasureMapOption(GetString(item, "id"), GetString(item, "name"), GetInt(item, "width"), GetInt(item, "height"))).Where(item => !string.IsNullOrWhiteSpace(item.Id)).ToList() : [];
+        var profiles = root.TryGetProperty("profiles", out var profileValues) && profileValues.ValueKind == JsonValueKind.Array ? profileValues.EnumerateArray().Select(item => new TreasureProfileOption(GetString(item, "mapId"), GetString(item, "id"), GetString(item, "name"), !item.TryGetProperty("writable", out var writable) || writable.ValueKind != JsonValueKind.False, GetString(item, "markerName"), GetString(item, "markerType"), GetString(item, "markerColor"))).Where(item => !string.IsNullOrWhiteSpace(item.MapId) && !string.IsNullOrWhiteSpace(item.Id)).ToList() : [];
+        var claimedAt = root.TryGetProperty("claimedAt", out var claimValue) && claimValue.TryGetInt64(out var parsedClaimedAt)
+            ? parsedClaimedAt
+            : root.TryGetProperty("openedAt", out var openedAtValue) && openedAtValue.TryGetInt64(out var parsedOpenedAt) ? parsedOpenedAt : (long?)null;
+        positionBridge.SetSession(new TreasureDestinationSession(GetString(root, "sessionId"), DateTimeOffset.UtcNow, maps, profiles), claimedAt);
+        await WriteJsonAsync(context.Response, 200, new { ok = true, expiresInSeconds = 300 });
+    }
+    private Task GetPositionPendingAsync(HttpListenerContext context)
+    {
+        var sessionId = context.Request.QueryString["session"] ?? "";
+        return WriteJsonAsync(context.Response, 200, new { ok = true, active = positionBridge.IsActiveSession(sessionId), trackingEnabled = positionBridge.IsTrackingEnabled, update = positionBridge.GetPending(sessionId) });
+    }
+    private async Task AcknowledgePositionAsync(HttpListenerContext context)
+    {
+        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8, false, 1024, leaveOpen: false);
+        using var document = JsonDocument.Parse(await reader.ReadToEndAsync()); var root = document.RootElement;
+        positionBridge.Acknowledge(GetString(root, "sessionId"), GetString(root, "trackingId"), root.TryGetProperty("success", out var success) && success.ValueKind == JsonValueKind.True, GetString(root, "message"));
         await WriteJsonAsync(context.Response, 200, new { ok = true });
     }
 

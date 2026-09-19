@@ -22,12 +22,16 @@ internal sealed class EditorForm : Form
     private readonly TreasureCaptureStore treasureStore;
     private readonly TreasureCaptureService treasureCaptureService;
     private readonly TreasureMapBridge treasureMapBridge;
+    private readonly PlayerPositionMapBridge playerPositionMapBridge;
+    private readonly PlayerPositionCaptureService playerPositionCaptureService;
     private readonly WebView2 webView = new();
     private readonly System.Windows.Forms.Timer dayZStatusTimer = new() { Interval = 2500 };
     private AppConfig config;
     private DayZCompanionSettings dayZSettings;
     private DayZCompanionStatus dayZStatus;
     private OcrStatus? ocrStatus;
+    private readonly System.Windows.Forms.Timer ocrInstallPollTimer = new() { Interval = 5000 };
+    private int ocrInstallPollAttempts;
     private Size previewSize = new(720, 420);
     private BattlePassSettings battlePassSettings;
     private BattlePassSnapshot battlePassSnapshot;
@@ -44,16 +48,19 @@ internal sealed class EditorForm : Form
     public event Action<EditorWindowBounds>? EditorBoundsChanged;
     public event Action? ExitRequested;
     public event Action<DayZCompanionSettings>? DayZSettingsChanged;
+    public event Action? PlayerPositionRegionRequested;
     public event Action? DayZStatusRequested;
     public event Action<BattlePassSettings>? BattlePassSettingsChanged;
     public event Action<string>? BattlePassCommandRequested;
 
-    public EditorForm(AppConfig source, UpdateService updateService, DayZCompanionSettings dayZSettings, DayZCompanionStatus dayZStatus, BattlePassSettings battlePassSettings, BattlePassSnapshot battlePassSnapshot, TreasureCaptureStore treasureStore, TreasureCaptureService treasureCaptureService, TreasureMapBridge treasureMapBridge, string? initialTab = null)
+    public EditorForm(AppConfig source, UpdateService updateService, DayZCompanionSettings dayZSettings, DayZCompanionStatus dayZStatus, BattlePassSettings battlePassSettings, BattlePassSnapshot battlePassSnapshot, TreasureCaptureStore treasureStore, TreasureCaptureService treasureCaptureService, TreasureMapBridge treasureMapBridge, PlayerPositionMapBridge playerPositionMapBridge, PlayerPositionCaptureService playerPositionCaptureService, string? initialTab = null)
     {
         this.updateService = updateService;
         this.treasureStore = treasureStore;
         this.treasureCaptureService = treasureCaptureService;
         this.treasureMapBridge = treasureMapBridge;
+        this.playerPositionMapBridge = playerPositionMapBridge;
+        this.playerPositionCaptureService = playerPositionCaptureService;
         foreach (var capture in treasureStore.Load().Where(item => item.Status is TreasureRecognitionStatus.Queued or TreasureRecognitionStatus.Recognizing)) treasureOcrQueue.Enqueue(capture.Id);
         _ = ProcessTreasureQueueAsync();
         pendingTab = initialTab;
@@ -62,6 +69,7 @@ internal sealed class EditorForm : Form
         this.dayZSettings = dayZSettings;
         this.dayZSettings.Normalize();
         this.dayZStatus = dayZStatus;
+        ocrInstallPollTimer.Tick += async (_, _) => await RefreshOcrAfterInstallAsync();
         this.battlePassSettings = battlePassSettings.Clone();
         this.battlePassSnapshot = battlePassSnapshot;
 
@@ -92,6 +100,8 @@ internal sealed class EditorForm : Form
         {
             dayZStatusTimer.Stop();
             dayZStatusTimer.Dispose();
+            ocrInstallPollTimer.Stop();
+            ocrInstallPollTimer.Dispose();
             var savedBounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
             EditorBoundsChanged?.Invoke(EditorWindowBounds.FromRectangle(savedBounds));
             MonitorChanged?.Invoke(Screen.FromRectangle(savedBounds).DeviceName);
@@ -273,6 +283,9 @@ internal sealed class EditorForm : Form
                 case "command":
                     await HandleCommandAsync(root.GetProperty("name").GetString());
                     break;
+                case "updatePlayerPositionSettings":
+                    ApplyPlayerPositionSettingsFromWeb(root.GetProperty("settings"));
+                    break;
                 case "treasure":
                     HandleTreasureFromWeb(root);
                     await SendStateAsync();
@@ -338,7 +351,10 @@ internal sealed class EditorForm : Form
                 UpdateService.OpenReleasesPage();
                 break;
             case "exitApplication":
-                ExitRequested?.Invoke();
+                // Return from the WebView callback before closing its owning form.
+                // Closing it synchronously can leave the callback and its COM message pump
+                // waiting on each other, making the application appear stuck.
+                BeginInvoke(new Action(() => ExitRequested?.Invoke()));
                 break;
             case "selectDayZMarkersFile":
                 SelectDayZMarkersFile();
@@ -367,6 +383,10 @@ internal sealed class EditorForm : Form
                 break;
             case "installOcr":
                 TesseractOcr.Install();
+                ocrInstallPollAttempts = 0;
+                ocrInstallPollTimer.Start();
+                ocrStatus = TesseractOcr.Detect();
+                await SendStateAsync();
                 break;
             case "refreshOcr":
                 ocrStatus = TesseractOcr.Detect();
@@ -374,6 +394,15 @@ internal sealed class EditorForm : Form
                 break;
             case "captureTreasure":
                 await CaptureTreasureAsync();
+                break;
+            case "selectPlayerPositionRegion":
+                PlayerPositionRegionRequested?.Invoke();
+                break;
+            case "testPlayerPosition":
+                await TestPlayerPositionAsync();
+                break;
+            case "openPlayerPositionDiagnostics":
+                OpenFileLocation(playerPositionCaptureService.DiagnosticsDirectory);
                 break;
             case "openTreasureCapturesFolder":
                 OpenFileLocation(treasureStore.ImagesDirectory);
@@ -388,6 +417,37 @@ internal sealed class EditorForm : Form
         next.Normalize();
         dayZSettings = next;
         DayZSettingsChanged?.Invoke(next);
+    }
+
+    private void ApplyPlayerPositionSettingsFromWeb(JsonElement settingsElement)
+    {
+        var next = settingsElement.Deserialize<PlayerPositionTrackingSettings>(JsonOptions);
+        if (next is null) return;
+        next.Normalize();
+        dayZSettings.PlayerPositionTracking = next;
+        DayZSettingsChanged?.Invoke(dayZSettings);
+    }
+
+    public void SelectPlayerPositionRegion()
+    {
+        var bounds = SystemInformation.VirtualScreen;
+        using var screen = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppArgb);
+        using (var graphics = Graphics.FromImage(screen)) graphics.CopyFromScreen(bounds.Location, Point.Empty, bounds.Size);
+        var region = ScreenRegionSelector.SelectRegion(screen);
+        if (!region.HasValue) return;
+        dayZSettings.PlayerPositionTracking.SetScreenRectangle(region.Value, bounds);
+        DayZSettingsChanged?.Invoke(dayZSettings);
+    }
+
+    public async Task TestPlayerPositionAsync()
+    {
+        var settings = dayZSettings.PlayerPositionTracking;
+        var session = playerPositionMapBridge.GetSession();
+        var map = session?.Maps.SingleOrDefault(item => item.Id == settings.MapId);
+        var result = await playerPositionCaptureService.TestAsync(settings, map);
+        settings.LastError = result.Position is null ? result.Message : "Тест: " + result.Message;
+        if (result.Position is not null) { settings.LastX = result.Position.X; settings.LastY = result.Position.Y; settings.LastZ = result.Position.Z; }
+        DayZSettingsChanged?.Invoke(dayZSettings);
     }
 
     private void HandleTreasureFromWeb(JsonElement root)
@@ -583,8 +643,10 @@ internal sealed class EditorForm : Form
             openTab,
             update = updateInfo,
             dayZ = new { settings = dayZSettings, status = dayZStatus },
-            battlePass = new { settings = battlePassSettings, snapshot = battlePassSnapshot, ocr = ocrStatus ??= TesseractOcr.Detect() },
+            ocr = ocrStatus ??= TesseractOcr.Detect(),
+            battlePass = new { settings = battlePassSettings, snapshot = battlePassSnapshot, ocr = ocrStatus },
             treasures = new { captures = PrepareTreasureCapturesForView(), destination = treasureMapBridge.GetSession(), selecting = treasureCaptureInProgress, processing = treasureOcrWorkerRunning, queued = treasureOcrQueue.Count, feedback = treasureMapBridge.GetDeliveryFeedback() ?? treasureFeedback },
+            playerPosition = new { settings = dayZSettings.PlayerPositionTracking, destination = playerPositionMapBridge.GetSession(), feedback = playerPositionMapBridge.GetFeedback(), diagnostics = playerPositionCaptureService.GetDiagnostics() },
             hotkeyErrors = config.HotkeyRegistrationErrors,
             monitors = MonitorInfo.GetAll().Select(monitor => new
             {
@@ -596,6 +658,17 @@ internal sealed class EditorForm : Form
         };
         var json = JsonSerializer.Serialize(payload, JsonOptions);
             await webView.CoreWebView2.ExecuteScriptAsync($"window.DayZMapCompanion.receiveState({json});");
+    }
+
+    private async Task RefreshOcrAfterInstallAsync()
+    {
+        ocrInstallPollAttempts++;
+        ocrStatus = TesseractOcr.Detect();
+        if (ocrStatus.Ready || ocrInstallPollAttempts >= 24)
+        {
+            ocrInstallPollTimer.Stop();
+        }
+        await SendStateAsync();
     }
 
     private async Task RefreshUpdateInfoAsync(bool forceRefresh)
@@ -1289,6 +1362,7 @@ let treasurePreviewUri = null;
 let treasureTypeMenuOpen = false;
 let treasureMapMenuOpen = false;
 let treasureProfileMenuOpen = false;
+let playerPositionSettingsTimer = null;
 let treasureTypeMenuUp = false;
 let treasureMapMenuUp = false;
 let treasureProfileMenuUp = false;
@@ -1296,6 +1370,11 @@ const treasureMarkerTypes = [
   ["default", "⌖", "Обычный маркер", "#3498db"], ["cross", "×", "X", "#3498db"], ["home", "⌂", "Дом", "#e74c3c"], ["camp", "△", "Лагерь", "#27ae60"], ["safezone", "♢", "Безопасная зона", "#2ecc71"], ["blackmarket", "▣", "Чёрный рынок", "#34495e"], ["hospital", "+", "Госпиталь", "#e74c8c"], ["sniper", "⊙", "Снайпер", "#c0392b"], ["player", "♙", "Игрок", "#9b59b6"], ["flag", "⚑", "Флаг", "#d35400"], ["star", "☆", "Звезда", "#f1c40f"], ["car", "▰", "Авто", "#16a085"], ["parking", "P", "Парковка", "#7f8c8d"], ["heli", "✈", "Вертолёт", "#2980b9"], ["rail", "▤", "Железная дорога", "#8e44ad"], ["ship", "⚓", "Корабль", "#3498db"], ["scooter", "◉", "Скутер", "#1abc9c"], ["bank", "¤", "Банк", "#f39c12"], ["restaurant", "●", "Ресторан", "#e67e22"], ["post", "✉", "Почта", "#95a5a6"], ["castle", "♜", "Замок", "#7d3c98"], ["ranger-station", "♲", "Станция рейнджера", "#27ae60"], ["water", "♒", "Вода", "#3498db"], ["triangle", "▲", "Треугольник", "#e74c3c"], ["cow", "♧", "Корова", "#8b4513"], ["bear", "♛", "Медведь", "#2c3e50"], ["car-repair", "⚒", "Ремонт авто", "#d35400"], ["communications", "⌁", "Коммуникации", "#9b59b6"], ["roadblock", "▰", "Блокпост", "#c0392b"], ["stadium", "▭", "Стадион", "#f1c40f"], ["skull", "☠", "Череп", "#2c3e50"], ["rocket", "▲", "Ракета", "#e74c3c"], ["bbq", "♨", "BBQ", "#d35400"], ["ping", "●", "Пинг", "#2ecc71"], ["circle", "●", "Круг", "#3498db"]
 ].map(([id, icon, name, color]) => ({ id, icon, name, color }));
 const treasureMarkerIcon = (type, color) => `<svg class="treasure-type-icon" style="color:${color}" viewBox="0 0 24 24" aria-hidden="true"><use href="#${type}"></use></svg>`;
+const playerPositionShapes = [
+  ["triangle", "▲", "Треугольник"], ["circle", "●", "Круг"], ["square", "■", "Квадрат"], ["diamond", "◆", "Ромб"],
+  ["heart", "♥", "Сердце"], ["cross", "✚", "Крест"], ["star", "★", "Звезда"],
+  ["hexagon", "⬢", "Шестиугольник"], ["pentagon", "⬠", "Пятиугольник"], ["x", "✕", "X"], ["paw", "🐾", "Лапка"]
+].map(([id, icon, name]) => ({ id, icon, name }));
 document.addEventListener("keydown", event => {
   if (event.key === "Escape") {
     const hadPreview = Boolean(treasurePreviewUri);
@@ -1351,6 +1430,7 @@ const defaultHotkeys = {
 };
 
 const navigation = [
+  { tab: ["player-position", "Позиция игрока"] },
   { tab: ["treasures", "\u041a\u043b\u0430\u0434\u044b"] },
   { tab: ["dayz", "Синхронизация меток"] },
   { id: "tasks", label: "Отслеживание заданий", tabs: [
@@ -1615,6 +1695,7 @@ function renderDataChanged(previous, next) {
     config: value.config,
     openTab: value.openTab,
     update: value.update,
+    ocr: value.ocr,
     dayZSettings: value.dayZ?.settings,
     battlePass: value.battlePass,
     treasures: value.treasures,
@@ -1660,6 +1741,7 @@ function renderEditor() {
     taskhotkeys: renderBattlePassHotkeys(),
     monitor: renderMonitor(),
     dayz: renderDayZ(),
+    "player-position": renderPlayerPosition(),
     treasures: renderTreasures(),
     tasks: renderBattlePass(),
     profiles: renderProfiles(),
@@ -1847,6 +1929,35 @@ function renderImage() {
   `;
 }
 
+function renderOcrStatus(ocr = state.ocr) {
+  const ready = !!ocr?.Ready;
+  const status = ready ? "OCR: готово" : "OCR: не установлен";
+  return field("Распознавание текста", { input: `<div class="update-status"><strong>${status}</strong><span>${escapeHtml(ocr?.Message || "Проверка OCR ещё не выполнена.")}</span></div><div class="actions"><button class="action primary" data-command="installOcr" ${ready ? "disabled" : ""}>Установить OCR</button><button class="action" data-command="refreshOcr">Проверить снова</button></div>` });
+}
+
+function renderPlayerPosition() {
+  const data = state.playerPosition || {};
+  const s = data.settings || {};
+  const destination = data.destination;
+  const diagnostics = data.diagnostics;
+  const selectedShape = playerPositionShapes.find(item => item.id === s.IndicatorShape) || playerPositionShapes[0];
+  const shapeOptions = playerPositionShapes.map(item => `<option value="${item.id}" ${item.id === selectedShape.id ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("");
+  const last = Number.isInteger(s.LastX) ? `X=${s.LastX}, Y=${s.LastY}, Z=${s.LastZ}` : "ещё не распознана";
+  const status = s.Enabled && !s.Paused ? "включено" : s.Paused ? "на паузе" : "выключено";
+  return `<h2>Позиция игрока</h2>${renderOcrStatus()}<div class="control-group">
+    <div class="limit">Захватывается только выделенная область видимого HUD; память игры, инъекции и игровой ввод не используются.</div>
+    <div class="field"><label><input type="checkbox" data-position-enabled ${s.Enabled ? "checked" : ""}> Отслеживание: ${status} (${s.Enabled ? "снимите галочку, чтобы отключить отслеживание" : "поставьте галочку, чтобы включить отслеживание"})</label></div>
+    <div class="field"><label><input type="checkbox" data-position-paused ${s.Paused ? "checked" : ""}> Пауза</label></div>
+    <div class="limit">Карта определяется автоматически по открытой вкладке DayZ-Map.</div>
+    <div class="actions"><input data-position-name value="${escapeHtml(s.MarkerName || "")}" placeholder="Подпись маркера"><input class="treasure-color-picker" data-position-color type="color" value="${escapeHtml(s.MarkerColor || "#3498db")}" title="Цвет индикатора"></div>
+    <div class="field"><label>Фигура индикатора <select data-position-shape>${shapeOptions}</select></label><div class="limit">Это временный индикатор позиции — он не добавляется в профиль, списки и экспорт карты.</div></div>
+    <div class="field"><label>Интервал, секунд <input class="number" data-position-interval type="number" min="2" max="300" value="${s.IntervalSeconds || 5}"></label><div class="limit">Допустимый диапазон: 2–300 секунд.</div></div>
+    <div class="actions"><button class="action" data-command="selectPlayerPositionRegion">Настроить область координат</button><button class="action" data-command="testPlayerPosition">Тест распознавания</button><button class="action" data-command="openPlayerPositionDiagnostics" ${diagnostics ? "" : "disabled"}>Открыть диагностику OCR</button></div>
+    <div class="limit" data-player-position-status>Область: ${s.HasRegion ? "настроена" : "не выбрана"}. Последняя позиция: ${last}. Последняя отправка: ${s.LastSentAt ? new Date(s.LastSentAt).toLocaleString() : "—"}. Ошибок подряд: ${s.ConsecutiveErrors || 0}.</div>
+    <div class="limit ${s.LastError ? "hotkey-warning" : ""}" data-player-position-error>${escapeHtml(s.LastError || data.feedback || "")}</div>${diagnostics ? `<div class="limit">OCR ${diagnostics.Recognized ? "распознано" : "не распознано"}: ${escapeHtml((diagnostics.RawText || "").slice(0, 180))}</div>` : ""}${destination ? "" : `<div class="limit">Откройте DayZ-Map в браузере и подключите Companion.</div>`}
+  </div>`;
+}
+
 function renderTreasures() {
   const items = state.treasures?.captures || [];
   const readyItems = items.filter(item => Number.isInteger(item.X) && Number.isInteger(item.Z));
@@ -1887,7 +1998,7 @@ function renderTreasures() {
   const destinationUi = !destination ? `<div class="field"><div class="field-label">Карта</div><div class="limit">Откройте DayZ-Map в браузере: Companion ожидает подключение карты.</div></div>` : `<div class="field"><div class="field-label">Отправка на карту</div><div class="treasure-destination-grid"><label>Карта${mapPicker}</label><label>Профиль${profilePicker}</label></div><div class="treasure-template-label">Настройки метки<div class="treasure-template-row"><input type="text" data-treasure-template-name value="${escapeHtml(selectedTemplate.name)}" placeholder="Название метки" maxlength="300"><div class="treasure-type-picker ${treasureTypeMenuUp ? "open-up" : ""}"><input type="hidden" data-treasure-template-type value="${selectedMarkerType.id}"><button type="button" class="treasure-type-trigger" data-treasure-type-toggle>${treasureMarkerIcon(selectedMarkerType.id, selectedMarkerType.color)}<span>${escapeHtml(selectedMarkerType.name)}</span></button><div class="treasure-type-menu" ${treasureTypeMenuOpen ? "" : "hidden"}>${typeOptions}</div></div><input class="treasure-color-picker" data-treasure-template-color type="color" value="${selectedColor}" title="Цвет метки"></div></div><div><button class="action primary" data-treasure-send ${!treasureProfileId ? "disabled" : ""}>Отправить координаты</button></div><div class="limit">Шаблон задаётся для этой отправки и не изменяет настройки профиля на карте.</div></div>`;
   const feedback = state.treasures?.feedback ? `<div class="limit">${escapeHtml(state.treasures.feedback)}</div>` : "";
   const preview = treasurePreviewUri ? `<div class="treasure-image-modal" data-treasure-preview-close><img src="${treasurePreviewUri}" alt="Скриншот уведомления"></div>` : "";
-  return `<h2>Клады</h2><div class="control-group"><div class="field-row"><span>Горячая клавиша захвата</span><button class="action" data-hotkey="CaptureTreasure">${displayHotkey(state.config.Hotkeys.CaptureTreasure)}</button></div>${hotkeyRegistrationWarning("CaptureTreasure")}<div class="actions"><button class="action primary" data-command="captureTreasure" ${state.treasures?.selecting ? "disabled" : ""}>Выделить область уведомления</button><button class="action" data-command="openTreasureCapturesFolder">Открыть папку PNG</button><button class="action" data-treasure="clear" ${items.length ? "" : "disabled"}>Очистить все</button>${errors.length ? `<button class="action" data-treasure="clearErrors">Удалить ошибки OCR (${errors.length})</button>` : ""}</div>${queue}${feedback}${cards}${destinationUi}${preview}</div>`;
+  return `<h2>Клады</h2>${renderOcrStatus()}<div class="control-group"><div class="field-row"><span>Горячая клавиша захвата</span><button class="action" data-hotkey="CaptureTreasure">${displayHotkey(state.config.Hotkeys.CaptureTreasure)}</button></div>${hotkeyRegistrationWarning("CaptureTreasure")}<div class="actions"><button class="action primary" data-command="captureTreasure" ${state.treasures?.selecting ? "disabled" : ""}>Выделить область уведомления</button><button class="action" data-command="openTreasureCapturesFolder">Открыть папку PNG</button><button class="action" data-treasure="clear" ${items.length ? "" : "disabled"}>Очистить все</button>${errors.length ? `<button class="action" data-treasure="clearErrors">Удалить ошибки OCR (${errors.length})</button>` : ""}</div>${queue}${feedback}${cards}${destinationUi}${preview}</div>`;
 }
 
 function renderHotkeys() {
@@ -1929,7 +2040,7 @@ function renderBattlePass() {
   const monitorOptions = monitors.map(m => `<option value="${m.DeviceName}" ${m.DeviceName === (s.MonitorDeviceName || "") ? "selected" : ""}>${escapeHtml(m.DisplayName)}</option>`).join("");
   return `
     <h2>Отслеживание заданий</h2>
-    ${field("Tesseract OCR", { input: `<div class="update-status">${escapeHtml(ocr?.Message || "Проверка OCR ещё не выполнена.")}</div><div class="actions"><button class="action primary" data-command="installOcr" ${ocr?.Ready ? "disabled" : ""}>Установить Tesseract</button><button class="action" data-command="refreshOcr">Проверить снова</button></div>` })}
+    ${renderOcrStatus(ocr)}
     <div class="limit">Откройте Battle Pass в DayZ, выберите тип страницы ниже и нажмите «Считать экран». Для еженедельных заданий повторите для страниц 1 и 2.</div>
     ${field("Монитор", { input: `<select data-bp-select="MonitorDeviceName">${monitorOptions}</select>` })}
     <div class="settings-columns">
@@ -2192,6 +2303,35 @@ function bindEditorEvents() {
       button.textContent = "Нажмите сочетание...";
     });
   });
+  const positionSetting = () => ({
+    ...(state.playerPosition?.settings || {}),
+    Enabled: document.querySelector("[data-position-enabled]")?.checked || false,
+    Paused: document.querySelector("[data-position-paused]")?.checked || false,
+    MapId: state.playerPosition?.settings?.MapId || "",
+    ProfileId: "",
+    MarkerName: document.querySelector("[data-position-name]")?.value || "",
+    MarkerType: "player",
+    IndicatorShape: document.querySelector("[data-position-shape]")?.value || "triangle",
+    MarkerColor: document.querySelector("[data-position-color]")?.value || "#3498db",
+    IntervalSeconds: Number(document.querySelector("[data-position-interval]")?.value || 5)
+  });
+  const savePlayerPositionSettings = (refreshEditor = false) => {
+    const next = positionSetting();
+    state.playerPosition = { ...(state.playerPosition || {}), settings: next };
+    // Checkbox state is also reflected in the surrounding label. Update the
+    // local view immediately instead of waiting for the native state push.
+    if (refreshEditor) render();
+    post({ type: "updatePlayerPositionSettings", settings: next });
+  };
+  const debouncePlayerPositionSettings = () => {
+    clearTimeout(playerPositionSettingsTimer);
+    playerPositionSettingsTimer = setTimeout(savePlayerPositionSettings, 180);
+  };
+  document.querySelectorAll("[data-position-enabled], [data-position-paused]").forEach(input => input.addEventListener("change", () => savePlayerPositionSettings(true)));
+  document.querySelector("[data-position-interval]")?.addEventListener("change", savePlayerPositionSettings);
+  document.querySelector("[data-position-name]")?.addEventListener("input", debouncePlayerPositionSettings);
+  document.querySelector("[data-position-color]")?.addEventListener("input", debouncePlayerPositionSettings);
+  document.querySelector("[data-position-shape]")?.addEventListener("change", savePlayerPositionSettings);
   document.querySelectorAll("[data-treasure]").forEach(button => {
     button.addEventListener("click", () => {
       const id = button.dataset.id;
@@ -2562,6 +2702,23 @@ document.addEventListener("click", event => {
   });
 });
 
+function refreshPlayerPositionStatus() {
+  const settings = state?.playerPosition?.settings;
+  if (!settings) return;
+  const status = document.querySelector("[data-player-position-status]");
+  if (status) {
+    const last = Number.isInteger(settings.LastX) ? `X=${settings.LastX}, Y=${settings.LastY}, Z=${settings.LastZ}` : "ещё не распознана";
+    const sent = settings.LastSentAt ? new Date(settings.LastSentAt).toLocaleString() : "—";
+    status.textContent = `Область: ${settings.HasRegion ? "настроена" : "не выбрана"}. Последняя позиция: ${last}. Последняя отправка: ${sent}. Ошибок подряд: ${settings.ConsecutiveErrors || 0}.`;
+  }
+  const error = document.querySelector("[data-player-position-error]");
+  if (error) {
+    const message = settings.LastError || state.playerPosition?.feedback || "";
+    error.textContent = message;
+    error.classList.toggle("hotkey-warning", Boolean(settings.LastError));
+  }
+}
+
 window.DayZMapCompanion = {
   receivePreview(preview) {
     if (state) state.preview = preview;
@@ -2590,6 +2747,7 @@ window.DayZMapCompanion = {
       expandNavForTab(activeTab);
     }
     if (needsRender) render();
+    else refreshPlayerPositionStatus();
   },
   openTab(tab) {
     activeTab = tab;

@@ -19,6 +19,7 @@ internal sealed class TrayMenuForm : Form
     public TrayMenuForm(
         Action onOpenGeneral,
         Action onOpenTreasures,
+        Action onOpenPlayerPosition,
         Action onOpenTasks,
         Action onOpenCrosshair,
         Action onExit)
@@ -35,6 +36,7 @@ internal sealed class TrayMenuForm : Form
 
         AddItem("Открыть окно", onOpenGeneral);
         AddSeparator();
+        AddItem("Позиция игрока", onOpenPlayerPosition);
         AddItem("Клады", onOpenTreasures);
         AddItem("Оверлей заданий", onOpenTasks);
         AddItem("Прицел", onOpenCrosshair);

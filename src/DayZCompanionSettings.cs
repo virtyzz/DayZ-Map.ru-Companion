@@ -12,12 +12,15 @@ internal sealed class DayZCompanionSettings
     public int BackupLimit { get; set; } = 20;
     public int BackupMaxAgeDays { get; set; } = 90;
     public EditorWindowBounds? EditorWindowBounds { get; set; }
+    public PlayerPositionTrackingSettings PlayerPositionTracking { get; set; } = new();
 
     public void Normalize()
     {
         BackupLimit = Math.Clamp(BackupLimit, 1, 100);
         BackupMaxAgeDays = Math.Clamp(BackupMaxAgeDays, 1, 3650);
         EditorWindowBounds?.Normalize();
+        PlayerPositionTracking ??= new PlayerPositionTrackingSettings();
+        PlayerPositionTracking.Normalize();
         if (!string.IsNullOrWhiteSpace(PrivateMarkersPath))
         {
             PrivateMarkersPath = Path.GetFullPath(PrivateMarkersPath);
@@ -37,6 +40,7 @@ internal sealed class DayZCompanionSettings
         BackupLimit = source.BackupLimit;
         BackupMaxAgeDays = source.BackupMaxAgeDays;
         EditorWindowBounds = source.EditorWindowBounds?.Clone();
+        PlayerPositionTracking = source.PlayerPositionTracking?.Clone() ?? new PlayerPositionTrackingSettings();
         Normalize();
     }
 }
@@ -44,6 +48,7 @@ internal sealed class DayZCompanionSettings
 internal sealed class DayZCompanionSettingsStore
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    private readonly object sync = new();
     private readonly string path;
 
     public DayZCompanionSettingsStore()
@@ -61,37 +66,43 @@ internal sealed class DayZCompanionSettingsStore
 
     public DayZCompanionSettings Load()
     {
-        try
+        lock (sync)
         {
-            var settings = File.Exists(path)
-                ? JsonSerializer.Deserialize<DayZCompanionSettings>(File.ReadAllText(path), JsonOptions) ?? new DayZCompanionSettings()
-                : new DayZCompanionSettings();
-            settings.Normalize();
-            if (!File.Exists(path)) Save(settings);
-            return settings;
-        }
-        catch (Exception ex)
-        {
-            AppRuntimeLog.Error("Could not load DayZ Companion settings", ex);
-            var fallback = new DayZCompanionSettings();
-            fallback.Normalize();
             try
             {
-                Save(fallback);
+                var settings = File.Exists(path)
+                    ? JsonSerializer.Deserialize<DayZCompanionSettings>(File.ReadAllText(path), JsonOptions) ?? new DayZCompanionSettings()
+                    : new DayZCompanionSettings();
+                settings.Normalize();
+                if (!File.Exists(path)) Save(settings);
+                return settings;
             }
-            catch (Exception saveEx)
+            catch (Exception ex)
             {
-                AppRuntimeLog.Error("Could not restore default DayZ Companion settings", saveEx);
+                AppRuntimeLog.Error("Could not load DayZ Companion settings", ex);
+                var fallback = new DayZCompanionSettings();
+                fallback.Normalize();
+                try
+                {
+                    Save(fallback);
+                }
+                catch (Exception saveEx)
+                {
+                    AppRuntimeLog.Error("Could not restore default DayZ Companion settings", saveEx);
+                }
+                return fallback;
             }
-            return fallback;
         }
     }
 
     public void Save(DayZCompanionSettings settings)
     {
-        settings.Normalize();
-        var temp = path + ".tmp";
-        File.WriteAllText(temp, JsonSerializer.Serialize(settings, JsonOptions));
-        File.Move(temp, path, true);
+        lock (sync)
+        {
+            settings.Normalize();
+            var temp = path + ".tmp";
+            File.WriteAllText(temp, JsonSerializer.Serialize(settings, JsonOptions));
+            File.Move(temp, path, true);
+        }
     }
 }

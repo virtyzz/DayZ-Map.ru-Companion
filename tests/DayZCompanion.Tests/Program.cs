@@ -29,7 +29,9 @@ var tests = new (string Name, Action Run)[]
     ("Battle Pass scan hotkey is reset once", BattlePassScanHotkeyIsResetOnce),
     ("update reminder observes the 12-hour interval", UpdateReminderObservesInterval),
     ("Treasure OCR recognizes labeled coordinates", TreasureOcrRecognizesCoordinates),
-    ("Treasure bridge sends coordinates", TreasureBridgeQueuesCoordinates)
+    ("Treasure bridge sends coordinates", TreasureBridgeQueuesCoordinates),
+    ("Player position OCR requires exactly X Y Z", PlayerPositionOcrIsStrict),
+    ("Player position bridge keeps one pending update", PlayerPositionBridgeUpserts)
 };
 
 var failures = new List<string>();
@@ -411,6 +413,29 @@ static void TreasureBridgeQueuesCoordinates()
     using var markerJson = JsonDocument.Parse(JsonSerializer.Serialize(marker, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase }));
     True(markerJson.RootElement.TryGetProperty("creatorSteamID", out _), "DayZ marker uses an invalid JSON field name");
     True(markerJson.RootElement.TryGetProperty("showAllPlayerNametags", out _), "DayZ marker is missing a required JSON field");
+}
+
+static void PlayerPositionOcrIsStrict()
+{
+    var map = new TreasureMapOption("cherno", "Chernarus", 15360, 15360);
+    var valid = PlayerPositionCaptureService.Parse("8320 120 6896", map);
+    True(valid.Position is not null, "three coordinates were not accepted");
+    Equal(120, valid.Position!.Y, "height was not preserved");
+    True(PlayerPositionCaptureService.Parse("8320 120 6896.", map).Position is not null, "trailing OCR punctuation was not accepted");
+    True(PlayerPositionCaptureService.Parse("8320 6896", map).Position is null, "two coordinates were accepted");
+    True(PlayerPositionCaptureService.Parse("8320 120 20000", map).Position is null, "coordinates outside map were accepted");
+}
+
+static void PlayerPositionBridgeUpserts()
+{
+    var bridge = new PlayerPositionMapBridge();
+    bridge.SetSession(new TreasureDestinationSession("12345678901234567890", DateTimeOffset.UtcNow, [new TreasureMapOption("cherno", "Chernarus", 15360, 15360)], [new TreasureProfileOption("cherno", "p1", "Main", true, "Me", "player", "#3498db")]));
+    var settings = new PlayerPositionTrackingSettings { MapId = "cherno", ProfileId = "p1", TrackingId = "tracking", MarkerUid = "marker" };
+    bridge.Queue(settings, new PlayerPosition(1, 2, 3, DateTimeOffset.UtcNow));
+    bridge.Queue(settings, new PlayerPosition(4, 5, 6, DateTimeOffset.UtcNow));
+    var update = bridge.GetPending("12345678901234567890");
+    Equal(4, update!.X, "latest position did not replace pending update");
+    Equal("marker", update.MarkerUid, "stable marker uid was not preserved");
 }
 
 static void Equal<T>(T expected, T actual, string message)

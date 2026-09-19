@@ -3,6 +3,7 @@ namespace CrosshairMarker;
 internal static class AppRuntimeLog
 {
     private static readonly object Sync = new();
+    private static DateTimeOffset lastTrimAt = DateTimeOffset.MinValue;
     private static readonly string LogPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
         AppIdentity.DataDirectoryName,
@@ -49,7 +50,16 @@ internal static class AppRuntimeLog
             return;
         }
 
+        // Some Windows display drivers can emit display-change notifications in a
+        // burst. Do not synchronously reread and rewrite the entire log for every
+        // one of those UI-thread messages once the size limit has been reached.
+        if (DateTimeOffset.Now - lastTrimAt < TimeSpan.FromSeconds(30))
+        {
+            return;
+        }
+
         var lines = File.ReadLines(LogPath).TakeLast(2000).ToArray();
         File.WriteAllLines(LogPath, lines);
+        lastTrimAt = DateTimeOffset.Now;
     }
 }

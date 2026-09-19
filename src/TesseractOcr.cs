@@ -6,6 +6,21 @@ internal sealed record OcrStatus(bool Ready, string Message, string? ExecutableP
 
 internal static class TesseractOcr
 {
+    public static async Task<string> RunAsync(string executable, string imagePath, CancellationToken cancellationToken)
+    {
+        using var process = Process.Start(new ProcessStartInfo(executable, $"\"{imagePath}\" stdout -l rus+eng --psm 6 --dpi 192")
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardOutputEncoding = System.Text.Encoding.UTF8,
+            CreateNoWindow = true
+        }) ?? throw new InvalidOperationException("Не удалось запустить Tesseract.");
+        var output = await process.StandardOutput.ReadToEndAsync(cancellationToken);
+        await process.WaitForExitAsync(cancellationToken);
+        if (process.ExitCode != 0) throw new InvalidOperationException("Tesseract не смог распознать выбранную область.");
+        return output;
+    }
     public static void Install()
     {
         try
