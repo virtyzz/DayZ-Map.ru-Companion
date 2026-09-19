@@ -431,9 +431,9 @@ internal sealed class EditorForm : Form
     public void SelectPlayerPositionRegion()
     {
         var bounds = SystemInformation.VirtualScreen;
-        using var screen = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppArgb);
-        using (var graphics = Graphics.FromImage(screen)) graphics.CopyFromScreen(bounds.Location, Point.Empty, bounds.Size);
-        var region = ScreenRegionSelector.SelectRegion(screen);
+        using var screenshot = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppArgb);
+        using (var graphics = Graphics.FromImage(screenshot)) graphics.CopyFromScreen(bounds.Location, Point.Empty, bounds.Size);
+        var region = ScreenRegionSelector.SelectRegion(screenshot);
         if (!region.HasValue) return;
         dayZSettings.PlayerPositionTracking.SetScreenRectangle(region.Value, bounds);
         DayZSettingsChanged?.Invoke(dayZSettings);

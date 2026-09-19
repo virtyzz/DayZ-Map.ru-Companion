@@ -10,24 +10,47 @@ internal sealed class ScreenRegionSelector : Form
     private Point start;
     private Point current;
     private bool selecting;
+    private readonly Action<Rectangle>? complete;
+    private readonly Action? cancel;
 
-    private ScreenRegionSelector(Bitmap screenshot)
+    private ScreenRegionSelector(Bitmap screenshot, Rectangle displayBounds, Action<Rectangle>? complete = null, Action? cancel = null)
     {
+        if (screenshot.Width != displayBounds.Width || screenshot.Height != displayBounds.Height)
+            throw new ArgumentException("The screenshot must match the displayed bounds.", nameof(screenshot));
+
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
         TopMost = true;
         DoubleBuffered = true;
         AutoScaleMode = AutoScaleMode.None;
+        StartPosition = FormStartPosition.Manual;
         Cursor = Cursors.Cross;
-        Bounds = SystemInformation.VirtualScreen;
+        // A WinForms top-level window has one DPI context. Spanning the whole
+        // virtual desktop therefore makes its client coordinates disagree with
+        // a physical-pixel screenshot when monitors have different scale
+        // factors (and is especially visible for monitors left of the primary
+        // display, whose X coordinate is negative). Keep every selector on the
+        // one display that was captured instead.
+        Bounds = displayBounds;
         KeyPreview = true;
         BackgroundImage = CreatePreview(screenshot);
         BackgroundImageLayout = ImageLayout.None;
+        this.complete = complete;
+        this.cancel = cancel;
     }
 
     public static Rectangle? SelectRegion(Bitmap screenshot)
     {
-        using var selector = new ScreenRegionSelector(screenshot);
+        var virtualBounds = SystemInformation.VirtualScreen;
+        if (screenshot.Width != virtualBounds.Width || screenshot.Height != virtualBounds.Height)
+            throw new ArgumentException("The screenshot must match the virtual screen.", nameof(screenshot));
+
+        return new MultiMonitorSelector(screenshot, virtualBounds).Select();
+    }
+
+    public static Rectangle? SelectRegion(Bitmap screenshot, Rectangle displayBounds)
+    {
+        using var selector = new ScreenRegionSelector(screenshot, displayBounds);
         return selector.ShowDialog() == DialogResult.OK ? selector.Selection : null;
     }
 
@@ -80,6 +103,11 @@ internal sealed class ScreenRegionSelector : Form
             InvalidateSelection(SelectionRectangle);
             return;
         }
+        if (complete is not null)
+        {
+            complete(Selection);
+            return;
+        }
         DialogResult = DialogResult.OK;
         Close();
     }
@@ -87,6 +115,11 @@ internal sealed class ScreenRegionSelector : Form
     protected override void OnKeyDown(KeyEventArgs e)
     {
         if (e.KeyCode != Keys.Escape) return;
+        if (cancel is not null)
+        {
+            cancel();
+            return;
+        }
         DialogResult = DialogResult.Cancel;
         Close();
     }
@@ -124,6 +157,69 @@ internal sealed class ScreenRegionSelector : Form
         using var shade = new SolidBrush(Color.FromArgb(72, Color.Black));
         graphics.FillRectangle(shade, new Rectangle(Point.Empty, preview.Size));
         return preview;
+    }
+
+    private sealed class MultiMonitorSelector
+    {
+        private readonly Bitmap screenshot;
+        private readonly Rectangle virtualBounds;
+        private readonly List<ScreenRegionSelector> selectors = [];
+        private Rectangle? selection;
+        private bool finished;
+
+        public MultiMonitorSelector(Bitmap screenshot, Rectangle virtualBounds)
+        {
+            this.screenshot = screenshot;
+            this.virtualBounds = virtualBounds;
+        }
+
+        public Rectangle? Select()
+        {
+            foreach (var screen in Screen.AllScreens)
+            {
+                var bounds = Rectangle.Intersect(screen.Bounds, virtualBounds);
+                if (bounds.Width <= 0 || bounds.Height <= 0) continue;
+
+                var source = new Rectangle(bounds.Left - virtualBounds.Left, bounds.Top - virtualBounds.Top, bounds.Width, bounds.Height);
+                using var displayShot = screenshot.Clone(source, PixelFormat.Format32bppArgb);
+                selectors.Add(new ScreenRegionSelector(displayShot, bounds, Complete, Cancel));
+            }
+
+            if (selectors.Count == 0) return null;
+
+            var primary = selectors[0];
+            primary.Shown += (_, _) =>
+            {
+                foreach (var selector in selectors.Skip(1)) selector.Show(primary);
+            };
+            primary.FormClosed += (_, _) => Cancel();
+            primary.ShowDialog();
+            return selection;
+        }
+
+        private void Complete(Rectangle value)
+        {
+            if (finished) return;
+            finished = true;
+            selection = value;
+            CloseAll(DialogResult.OK);
+        }
+
+        private void Cancel()
+        {
+            if (finished) return;
+            finished = true;
+            CloseAll(DialogResult.Cancel);
+        }
+
+        private void CloseAll(DialogResult result)
+        {
+            foreach (var selector in selectors.Where(selector => !selector.IsDisposed && selector.Visible).ToArray())
+            {
+                if (selector == selectors[0]) selector.DialogResult = result;
+                selector.Close();
+            }
+        }
     }
 
     private void ActivateSelector()
