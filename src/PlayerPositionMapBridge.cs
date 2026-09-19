@@ -52,6 +52,10 @@ internal sealed class PlayerPositionMapBridge
                 pending = null;
                 feedback = "Отслеживание позиции отключено.";
             }
+            else if (feedback == "Отслеживание позиции отключено.")
+            {
+                feedback = null;
+            }
         }
     }
 
@@ -60,7 +64,7 @@ internal sealed class PlayerPositionMapBridge
         lock (sync)
         {
             ExpireUnsafe();
-            if (session is null) throw new DayZCompanionException("Откройте DayZ-Map и подключите Companion.");
+            if (session is null) throw new DayZCompanionException("Откройте DayZ-Map в браузере — Companion подключится автоматически.");
             var map = session.Maps.SingleOrDefault(item => item.Id == settings.MapId) ?? throw new DayZCompanionException("Выбранная карта недоступна.");
             if (map.Width > 0 && map.Height > 0 && (position.X < 0 || position.X > map.Width || position.Z < 0 || position.Z > map.Height)) throw new DayZCompanionException("Координаты вне выбранной карты.");
             pending = new PlayerPositionUpdate(session.SessionId, settings.MapId, "", settings.TrackingId, settings.MarkerUid, new TreasureMarkerTemplate(settings.MarkerName, settings.IndicatorShape, settings.MarkerColor), position.X, position.Y, position.Z, position.MeasuredAt);

@@ -69,7 +69,10 @@ internal sealed class RoundedButton : Button
                     ? HoverBackColor
                     : BackColor;
 
-        using var path = CreatePath(bounds, Radius, 1f);
+        // Keep the 1 px outline on the actual edge of the control. The web
+        // editor's .action buttons use an outer CSS border; an inset path made
+        // this native counterpart look visibly smaller beside them.
+        using var path = CreatePath(bounds, Radius, 0.5f);
         using var brush = new SolidBrush(fill);
         pevent.Graphics.FillPath(brush, path);
 
@@ -113,7 +116,7 @@ internal sealed class RoundedButton : Button
     protected override void OnResize(EventArgs e)
     {
         base.OnResize(e);
-        using var path = CreatePath(ClientRectangle, Radius, 1f);
+        using var path = CreatePath(ClientRectangle, Radius, 0f);
         Region = new Region(path);
     }
 

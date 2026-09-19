@@ -398,6 +398,9 @@ internal sealed class EditorForm : Form
             case "selectPlayerPositionRegion":
                 PlayerPositionRegionRequested?.Invoke();
                 break;
+            case "showPlayerPositionHint":
+                PlayerPositionSelectionHintForm.ShowHint(this);
+                break;
             case "testPlayerPosition":
                 await TestPlayerPositionAsync();
                 break;
@@ -1952,9 +1955,9 @@ function renderPlayerPosition() {
     <div class="actions"><input data-position-name value="${escapeHtml(s.MarkerName || "")}" placeholder="Подпись маркера"><input class="treasure-color-picker" data-position-color type="color" value="${escapeHtml(s.MarkerColor || "#3498db")}" title="Цвет индикатора"></div>
     <div class="field"><label>Фигура индикатора <select data-position-shape>${shapeOptions}</select></label><div class="limit">Это временный индикатор позиции — он не добавляется в профиль, списки и экспорт карты.</div></div>
     <div class="field"><label>Интервал, секунд <input class="number" data-position-interval type="number" min="2" max="300" value="${s.IntervalSeconds || 5}"></label><div class="limit">Допустимый диапазон: 2–300 секунд.</div></div>
-    <div class="actions"><button class="action" data-command="selectPlayerPositionRegion">Настроить область координат</button><button class="action" data-command="testPlayerPosition">Тест распознавания</button><button class="action" data-command="openPlayerPositionDiagnostics" ${diagnostics ? "" : "disabled"}>Открыть диагностику OCR</button></div>
+    <div class="actions"><button class="action" data-command="selectPlayerPositionRegion">Настроить область координат</button><button class="action" data-command="showPlayerPositionHint">Подсказка</button><button class="action" data-command="testPlayerPosition">Тест распознавания</button><button class="action" data-command="openPlayerPositionDiagnostics" ${diagnostics ? "" : "disabled"}>Открыть диагностику OCR</button></div>
     <div class="limit" data-player-position-status>Область: ${s.HasRegion ? "настроена" : "не выбрана"}. Последняя позиция: ${last}. Последняя отправка: ${s.LastSentAt ? new Date(s.LastSentAt).toLocaleString() : "—"}. Ошибок подряд: ${s.ConsecutiveErrors || 0}.</div>
-    <div class="limit ${s.LastError ? "hotkey-warning" : ""}" data-player-position-error>${escapeHtml(s.LastError || data.feedback || "")}</div>${diagnostics ? `<div class="limit">OCR ${diagnostics.Recognized ? "распознано" : "не распознано"}: ${escapeHtml((diagnostics.RawText || "").slice(0, 180))}</div>` : ""}${destination ? "" : `<div class="limit">Откройте DayZ-Map в браузере и подключите Companion.</div>`}
+    <div class="limit ${s.LastError ? "hotkey-warning" : ""}" data-player-position-error>${escapeHtml(s.LastError || (s.Enabled ? data.feedback : "") || "")}</div>${diagnostics ? `<div class="limit">OCR ${diagnostics.Recognized ? "распознано" : "не распознано"}: ${escapeHtml((diagnostics.RawText || "").slice(0, 180))}</div>` : ""}${destination ? "" : `<div class="limit">Откройте DayZ-Map в браузере — Companion подключится автоматически.</div>`}
   </div>`;
 }
 
@@ -2713,7 +2716,7 @@ function refreshPlayerPositionStatus() {
   }
   const error = document.querySelector("[data-player-position-error]");
   if (error) {
-    const message = settings.LastError || state.playerPosition?.feedback || "";
+    const message = settings.LastError || (settings.Enabled ? state.playerPosition?.feedback : "") || "";
     error.textContent = message;
     error.classList.toggle("hotkey-warning", Boolean(settings.LastError));
   }
