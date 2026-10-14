@@ -69,6 +69,7 @@ internal sealed class UpdateService
 
     public static void OpenDownload(UpdateInfo info)
     {
+        if (AppDistribution.IsMicrosoftStore) { AppDistribution.OpenStore(); return; }
         var url = string.IsNullOrWhiteSpace(info.InstallerUrl) ? info.ReleaseUrl : info.InstallerUrl;
         if (string.IsNullOrWhiteSpace(url))
         {

@@ -163,6 +163,8 @@ internal sealed class BattlePassTracker
 
     private static string? FindTesseract()
     {
+        var bundled = Path.Combine(AppContext.BaseDirectory, "ocr", "tesseract.exe");
+        if (AppDistribution.IsMicrosoftStore && File.Exists(bundled)) return TesseractOcr.Detect() is { Ready: true, ExecutablePath: var executable } ? executable : null;
         var candidates = new[] { Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "Tesseract-OCR", "tesseract.exe"), Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Tesseract-OCR", "tesseract.exe"), Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Tesseract-OCR", "tesseract.exe"), "tesseract.exe" };
         foreach (var candidate in candidates.Where(path => path == "tesseract.exe" || File.Exists(path)))
         {

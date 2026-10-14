@@ -35,6 +35,7 @@ internal sealed class EditorForm : Form
     private Size previewSize = new(720, 420);
     private BattlePassSettings battlePassSettings;
     private BattlePassSnapshot battlePassSnapshot;
+    private readonly BattlePassStore battlePassStore = new();
     private UpdateInfo? updateInfo;
     private string? pendingTab;
     private bool webReady;
@@ -52,6 +53,7 @@ internal sealed class EditorForm : Form
     public event Action? DayZStatusRequested;
     public event Action<BattlePassSettings>? BattlePassSettingsChanged;
     public event Action<string>? BattlePassCommandRequested;
+    public event Action<string, ManualTask>? ManualTaskCommandRequested;
 
     public EditorForm(AppConfig source, UpdateService updateService, DayZCompanionSettings dayZSettings, DayZCompanionStatus dayZStatus, BattlePassSettings battlePassSettings, BattlePassSnapshot battlePassSnapshot, TreasureCaptureStore treasureStore, TreasureCaptureService treasureCaptureService, TreasureMapBridge treasureMapBridge, PlayerPositionMapBridge playerPositionMapBridge, PlayerPositionCaptureService playerPositionCaptureService, string? initialTab = null)
     {
@@ -222,7 +224,13 @@ internal sealed class EditorForm : Form
     {
         try
         {
-            await webView.EnsureCoreWebView2Async();
+            if (AppDistribution.IsMicrosoftStore)
+            {
+                var browserData = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), AppIdentity.DataDirectoryName, "WebView2");
+                var environment = await CoreWebView2Environment.CreateAsync(userDataFolder: browserData);
+                await webView.EnsureCoreWebView2Async(environment);
+            }
+            else await webView.EnsureCoreWebView2Async();
             webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
             webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
             webView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
@@ -283,6 +291,14 @@ internal sealed class EditorForm : Form
                 case "command":
                     await HandleCommandAsync(root.GetProperty("name").GetString());
                     break;
+                case "manualTask":
+                    var manualTask = root.GetProperty("task").Deserialize<ManualTask>(JsonOptions);
+                    var action = root.GetProperty("action").GetString();
+                    if (manualTask is null || action is not ("save" or "delete")) break;
+                    if (action == "save" && (string.IsNullOrWhiteSpace(manualTask.Title) || manualTask.Current < 0 || manualTask.Target <= 0))
+                        throw new InvalidOperationException("Укажите название и корректный прогресс (текущее значение и цель).");
+                    ManualTaskCommandRequested?.Invoke(action, manualTask);
+                    break;
                 case "updatePlayerPositionSettings":
                     ApplyPlayerPositionSettingsFromWeb(root.GetProperty("settings"));
                     break;
@@ -338,6 +354,7 @@ internal sealed class EditorForm : Form
                 await SendStateAsync();
                 break;
             case "checkUpdate":
+                if (AppDistribution.IsMicrosoftStore) { AppDistribution.OpenStore(); break; }
                 await RefreshUpdateInfoAsync(true);
                 break;
             case "downloadUpdate":
@@ -373,6 +390,10 @@ internal sealed class EditorForm : Form
                 OpenFileLocation(AppRuntimeLog.FilePath);
                 break;
             case "scanBattlePass":
+            case "scanBattlePassDaily":
+            case "scanBattlePassWeeklyPage1":
+            case "scanBattlePassWeeklyPage2":
+            case "scanBattlePassSeasonal":
             case "editBattlePassTasks":
             case "clearBattlePass":
             case "showBattlePassDebug":
@@ -642,12 +663,13 @@ internal sealed class EditorForm : Form
         pendingTab = null;
         var payload = new
         {
+            microsoftStore = AppDistribution.IsMicrosoftStore,
             config,
             openTab,
             update = updateInfo,
             dayZ = new { settings = dayZSettings, status = dayZStatus },
             ocr = ocrStatus ??= TesseractOcr.Detect(),
-            battlePass = new { settings = battlePassSettings, snapshot = battlePassSnapshot, ocr = ocrStatus },
+            battlePass = new { settings = battlePassSettings, snapshot = battlePassSnapshot, manualTasks = battlePassStore.LoadManualTasks(), ocr = ocrStatus },
             treasures = new { captures = PrepareTreasureCapturesForView(), destination = treasureMapBridge.GetSession(), selecting = treasureCaptureInProgress, processing = treasureOcrWorkerRunning, queued = treasureOcrQueue.Count, feedback = treasureMapBridge.GetDeliveryFeedback() ?? treasureFeedback },
             playerPosition = new { settings = dayZSettings.PlayerPositionTracking, destination = playerPositionMapBridge.GetSession(), feedback = playerPositionMapBridge.GetFeedback(), diagnostics = playerPositionCaptureService.GetDiagnostics() },
             hotkeyErrors = config.HotkeyRegistrationErrors,
@@ -676,6 +698,7 @@ internal sealed class EditorForm : Form
 
     private async Task RefreshUpdateInfoAsync(bool forceRefresh)
     {
+        if (AppDistribution.IsMicrosoftStore) { await SendStateAsync(); return; }
         updateInfo = await updateService.GetLatestAsync(forceRefresh);
         await SendStateAsync();
     }
@@ -1150,6 +1173,22 @@ input[type="color"] {
   max-width: 100%;
   padding-inline: 16px;
   overflow-wrap: anywhere;
+}
+.layout:not(.with-crosshair-preview) .actions.task-settings-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: stretch;
+  gap: 10px;
+}
+.task-settings-actions .action {
+  width: 100%;
+  min-height: 44px;
+  white-space: normal;
+}
+@container (max-width: 560px) {
+  .layout:not(.with-crosshair-preview) .actions.task-settings-actions {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 .layout:not(.with-crosshair-preview) .field-row {
   grid-template-columns: auto auto;
@@ -1752,8 +1791,8 @@ function renderEditor() {
   };
   const editor = document.getElementById("editor");
   editor.dataset.page = activeTab;
-  editor.classList.toggle("updates-editor", activeTab === "updates");
-  editor.innerHTML = `<div class="section active ${activeTab === "updates" ? "updates-section" : ""}">${sections[activeTab]}</div>`;
+  editor.classList.toggle("updates-editor", activeTab === "updates" && !state.microsoftStore);
+  editor.innerHTML = `<div class="section active ${activeTab === "updates" && !state.microsoftStore ? "updates-section" : ""}">${sections[activeTab]}</div>`;
   if (activeTab === "crosshair") {
     organizeCrosshairSection();
   }
@@ -2034,6 +2073,20 @@ function renderMonitor() {
   `;
 }
 
+const manualTaskDrafts = new Map();
+
+function renderManualTaskRow(task, isNew = false) {
+  const key = isNew ? "new" : task.Id;
+  const draft = manualTaskDrafts.get(key) || task;
+  return `<div class="field" data-manual-row="${escapeHtml(key)}"><div class="actions">
+    <input data-manual-field="Title" value="${escapeHtml(draft.Title || "")}" placeholder="Название личной задачи" aria-label="Название личной задачи">
+    <label>Текущее <input class="number" type="number" min="0" step="1" data-manual-field="Current" value="${draft.Current ?? 0}"></label>
+    <label>Цель <input class="number" type="number" min="1" step="1" data-manual-field="Target" value="${draft.Target || ""}"></label>
+    <button class="action primary" data-manual-save>${isNew ? "Добавить задачу" : "Сохранить"}</button>
+    ${isNew ? "" : `<button class="action danger" data-manual-delete>Удалить</button>`}
+  </div></div>`;
+}
+
 function renderBattlePass() {
   const bp = state.battlePass || { settings: {}, snapshot: { Tasks: [] } };
   const s = bp.settings;
@@ -2044,7 +2097,7 @@ function renderBattlePass() {
   return `
     <h2>Отслеживание заданий</h2>
     ${renderOcrStatus(ocr)}
-    <div class="limit">Откройте Battle Pass в DayZ, выберите тип страницы ниже и нажмите «Считать экран». Для еженедельных заданий повторите для страниц 1 и 2.</div>
+    <div class="limit">Откройте нужную страницу Battle Pass в DayZ и нажмите соответствующую кнопку сканирования ниже. Для еженедельных заданий повторите для страниц 1 и 2.</div>
     ${field("Монитор", { input: `<select data-bp-select="MonitorDeviceName">${monitorOptions}</select>` })}
     <div class="settings-columns">
     <div class="settings-card">
@@ -2057,10 +2110,26 @@ function renderBattlePass() {
     </div>
     </div>
     <div class="settings-card">
-    <h3>Сканирование и данные</h3>
+    <h3>Сканирование и личные задачи</h3>
+    <div class="actions task-settings-actions">
+      <button class="action primary" data-command="scanBattlePassDaily">Сканировать ежедневные</button>
+      <button class="action primary" data-command="scanBattlePassSeasonal">Сканировать сезонные</button>
+      <button class="action primary" data-command="scanBattlePassWeeklyPage1">Сканировать еженедельные — стр. 1</button>
+      <button class="action primary" data-command="scanBattlePassWeeklyPage2">Сканировать еженедельные — стр. 2</button>
+    </div>
+    <h3>Список личных задач</h3>
+    ${(bp.manualTasks || []).map(task => renderManualTaskRow(task)).join("") || `<div class="limit">Личных задач пока нет.</div>`}
+    ${renderManualTaskRow({ Title: "", Current: 0, Target: "" }, true)}
+    </div>
+    <div class="settings-card">
+    <h3>Зоны и данные</h3>
     <div class="limit">Для точной настройки используйте «Настроить зоны на экране»: зоны можно перетаскивать и менять их размер прямо поверх текущего изображения Battle Pass.</div>
-    <div class="actions"><button class="action primary" data-command="calibrateBattlePassZones">Настроить зоны на экране</button><button class="action" data-command="previewBattlePassZones">Предпросмотр зон</button><button class="action primary" data-command="scanBattlePass">Считать экран</button><button class="action" data-command="editBattlePassTasks">Проверить и исправить</button><button class="action" data-command="showBattlePassDebug">Открыть отладочный снимок</button><button class="action danger" data-command="clearBattlePass">Очистить данные</button></div>
-    <div class="actions"><button class="action" data-command="resetBattlePassOverlayBounds">Сбросить положение и размер оверлея</button></div>
+    <div class="actions task-settings-actions">
+      <button class="action primary" data-command="calibrateBattlePassZones">Настроить зоны на экране</button>
+      <button class="action" data-command="showBattlePassDebug">Открыть отладочный снимок</button>
+      <button class="action" data-command="resetBattlePassOverlayBounds">Сбросить положение и размер оверлея</button>
+      <button class="action danger" data-command="clearBattlePass">Очистить данные</button>
+    </div>
     <div class="update-status">Последнее обновление: ${bp.snapshot?.UpdatedAt ? escapeHtml(new Date(bp.snapshot.UpdatedAt).toLocaleString()) : "ещё не выполнялось"}. Сохранено заданий: ${tasks.length}.</div>
     </div>
   `;
@@ -2156,6 +2225,7 @@ function renderDayZ() {
 }
 
 function renderUpdates() {
+  if (state.microsoftStore) return `<h2>Обновление</h2><div class="limit">Эта версия обновляется через Microsoft Store. Проверить обновления можно в библиотеке магазина.</div><div class="actions"><button class="action primary" data-command="checkUpdate">Открыть Microsoft Store</button></div>`;
   const info = state.update;
   if (!info) {
     return `
@@ -2242,6 +2312,29 @@ function bindEditorEvents() {
     });
   });
   document.querySelectorAll("[data-bp-check]").forEach(input => input.addEventListener("change", () => updateBattlePass(settings => settings[input.dataset.bpCheck] = input.checked)));
+  document.querySelectorAll("[data-manual-row]").forEach(row => {
+    const key = row.dataset.manualRow;
+    const read = () => ({
+      Title: row.querySelector('[data-manual-field="Title"]').value,
+      Current: row.querySelector('[data-manual-field="Current"]').value,
+      Target: row.querySelector('[data-manual-field="Target"]').value
+    });
+    row.querySelectorAll("input").forEach(input => input.addEventListener("input", () => manualTaskDrafts.set(key, read())));
+    row.querySelector("[data-manual-save]").addEventListener("click", () => {
+      const draft = read();
+      const current = Number(draft.Current), target = Number(draft.Target);
+      if (!draft.Title.trim() || !draft.Current.trim() || !Number.isInteger(current) || current < 0 || !Number.isInteger(target) || target <= 0 || current > 2147483647 || target > 2147483647) {
+        alert("Укажите название и корректный прогресс (текущее значение и цель).");
+        return;
+      }
+      manualTaskDrafts.delete(key);
+      post({ type: "manualTask", action: "save", task: { ...(key === "new" ? {} : { Id: key }), Title: draft.Title.trim(), Current: current, Target: target } });
+    });
+    row.querySelector("[data-manual-delete]")?.addEventListener("click", () => {
+      manualTaskDrafts.delete(key);
+      post({ type: "manualTask", action: "delete", task: { Id: key } });
+    });
+  });
   document.querySelectorAll("[data-bp-select]").forEach(input => input.addEventListener("change", () => updateBattlePass(settings => settings[input.dataset.bpSelect] = input.value || null)));
   document.querySelectorAll("[data-bp-number]").forEach(input => input.addEventListener("change", () => updateBattlePass(settings => settings[input.dataset.bpNumber] = Number(input.value))));
   document.querySelectorAll("[data-bp-percent]").forEach(input => input.addEventListener("change", () => updateBattlePass(settings => settings[input.dataset.bpPercent] = Number(input.value) / 100)));

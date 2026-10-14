@@ -35,7 +35,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         store = new ConfigStore();
         updateService = new UpdateService();
         config = store.Load();
-        StartupManager.SetEnabled(config.StartWithWindows);
+        if (!AppDistribution.IsMicrosoftStore) StartupManager.SetEnabled(config.StartWithWindows);
         overlay = new OverlayForm();
         overlay.ApplyMonitor(config.TargetMonitorDeviceName);
         overlay.ApplyWindowSize(config.OverlayWindowSize);
@@ -74,7 +74,11 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             battlePassStore.SaveSnapshot(snapshot);
             editor?.ApplyBattlePassState(battlePassSettings, snapshot);
         };
-        battlePassOverlay.ManualTasksChanged += tasks => battlePassStore.SaveManualTasks(tasks);
+        battlePassOverlay.ManualTasksChanged += tasks =>
+        {
+            battlePassStore.SaveManualTasks(tasks);
+            editor?.ApplyBattlePassState(battlePassSettings, battlePassStore.LoadSnapshot());
+        };
         battlePassOverlay.ScanRequested += page => ScanBattlePass(page);
         ApplyBattlePassOverlay();
         battlePassOverlay.SetEditing(battlePassSettings.OverlayEditingEnabled);
@@ -203,14 +207,16 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         SaveBattlePassSettings(battlePassSettings);
     }
 
-    private async void ScanBattlePass(BattlePassPage? requestedPage = null)
+    private async void ScanBattlePass(BattlePassPage? requestedPage = null, bool hideEditor = false)
     {
+        var editorWasVisible = hideEditor && editor is { Visible: true };
+        if (editorWasVisible) editor?.Hide();
         var wasVisible = battlePassOverlay.Visible;
         var originalBounds = battlePassOverlay.Bounds;
         if (wasVisible) battlePassOverlay.Hide();
         try
         {
-            await Task.Delay(120);
+            await Task.Delay(editorWasVisible ? 350 : 120);
             var result = await battlePassTracker.ScanAsync(requestedPage ?? battlePassSettings.CapturePage, battlePassSettings);
             ApplyBattlePassOverlay();
             battlePassOverlay.RestoreOverlayBounds(originalBounds);
@@ -226,6 +232,12 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         }
         finally
         {
+            if (editorWasVisible && editor is { IsDisposed: false })
+            {
+                editor.ApplyBattlePassState(battlePassSettings, battlePassStore.LoadSnapshot());
+                editor.Show();
+                editor.Activate();
+            }
             if (wasVisible && battlePassSettings.OverlayVisible)
             {
                 battlePassOverlay.Show();
@@ -259,6 +271,10 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         switch (command)
         {
             case "scanBattlePass": ScanBattlePass(); break;
+            case "scanBattlePassDaily": ScanBattlePass(BattlePassPage.Daily, hideEditor: true); break;
+            case "scanBattlePassWeeklyPage1": ScanBattlePass(BattlePassPage.WeeklyPage1, hideEditor: true); break;
+            case "scanBattlePassWeeklyPage2": ScanBattlePass(BattlePassPage.WeeklyPage2, hideEditor: true); break;
+            case "scanBattlePassSeasonal": ScanBattlePass(BattlePassPage.Seasonal, hideEditor: true); break;
             case "editBattlePassTasks": OpenBattlePassTasks(); break;
             case "clearBattlePass": ClearBattlePass(); break;
             case "showBattlePassDebug": OpenBattlePassDebugScreenshot(); break;
@@ -429,12 +445,29 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         editor.PlayerPositionRegionRequested += () => editor?.SelectPlayerPositionRegion();
         editor.BattlePassSettingsChanged += SaveBattlePassSettings;
         editor.BattlePassCommandRequested += HandleBattlePassCommand;
+        editor.ManualTaskCommandRequested += (action, task) =>
+        {
+            var tasks = battlePassStore.LoadManualTasks();
+            var existing = tasks.Find(item => item.Id == task.Id);
+            if (action == "delete") tasks.RemoveAll(item => item.Id == task.Id);
+            else if (existing is null) tasks.Add(task);
+            else
+            {
+                existing.Title = task.Title;
+                existing.Current = task.Current;
+                existing.Target = task.Target;
+            }
+            battlePassStore.SaveManualTasks(tasks);
+            ApplyBattlePassOverlay();
+            editor.ApplyBattlePassState(battlePassSettings, battlePassStore.LoadSnapshot());
+        };
         editor.ExitRequested += ExitApplication;
         editor.Show();
     }
 
     private async Task CheckForUpdateAsync()
     {
+        if (AppDistribution.IsMicrosoftStore) return;
         if (updateCheckInProgress) return;
         updateCheckInProgress = true;
         try

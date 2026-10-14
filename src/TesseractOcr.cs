@@ -23,6 +23,11 @@ internal static class TesseractOcr
     }
     public static void Install()
     {
+        if (AppDistribution.IsMicrosoftStore)
+        {
+            System.Windows.Forms.MessageBox.Show("OCR входит в пакет приложения. Если файлы повреждены, восстановите или переустановите приложение через Microsoft Store.", AppIdentity.DisplayName);
+            return;
+        }
         try
         {
             Process.Start(new ProcessStartInfo("winget.exe", "install --id tesseract-ocr.tesseract --exact --accept-package-agreements --accept-source-agreements") { UseShellExecute = true });
@@ -37,6 +42,7 @@ internal static class TesseractOcr
     {
         var candidates = new[]
         {
+            AppDistribution.IsMicrosoftStore ? Path.Combine(AppContext.BaseDirectory, "ocr", "tesseract.exe") : "",
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "Tesseract-OCR", "tesseract.exe"),
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Tesseract-OCR", "tesseract.exe"),
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Tesseract-OCR", "tesseract.exe"),

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+         xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+         xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+         IgnorableNamespaces="uap desktop rescap">
+  <Identity Name="Virtyzz.DayZ-MapCompanion" Publisher="CN=19150DDA-3930-4E74-B112-0BB4B6A6461B" Version="0.6.0.0" ProcessorArchitecture="x64" />
+  <Properties>
+    <DisplayName>DayZ-Map Companion</DisplayName>
+    <PublisherDisplayName>Virtyzz</PublisherDisplayName>
+    <Logo>StoreAssets\StoreLogo.png</Logo>
+    <Description>Экранный прицел, игровые метки и отслеживание заданий DayZ.</Description>
+  </Properties>
+  <Resources><Resource Language="ru-RU" /></Resources>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Applications>
+    <Application Id="Companion" Executable="DayZMapCompanion.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements DisplayName="DayZ-Map Companion" Description="Экранный прицел, игровые метки и отслеживание заданий DayZ."
+                          BackgroundColor="transparent" Square150x150Logo="StoreAssets\Square150x150Logo.png" Square44x44Logo="StoreAssets\Square44x44Logo.png" />
+      <Extensions>
+        <desktop:Extension Category="windows.startupTask" Executable="DayZMapCompanion.exe" EntryPoint="Windows.FullTrustApplication">
+          <desktop:StartupTask TaskId="DayZMapCompanionStartup" Enabled="false" DisplayName="DayZ-Map Companion" />
+        </desktop:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+  <Capabilities><rescap:Capability Name="runFullTrust" /></Capabilities>
+</Package>

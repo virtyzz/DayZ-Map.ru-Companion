@@ -106,7 +106,12 @@ internal sealed class BattlePassOverlayForm : Form
     public void Apply(BattlePassSettings next, BattlePassSnapshot nextSnapshot, IEnumerable<ManualTask>? nextManualTasks = null)
     {
         settings = next.Clone(); settings.Normalize(); snapshot = nextSnapshot;
-        if (nextManualTasks is not null) manualTasks = nextManualTasks.ToList();
+        if (nextManualTasks is not null)
+        {
+            foreach (var editors in manualEditors.Values) editors.Dispose();
+            manualEditors.Clear();
+            manualTasks = nextManualTasks.ToList();
+        }
         var screen = MonitorInfo.ResolveScreen(settings.MonitorDeviceName);
         var height = settings.OverlayCollapsed ? CollapsedHeight : settings.Height;
         Bounds = new Rectangle(screen.Bounds.Left + settings.Left, screen.Bounds.Top + settings.Top, settings.Width, height);

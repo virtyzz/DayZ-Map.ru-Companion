@@ -4,6 +4,31 @@ obj/
 _build_check/
 artifacts/
 tests/DayZCompanion.Tests/build-check-tests/
+*.msix
+*.msixbundle
+*.msixupload
+*.appx
+*.appxbundle
+*.appxupload
+
+# Local signing material (including development certificates)
+*.pfx
+*.p12
+*.key
+*.pvk
+*.snk
+*.pem
+*.cer
+*.pfx.dpapi
+certificate-thumbprint.txt
+id_rsa
+id_ed25519
+
+# Local environment secrets (keep only explicit example templates)
+.env
+.env.*
+!.env.example
+!.env.sample
 
 # IDE/user-local files
 .vs/
