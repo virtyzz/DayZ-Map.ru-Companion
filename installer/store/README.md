@@ -16,7 +16,7 @@ Requires .NET 8 SDK, Windows SDK's x64 `makeappx.exe`, and an x64 Tesseract runt
 also looks under `artifacts/store-tools/sdk/bin`.
 
 Without `-Version`, both scripts use the project version plus `.0` (currently
-`0.6.0.0`). Pass `-Version X.Y.Z.0` only to explicitly override it.
+`0.7.0.0`). Pass `-Version X.Y.Z.0` only to explicitly override it.
 
 The script publishes a self-contained x64 .NET application, bundles local OCR
 with checked-in `eng`/`rus` models, creates logos and the Store manifest, and

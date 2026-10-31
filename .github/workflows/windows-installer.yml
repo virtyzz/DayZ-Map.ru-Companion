@@ -6,7 +6,7 @@ on:
       version:
         description: Installer version
         required: true
-        default: 0.6.0
+        default: 0.7.0
   push:
     tags:
       - "v*"
@@ -48,19 +48,24 @@ jobs:
             throw "Для публикации ${{ github.ref_name }} подготовьте подробные русскоязычные заметки: $notes"
           }
 
-      - name: Verify bundled OCR assets
+      - name: Verify bundled assets
         shell: pwsh
         run: |
           $expected = @{
             ".\installer\third_party\tesseract-ocr-w64-setup-5.5.3.20260724.exe" = "BEE9E3434BD94FD65387D9BE28CD467A41F61B1275383B55B0F59A1331270AE4"
             ".\installer\third_party\eng.traineddata" = "7D4322BD2A7749724879683FC3912CB542F19906C83BCC1A52132556427170B2"
             ".\installer\third_party\rus.traineddata" = "E16E5E036CCE1D9EC2B00063CF8B54472625B9E14D893A169E2B0DEDEB4DF225"
+            ".\tools\PresentMon-2.6.0-x64.exe" = "B2A706BC6AD475749E3B7E3409263AA1E6906D45BDCF993F6DBC0F660188F1AF"
           }
           foreach ($entry in $expected.GetEnumerator()) {
-            if (-not (Test-Path -LiteralPath $entry.Key)) { throw "Отсутствует OCR-asset: $($entry.Key)" }
+            if (-not (Test-Path -LiteralPath $entry.Key)) { throw "Отсутствует файл: $($entry.Key)" }
             $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $entry.Key).Hash
             if ($actual -ne $entry.Value) { throw "SHA-256 не совпадает для $($entry.Key)" }
           }
+
+      - name: Run tests
+        shell: pwsh
+        run: dotnet run --project .\tests\DayZCompanion.Tests\DayZCompanion.Tests.csproj --configuration Release
 
       - name: Publish app
         shell: pwsh
@@ -77,6 +82,15 @@ jobs:
             -p:AssemblyVersion=$env:DAYZ_COMPANION_VERSION.0 `
             -p:FileVersion=$env:DAYZ_COMPANION_VERSION.0 `
             --output .\artifacts\publish
+
+      - name: Verify published FPS helper
+        shell: pwsh
+        run: |
+          $helper = ".\artifacts\publish\tools\PresentMon-2.6.0-x64.exe"
+          if (-not (Test-Path -LiteralPath $helper)) { throw "PresentMon должен находиться рядом с приложением в папке tools." }
+          if ((Get-FileHash -LiteralPath $helper -Algorithm SHA256).Hash -ne "B2A706BC6AD475749E3B7E3409263AA1E6906D45BDCF993F6DBC0F660188F1AF") {
+            throw "SHA-256 опубликованного PresentMon не совпадает."
+          }
 
       - name: Install Inno Setup
         shell: pwsh

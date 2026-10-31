@@ -13,6 +13,7 @@ internal sealed class DayZCompanionSettings
     public int BackupMaxAgeDays { get; set; } = 90;
     public EditorWindowBounds? EditorWindowBounds { get; set; }
     public PlayerPositionTrackingSettings PlayerPositionTracking { get; set; } = new();
+    public PerformanceSettings Performance { get; set; } = new();
 
     public void Normalize()
     {
@@ -21,6 +22,8 @@ internal sealed class DayZCompanionSettings
         EditorWindowBounds?.Normalize();
         PlayerPositionTracking ??= new PlayerPositionTrackingSettings();
         PlayerPositionTracking.Normalize();
+        Performance ??= new PerformanceSettings();
+        Performance.Normalize();
         if (!string.IsNullOrWhiteSpace(PrivateMarkersPath))
         {
             PrivateMarkersPath = Path.GetFullPath(PrivateMarkersPath);
@@ -41,6 +44,7 @@ internal sealed class DayZCompanionSettings
         BackupMaxAgeDays = source.BackupMaxAgeDays;
         EditorWindowBounds = source.EditorWindowBounds?.Clone();
         PlayerPositionTracking = source.PlayerPositionTracking?.Clone() ?? new PlayerPositionTrackingSettings();
+        Performance = source.Performance?.Clone() ?? new PerformanceSettings();
         Normalize();
     }
 }

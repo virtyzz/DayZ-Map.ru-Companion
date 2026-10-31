@@ -29,6 +29,7 @@ internal sealed class EditorForm : Form
     private AppConfig config;
     private DayZCompanionSettings dayZSettings;
     private DayZCompanionStatus dayZStatus;
+    private PerformanceSnapshot performanceSnapshot = new();
     private OcrStatus? ocrStatus;
     private readonly System.Windows.Forms.Timer ocrInstallPollTimer = new() { Interval = 5000 };
     private int ocrInstallPollAttempts;
@@ -153,6 +154,32 @@ internal sealed class EditorForm : Form
         _ = SendStateAsync();
     }
 
+    public void ApplyPerformanceState(PerformanceSnapshot snapshot)
+    {
+        performanceSnapshot = snapshot;
+        if (!webReady || IsDisposed || webView.CoreWebView2 is null) return;
+        _ = SendPerformanceAsync(snapshot);
+    }
+
+    private async Task SendPerformanceAsync(PerformanceSnapshot snapshot)
+    {
+        try
+        {
+            if (webView.CoreWebView2 is { } core)
+                await core.ExecuteScriptAsync($"window.DayZMapCompanion.receivePerformance({JsonSerializer.Serialize(snapshot, JsonOptions)});");
+        }
+        catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException or System.Runtime.InteropServices.COMException)
+        {
+            if (!IsDisposed) AppRuntimeLog.Error("Could not update performance display", ex);
+        }
+    }
+
+    public void ApplyPerformancePlacement(PerformanceOverlayPlacement placement)
+    {
+        if (!webReady || IsDisposed || webView.CoreWebView2 is null) return;
+        _ = webView.CoreWebView2.ExecuteScriptAsync($"window.DayZMapCompanion.receivePerformancePlacement({JsonSerializer.Serialize(placement, JsonOptions)});");
+    }
+
     public async Task CaptureTreasureAsync()
     {
         if (treasureCaptureInProgress) return;
@@ -224,13 +251,10 @@ internal sealed class EditorForm : Form
     {
         try
         {
-            if (AppDistribution.IsMicrosoftStore)
-            {
-                var browserData = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), AppIdentity.DataDirectoryName, "WebView2");
-                var environment = await CoreWebView2Environment.CreateAsync(userDataFolder: browserData);
-                await webView.EnsureCoreWebView2Async(environment);
-            }
-            else await webView.EnsureCoreWebView2Async();
+            var browserData = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), AppIdentity.DataDirectoryName, "WebView2");
+            Directory.CreateDirectory(browserData);
+            var environment = await CoreWebView2Environment.CreateAsync(userDataFolder: browserData);
+            await webView.EnsureCoreWebView2Async(environment);
             webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
             webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
             webView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
@@ -238,6 +262,7 @@ internal sealed class EditorForm : Form
         }
         catch (Exception ex)
         {
+            AppRuntimeLog.Error("WebView2 editor failed to start", ex);
             MessageBox.Show(
                 $"WebView2 editor failed to start.\n\n{ex.Message}",
                 AppIdentity.DisplayName,
@@ -383,6 +408,14 @@ internal sealed class EditorForm : Form
             case "refreshDayZStatus":
                 DayZStatusRequested?.Invoke();
                 break;
+            case "selectPerformanceFont":
+                SelectPerformanceFont();
+                break;
+            case "fitPerformanceOverlay":
+                PerformanceOverlayRenderer.Fit(dayZSettings.Performance);
+                DayZSettingsChanged?.Invoke(dayZSettings);
+                _ = SendStateAsync();
+                break;
             case "openDayZMarkersFolder":
                 OpenDayZMarkersFolder();
                 break;
@@ -439,6 +472,11 @@ internal sealed class EditorForm : Form
         var next = settingsElement.Deserialize<DayZCompanionSettings>(JsonOptions);
         if (next is null) return;
         next.Normalize();
+        var previous = dayZSettings.Performance;
+        var current = next.Performance;
+        if ((!previous.ShowFrameTime && current.ShowFrameTime) || (!previous.ShowOnePercentLow && current.ShowOnePercentLow)
+            || (!previous.ShowJitter && current.ShowJitter) || (!previous.ShowFrameGraph && current.ShowFrameGraph)
+            || (!previous.VerticalLayout && current.VerticalLayout)) PerformanceOverlayRenderer.Fit(current, onlyGrow: true);
         dayZSettings = next;
         DayZSettingsChanged?.Invoke(next);
     }
@@ -572,6 +610,22 @@ internal sealed class EditorForm : Form
         DayZSettingsChanged?.Invoke(dayZSettings);
     }
 
+    private void SelectPerformanceFont()
+    {
+        var settings = dayZSettings.Performance;
+        var style = (settings.Bold ? FontStyle.Bold : FontStyle.Regular) | (settings.Italic ? FontStyle.Italic : FontStyle.Regular);
+        using var font = new Font(settings.FontFamily, settings.FontSize, style);
+        using var dialog = new FontDialog { Font = font, FontMustExist = true, MinSize = 8, MaxSize = 72, ShowEffects = false };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        settings.FontFamily = dialog.Font.Name;
+        settings.FontSize = (int)Math.Round(dialog.Font.SizeInPoints);
+        settings.Bold = dialog.Font.Bold;
+        settings.Italic = dialog.Font.Italic;
+        settings.Normalize();
+        DayZSettingsChanged?.Invoke(dayZSettings);
+        _ = SendStateAsync();
+    }
+
     private void OpenDayZMarkersFolder()
     {
         var path = dayZStatus.PrivateMarkersPath ?? dayZSettings.PrivateMarkersPath;
@@ -668,6 +722,8 @@ internal sealed class EditorForm : Form
             openTab,
             update = updateInfo,
             dayZ = new { settings = dayZSettings, status = dayZStatus },
+            performance = performanceSnapshot,
+            performanceDefaults = new PerformanceSettings(),
             ocr = ocrStatus ??= TesseractOcr.Detect(),
             battlePass = new { settings = battlePassSettings, snapshot = battlePassSnapshot, manualTasks = battlePassStore.LoadManualTasks(), ocr = ocrStatus },
             treasures = new { captures = PrepareTreasureCapturesForView(), destination = treasureMapBridge.GetSession(), selecting = treasureCaptureInProgress, processing = treasureOcrWorkerRunning, queued = treasureOcrQueue.Count, feedback = treasureMapBridge.GetDeliveryFeedback() ?? treasureFeedback },
@@ -1364,6 +1420,12 @@ input[type="color"] {
   opacity: 1;
   transform: translateY(0);
 }
+.performance-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.performance-grid .field { min-width: 0; margin: 0; }
+.performance-grid input[type="number"] { width: 110px; }
+.performance-grid input[type="color"] { width: 70px; height: 34px; padding: 3px; }
+.performance-grid select { max-width: 100%; }
+.performance-colors { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 </style>
 </head>
 <body>
@@ -1472,6 +1534,10 @@ const defaultHotkeys = {
 };
 
 const navigation = [
+  { id: "performance", label: "Пинг и FPS", tabs: [
+    ["performance", "Общее"],
+    ["performance-settings", "Настройки"]
+  ] },
   { tab: ["player-position", "Позиция игрока"] },
   { tab: ["treasures", "\u041a\u043b\u0430\u0434\u044b"] },
   { tab: ["dayz", "Синхронизация меток"] },
@@ -1784,6 +1850,8 @@ function renderEditor() {
     monitor: renderMonitor(),
     dayz: renderDayZ(),
     "player-position": renderPlayerPosition(),
+    performance: renderPerformance(),
+    "performance-settings": renderPerformanceSettings(),
     treasures: renderTreasures(),
     tasks: renderBattlePass(),
     profiles: renderProfiles(),
@@ -1975,6 +2043,97 @@ function renderOcrStatus(ocr = state.ocr) {
   const ready = !!ocr?.Ready;
   const status = ready ? "OCR: готово" : "OCR: не установлен";
   return field("Распознавание текста", { input: `<div class="update-status"><strong>${status}</strong><span>${escapeHtml(ocr?.Message || "Проверка OCR ещё не выполнена.")}</span></div><div class="actions"><button class="action primary" data-command="installOcr" ${ready ? "disabled" : ""}>Установить OCR</button><button class="action" data-command="refreshOcr">Проверить снова</button></div>` });
+}
+
+function renderPerformance() {
+  const settings = state.dayZ?.settings?.Performance || {};
+  return `<h2>Пинг и FPS</h2><div class="control-group">
+    <div class="field"><label><input type="checkbox" data-performance-check="Enabled" ${settings.Enabled ? "checked" : ""}> Измерять пинг и FPS DayZ</label></div>
+    <div class="limit" data-performance-value="HelperStatus"></div>
+    <div class="limit">FPS и пинг обновляются раз в секунду. Оформление и положение оверлея можно изменить в подпункте «Настройки».</div>
+    <div class="field"><div class="field-label">Текущий FPS</div><div class="update-status" data-performance-value="Fps">—</div><div class="limit" data-performance-value="FpsStatus"></div></div>
+    <div class="field"><div class="field-label">Пинг сервера</div><div class="update-status" data-performance-value="Ping">—</div><div class="limit" data-performance-value="PingStatus"></div></div>
+    ${settings.ShowFrameTime ? `<div class="field"><div class="field-label">Время кадра</div><div class="update-status" data-performance-value="FrameTime">—</div><div class="limit">Среднее время кадра за последнюю секунду.</div></div>` : ""}
+    ${settings.ShowOnePercentLow ? `<div class="field"><div class="field-label">1% low</div><div class="update-status" data-performance-value="OnePercentLow">—</div><div class="limit">За последние 30 секунд: 1000 / среднее время самых медленных 1% кадров. Появляется после первых 100 кадров.</div></div>` : ""}
+    ${settings.ShowJitter ? `<div class="field"><div class="field-label">Jitter пинга</div><div class="update-status" data-performance-value="Jitter">—</div><div class="limit">Средняя разница между соседними успешными замерами за 30 секунд. После ошибки история начинается заново.</div></div>` : ""}
+    ${settings.ShowFrameGraph ? `<div class="field"><div class="field-label">Просадки: пики времени кадра за 60 секунд</div><canvas data-performance-graph style="width:100%;height:110px"></canvas></div>` : ""}
+    <div class="field"><div class="field-label">Текущий сервер</div><div class="limit" data-performance-value="Server">—</div></div>
+    <div class="field"><div class="field-label">Сетевой адаптер</div><div class="limit" data-performance-value="Adapter">—</div></div>
+    <div class="field"><div class="field-label">Query-адрес</div><div class="limit" data-performance-value="Query">—</div></div>
+    <div class="field"><label>Query-порт: <input type="number" min="0" max="65535" step="1" data-performance-port value="${settings.QueryPort || 0}" style="width:110px"></label><button class="action" data-performance-save-port>Применить</button></div>
+    <div class="limit">0 — автоматический поиск через Steam и проверку типовых портов. Ручной порт нужен, только если автоматический поиск не сработал.</div>
+    <div class="limit">Пинг — время UDP-ответа A2S_INFO, оно может отличаться от внутреннего пинга DayZ. Запрос использует локальный адрес игрового трафика; VPN с правилами по приложениям может направить его другим маршрутом. При отсутствии ответа выводится «—», после повторных ошибок опрос замедляется.</div>
+    <div class="limit">Галочка включает и выключает измерения. В установленной версии Windows запросит разрешение только при первой настройке; при последующих запусках всё включится автоматически. Основное окно работает с обычными правами.</div>
+  </div>`;
+}
+
+function renderPerformanceSettings() {
+  const s = { ...(state.performanceDefaults || {}), ...(state.dayZ?.settings?.Performance || {}) };
+  const check = (label, key) => `<label><input type="checkbox" data-performance-check="${key}" ${s[key] ? "checked" : ""}> ${label}</label>`;
+  const number = (label, key, min, max) => `<div class="field"><label>${label}<br><input type="number" data-performance-number="${key}" min="${min}" max="${max}" step="1" value="${s[key]}"></label></div>`;
+  const opacity = (label, key) => `<div class="field"><label>${label}: <span data-performance-opacity-label="${key}">${s[key] ?? s.Opacity ?? 90}</span>%<br><input type="range" data-performance-number="${key}" min="0" max="100" step="1" value="${s[key] ?? s.Opacity ?? 90}"></label></div>`;
+  const color = (label, key) => `<div class="field performance-colors"><label>${label}</label><input type="color" data-performance-color="${key}" value="${s[key]}"></div>`;
+  const monitors = (state.monitors || []).map(m => `<option value="${escapeHtml(m.DeviceName)}" ${m.DeviceName === s.MonitorDeviceName ? "selected" : ""}>${escapeHtml(m.DisplayName)}</option>`).join("");
+  return `<h2>Настройки оверлея</h2><div class="control-group">
+    <div class="field">${check("Показывать оверлей", "ShowOverlay")}</div>
+    <div class="field">${check("Разрешить перемещение и изменение размера", "EditingEnabled")}</div>
+    <div class="limit">При включённом перемещении перетащите окно мышью, а за края — измените размер. После настройки выключите перемещение: клики будут проходить в игру. Положение сохраняется автоматически.</div>
+    <div class="field"><label>Монитор<br><select data-performance-select="MonitorDeviceName"><option value="" ${!s.MonitorDeviceName ? "selected" : ""}>Основной монитор</option>${monitors}</select></label></div>
+    <div class="performance-grid">
+      ${number("Ширина окна, px", "Width", 120, 1200)}${number("Высота окна, px", "Height", 32, 500)}
+      ${number("Отступ слева, px", "Left", 0, 100000)}${number("Отступ сверху, px", "Top", 0, 100000)}
+    </div>
+    <h3>Оформление</h3>
+    <div class="performance-grid">
+      <div class="field performance-colors"><label>Цвет текста</label><input type="color" data-performance-color="TextColor" value="${s.TextColor}"></div>
+      <div class="field performance-colors"><label>Цвет фона</label><input type="color" data-performance-color="BackgroundColor" value="${s.BackgroundColor}"></div>
+    </div>
+    <div class="performance-grid">${opacity("Непрозрачность текста", "TextOpacity")}${opacity("Непрозрачность фона", "BackgroundOpacity")}</div>
+    <div class="field"><div>Шрифт: ${escapeHtml(s.FontFamily || "Segoe UI")}</div><button class="action" data-command="selectPerformanceFont">Выбрать шрифт…</button></div>
+    <div class="performance-grid">
+      ${number("Размер шрифта, pt", "FontSize", 8, 72)}
+      <div class="field">${check("Жирный", "Bold")}${check("Курсив", "Italic")}</div>
+    </div>
+    <div class="performance-grid">
+      <div class="field"><label>Расположение показателей<br><select data-performance-select="VerticalLayout"><option value="false" ${!s.VerticalLayout ? "selected" : ""}>В одну строку</option><option value="true" ${s.VerticalLayout ? "selected" : ""}>Друг под другом</option></select></label></div>
+      <div class="field"><label>Выравнивание текста<br><select data-performance-select="Alignment">${[["Left", "Слева"], ["Center", "По центру"], ["Right", "Справа"]].map(([value, label]) => `<option value="${value}" ${s.Alignment === value ? "selected" : ""}>${label}</option>`).join("")}</select></label></div>
+    </div>
+    <div class="performance-grid"><div class="field">${check("Показывать FPS", "ShowFps")}</div><div class="field">${check("Показывать пинг", "ShowPing")}</div></div>
+    <h3>Дополнительные показатели</h3>
+    <div class="performance-grid"><div class="field">${check("Время кадра", "ShowFrameTime")}</div><div class="field">${check("1% low", "ShowOnePercentLow")}</div>
+      <div class="field">${check("График просадок", "ShowFrameGraph")}</div><div class="field">${check("Jitter пинга", "ShowJitter")}</div></div>
+    <div class="limit">1% low и jitter считаются за последние 30 секунд. График показывает пиковое время кадра за каждую секунду последней минуты: высокий пик означает длинный кадр.</div>
+    <button class="action" data-command="fitPerformanceOverlay">Подогнать размер окна по содержимому</button>
+    <h3>Цвет по порогам</h3>
+    <div class="field">${check("Подсвечивать FPS, 1% low и пинг по порогам", "ColorByThresholds")}</div>
+    <div class="performance-grid">${number("FPS: предупреждение ниже", "FpsWarning", 1, 1000)}${number("FPS: критический ниже", "FpsCritical", 1, 1000)}
+      ${number("Пинг: предупреждение от, мс", "PingWarning", 1, 10000)}${number("Пинг: критический от, мс", "PingCritical", 1, 10000)}</div>
+    <div class="performance-grid">${color("Норма", "GoodColor")}${color("Предупреждение", "WarningColor")}${color("Критическое значение", "CriticalColor")}</div>
+    <button class="action" data-performance-reset>Сбросить настройки оверлея</button>
+  </div>`;
+}
+
+function refreshPerformanceStatus() {
+  const data = state?.performance || {};
+  document.querySelectorAll("[data-performance-value]").forEach(element => {
+    const key = element.dataset.performanceValue;
+    const value = data[key];
+    element.textContent = key === "Fps" || key === "OnePercentLow" ? (Number.isFinite(value) ? Math.round(value).toString() : "—")
+      : key === "Ping" ? (Number.isFinite(value) ? `${Math.round(value)} мс` : "—")
+      : key === "FrameTime" || key === "Jitter" ? (Number.isFinite(value) ? `${value.toFixed(1)} мс` : "—")
+      : value || "—";
+  });
+  const canvas = document.querySelector("[data-performance-graph]");
+  if (canvas) {
+    const width = Math.max(1, Math.floor(canvas.clientWidth)), height = 110, ratio = window.devicePixelRatio || 1;
+    canvas.width = Math.round(width * ratio); canvas.height = Math.round(height * ratio);
+    const ctx = canvas.getContext("2d"); ctx.scale(ratio, ratio);
+    const values = data.FrameTimeHistory || [], finite = values.filter(Number.isFinite), max = Math.max(33.3, ...finite);
+    ctx.strokeStyle = "#444"; ctx.beginPath(); ctx.moveTo(0, 20); ctx.lineTo(width, 20); ctx.moveTo(0, height - 4); ctx.lineTo(width, height - 4); ctx.stroke();
+    ctx.fillStyle = "#aaa"; ctx.font = "11px Segoe UI"; ctx.fillText(`${Math.round(max)} мс`, 0, 12);
+    ctx.strokeStyle = state.dayZ?.settings?.Performance?.TextColor || "#eeb15b"; ctx.lineWidth = 1.5; ctx.beginPath(); let connected = false;
+    values.forEach((value, i) => { if (!Number.isFinite(value)) { connected = false; return; } const x = i * width / Math.max(1, values.length - 1), y = height - 4 - value / max * (height - 24); if (connected) ctx.lineTo(x, y); else ctx.moveTo(x, y); connected = true; }); ctx.stroke();
+  }
 }
 
 function renderPlayerPosition() {
@@ -2260,6 +2419,41 @@ function renderUpdates() {
 }
 
 function bindEditorEvents() {
+  refreshPerformanceStatus();
+  document.querySelectorAll("[data-performance-check]").forEach(input => input.addEventListener("change", () => updateDayZ(settings => {
+    settings.Performance ||= {};
+    settings.Performance[input.dataset.performanceCheck] = input.checked;
+    if (input.dataset.performanceCheck === "EditingEnabled" && input.checked) settings.Performance.ShowOverlay = true;
+    if (!["ShowFps", "ShowPing", "ShowFrameTime", "ShowOnePercentLow", "ShowJitter", "ShowFrameGraph"].some(key => settings.Performance[key])) settings.Performance.ShowFps = true;
+  })));
+  document.querySelectorAll("[data-performance-number]").forEach(input => {
+    input.addEventListener("input", () => {
+      const label = document.querySelector(`[data-performance-opacity-label="${input.dataset.performanceNumber}"]`);
+      if (label) label.textContent = input.value;
+    });
+    input.addEventListener("change", () => {
+      if (!input.reportValidity() || input.value.trim() === "") return;
+      const value = Number(input.value);
+      if (Number.isInteger(value)) updateDayZ(settings => settings.Performance[input.dataset.performanceNumber] = value);
+    });
+  });
+  document.querySelectorAll("[data-performance-color]").forEach(input => input.addEventListener("change", () => updateDayZ(settings => settings.Performance[input.dataset.performanceColor] = input.value)));
+  document.querySelectorAll("[data-performance-select]").forEach(input => input.addEventListener("change", () => updateDayZ(settings => {
+    const key = input.dataset.performanceSelect;
+    settings.Performance[key] = key === "VerticalLayout" ? input.value === "true" : input.value || null;
+    if (key === "VerticalLayout" && settings.Performance.VerticalLayout) settings.Performance.Height = Math.max(settings.Performance.Height, 64);
+  })));
+  document.querySelector("[data-performance-reset]")?.addEventListener("click", () => updateDayZ(settings => {
+    const { Enabled, QueryPort, ShowOverlay } = settings.Performance;
+    settings.Performance = { ...clone(state.performanceDefaults), Enabled, QueryPort, ShowOverlay };
+  }));
+  document.querySelector("[data-performance-save-port]")?.addEventListener("click", () => {
+    const input = document.querySelector("[data-performance-port]");
+    if (!input.reportValidity() || input.value.trim() === "") return;
+    const value = Number(input.value);
+    if (!Number.isInteger(value) || value < 0 || value > 65535) return;
+    updateDayZ(settings => { settings.Performance ||= {}; settings.Performance.QueryPort = value; });
+  });
   document.querySelectorAll("[data-slider]").forEach(input => {
     const isImageSlider = input.dataset.slider.startsWith("ImageLayer.");
     input.addEventListener("input", () => {
@@ -2816,6 +3010,19 @@ function refreshPlayerPositionStatus() {
 }
 
 window.DayZMapCompanion = {
+  receivePerformancePlacement(placement) {
+    if (!state?.dayZ?.settings?.Performance) return;
+    Object.assign(state.dayZ.settings.Performance, placement);
+    document.querySelectorAll("[data-performance-number], [data-performance-select]").forEach(input => {
+      const key = input.dataset.performanceNumber || input.dataset.performanceSelect;
+      if (Object.hasOwn(placement, key)) input.value = placement[key];
+    });
+  },
+  receivePerformance(value) {
+    if (!state) return;
+    state.performance = value;
+    refreshPerformanceStatus();
+  },
   receivePreview(preview) {
     if (state) state.preview = preview;
     document.getElementById("preview").src = preview;

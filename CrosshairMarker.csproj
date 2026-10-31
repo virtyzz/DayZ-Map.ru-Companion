@@ -6,9 +6,9 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>DayZMapCompanion</AssemblyName>
-    <Version>0.6.0</Version>
-    <AssemblyVersion>0.6.0.0</AssemblyVersion>
-    <FileVersion>0.6.0.0</FileVersion>
+    <Version>0.7.0</Version>
+    <AssemblyVersion>0.7.0.0</AssemblyVersion>
+    <FileVersion>0.7.0.0</FileVersion>
     <RootNamespace>CrosshairMarker</RootNamespace>
     <ApplicationIcon>assets\dayz-map-companion.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
@@ -23,11 +23,14 @@
     <EmbeddedResource Include="assets\dayz-map-companion-tray.ico" LogicalName="DayZMapCompanion.TrayIcon" />
     <EmbeddedResource Include="assets\player-position-selection-example.png" LogicalName="DayZMapCompanion.PlayerPositionSelectionExample" />
     <Content Include="assets\marker-icons.svg" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="tools\PresentMon-2.6.0-x64.exe" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+    <Content Include="tools\PresentMon-LICENSE.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
   <ItemGroup>
     <Compile Remove="tests\**\*.cs" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2792.45" />
+    <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="3.2.8" />
   </ItemGroup>
 </Project>

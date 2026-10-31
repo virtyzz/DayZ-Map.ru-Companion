@@ -24,6 +24,8 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
     private readonly PlayerPositionMapBridge playerPositionMapBridge;
     private readonly PlayerPositionCaptureService playerPositionCaptureService;
     private readonly PlayerPositionTrackingController playerPositionTracker;
+    private readonly PerformanceHelperClient performanceMonitor;
+    private readonly PerformanceOverlayForm performanceOverlay;
     private readonly object playerPositionSettingsSync = new();
     private readonly System.Windows.Forms.Timer updateTimer = new() { Interval = 60 * 60 * 1000 };
     private bool updateCheckInProgress;
@@ -86,6 +88,31 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         RegisterConfiguredHotkeys();
         dayZSettingsStore = new DayZCompanionSettingsStore();
         dayZSettings = dayZSettingsStore.Load();
+        performanceOverlay = new PerformanceOverlayForm();
+        performanceOverlay.PlacementChanged += placement =>
+        {
+            var settings = dayZSettings.Performance;
+            settings.MonitorDeviceName = placement.MonitorDeviceName;
+            settings.Left = placement.Left;
+            settings.Top = placement.Top;
+            settings.Width = placement.Width;
+            settings.Height = placement.Height;
+            dayZSettingsStore.Save(dayZSettings);
+            editor?.ApplyPerformancePlacement(placement);
+        };
+        performanceMonitor = new PerformanceHelperClient();
+        performanceMonitor.EnableRejected += _ =>
+        {
+            dayZSettings.Performance.Enabled = false;
+            dayZSettingsStore.Save(dayZSettings);
+            if (editor is { } currentEditor && dayZCompanion is { } server) currentEditor.ApplyDayZState(dayZSettings, server.GetStatus());
+        };
+        performanceMonitor.Changed += snapshot =>
+        {
+            performanceOverlay.Apply(dayZSettings.Performance, snapshot);
+            editor?.ApplyPerformanceState(snapshot);
+        };
+        performanceMonitor.Apply(dayZSettings.Performance);
         playerPositionMapBridge.SetTrackingEnabled(dayZSettings.PlayerPositionTracking.Enabled);
         playerPositionMapBridge.SessionChanged += session =>
         {
@@ -415,6 +442,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         editor.DayZSettingsChanged += nextSettings =>
         {
             nextSettings.Normalize();
+            var requestPerformanceElevation = !dayZSettings.Performance.Enabled && nextSettings.Performance.Enabled;
             bool restartHttp;
             lock (playerPositionSettingsSync)
             {
@@ -439,9 +467,11 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
                 dayZCompanion.Start();
             }
             playerPositionTracker.Refresh();
+            performanceMonitor.Apply(dayZSettings.Performance, allowElevation: requestPerformanceElevation);
             editor?.ApplyDayZState(dayZSettings, dayZCompanion.GetStatus());
         };
         editor.DayZStatusRequested += () => editor?.ApplyDayZState(dayZSettings, dayZCompanion.GetStatus());
+        editor.ApplyPerformanceState(performanceMonitor.Snapshot);
         editor.PlayerPositionRegionRequested += () => editor?.SelectPlayerPositionRegion();
         editor.BattlePassSettingsChanged += SaveBattlePassSettings;
         editor.BattlePassCommandRequested += HandleBattlePassCommand;
@@ -614,6 +644,8 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         try
         {
             ShutdownStep("player position tracker", () => playerPositionTracker.Dispose());
+            ShutdownStep("performance monitor", () => performanceMonitor.Dispose());
+            ShutdownStep("performance overlay", () => performanceOverlay.Dispose());
             ShutdownStep("update timer", () => { updateTimer.Stop(); updateTimer.Dispose(); });
             ShutdownStep("application settings", () => store.SaveAtomic(config));
             ShutdownStep("Battle Pass settings", () => battlePassStore.SaveSettings(battlePassSettings));

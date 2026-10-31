@@ -8,7 +8,7 @@
 #define MyAppVersion GetEnv("DAYZ_COMPANION_VERSION")
 
 #if MyAppVersion == ""
-  #define MyAppVersion "0.6.0"
+  #define MyAppVersion "0.7.0"
 #endif
 
 [Setup]
@@ -16,13 +16,15 @@ AppId={{7E8F9DF7-7C0A-4D93-9DA8-4B4C6D40F23F}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-DefaultDirName={localappdata}\Programs\{#MyAppName}
+DefaultDirName={autopf}\{#MyAppName}
+UsePreviousAppDir=no
+DisableDirPage=yes
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\{#MyAppExeName}
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-PrivilegesRequired=lowest
+PrivilegesRequired=admin
 OutputDir=..\artifacts\installer
 OutputBaseFilename=DayZ-Map-ru-Companion-Setup-{#MyAppVersion}
 SetupIconFile=..\assets\dayz-map-companion.ico
@@ -41,7 +43,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "..\artifacts\publish\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\artifacts\publish\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\artifacts\publish\*"; Excludes: "{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "third_party\{#TesseractInstaller}"; DestDir: "{tmp}"; Flags: deleteafterinstall; Hash: "{#TesseractInstallerSha256}"
 Source: "third_party\eng.traineddata"; DestDir: "{tmp}"; Flags: deleteafterinstall; Hash: "{#TesseractEnglishDataSha256}"
 Source: "third_party\rus.traineddata"; DestDir: "{tmp}"; Flags: deleteafterinstall; Hash: "{#TesseractRussianDataSha256}"
@@ -60,7 +63,7 @@ var
   ResultCode: Integer;
 begin
   Exec(ExpandConstant('{cmd}'), '/c taskkill /IM "' + ExeName + '" /T >nul 2>nul', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Sleep(750);
+  Sleep(3000);
   Exec(ExpandConstant('{cmd}'), '/c taskkill /IM "' + ExeName + '" /T /F >nul 2>nul', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
@@ -71,18 +74,45 @@ begin
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  BootstrapDir, BootstrapExe: String;
+  ResultCode: Integer;
 begin
   StopRunningApp();
   Result := '';
+  ExtractTemporaryFile('{#MyAppExeName}');
+  BootstrapDir := ExpandConstant('{autopf}\{#MyAppName} Upgrade');
+  BootstrapExe := BootstrapDir + '\{#MyAppExeName}';
+  if not ForceDirectories(BootstrapDir) or not CopyFile(ExpandConstant('{tmp}\{#MyAppExeName}'), BootstrapExe, False) then
+  begin
+    Result := 'Не удалось подготовить перенос прежней установки.';
+    Exit;
+  end;
+  try
+    if not ExecAsOriginalUser(BootstrapExe, '--prepare-legacy-upgrade', BootstrapDir, SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+      Result := 'Не удалось удалить прежнюю установку Companion. Настройки сохранены. Закройте Companion и запустите установщик обычным двойным щелчком, без команды «Запуск от имени администратора».';
+  finally
+    DeleteFile(BootstrapExe);
+    RemoveDir(BootstrapDir);
+  end;
+end;
+
+function InitializeUninstall(): Boolean;
+begin
+  StopRunningApp();
+  Result := True;
 end;
 
 function IsTesseractInstalled(): Boolean;
 begin
-  Result := FileExists(ExpandConstant('{localappdata}\Programs\Tesseract-OCR\tesseract.exe')) or
-    FileExists(ExpandConstant('{autopf}\Tesseract-OCR\tesseract.exe'));
+  Result := FileExists(ExpandConstant('{autopf}\Tesseract-OCR\tesseract.exe'));
 end;
 
 [Run]
-Filename: "{tmp}\{#TesseractInstaller}"; Parameters: "/S /D={localappdata}\Programs\Tesseract-OCR"; StatusMsg: "Установка Tesseract OCR…"; Flags: waituntilterminated shellexec; Check: not IsTesseractInstalled
-Filename: "{cmd}"; Parameters: "/C copy /Y ""{tmp}\eng.traineddata"" ""{localappdata}\Programs\Tesseract-OCR\tessdata\eng.traineddata"" && copy /Y ""{tmp}\rus.traineddata"" ""{localappdata}\Programs\Tesseract-OCR\tessdata\rus.traineddata"""; StatusMsg: "Установка языков Tesseract OCR…"; Flags: runhidden waituntilterminated; Check: IsTesseractInstalled
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--finish-legacy-upgrade"; Flags: runhidden runasoriginaluser waituntilterminated
+Filename: "{tmp}\{#TesseractInstaller}"; Parameters: "/S /D={autopf}\Tesseract-OCR"; StatusMsg: "Установка Tesseract OCR…"; Flags: waituntilterminated shellexec; Check: not IsTesseractInstalled
+Filename: "{cmd}"; Parameters: "/C copy /Y ""{tmp}\eng.traineddata"" ""{autopf}\Tesseract-OCR\tessdata\eng.traineddata"" && copy /Y ""{tmp}\rus.traineddata"" ""{autopf}\Tesseract-OCR\tessdata\rus.traineddata"""; StatusMsg: "Установка языков Tesseract OCR…"; Flags: runhidden waituntilterminated; Check: IsTesseractInstalled
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
+
+[UninstallRun]
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--remove-performance-tasks"; Flags: runhidden waituntilterminated; RunOnceId: "RemovePerformanceTasks"

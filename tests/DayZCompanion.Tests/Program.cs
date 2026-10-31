@@ -2,8 +2,36 @@ using System.Text.Json;
 using System.Net;
 using CrosshairMarker;
 
+if (args.Length > 0 && args[0] == PerformanceScheduledTask.SetupArgument)
+    return PerformanceScheduledTask.Configure(args[1..]);
+if (args.Length == 1 && args[0] == PerformanceScheduledTask.RemoveArgument)
+    return PerformanceScheduledTask.RemoveForCurrentInstallation();
+if (args.Length > 0 && args[0] == PerformanceWorker.Argument)
+    return PerformanceWorker.Run(args[1..]);
+if (args.Length == 2 && args[0] == "--diagnose-helper")
+    return PerformanceHelperDiagnostics.Run(args[1]);
+if (args.Length == 2 && args[0] == "--diagnose-helper-recovery")
+    return PerformanceHelperDiagnostics.Run(args[1], verifyRecovery: true);
+if (args.Length == 2 && args[0] == "--diagnose-performance")
+    return PerformanceDiagnostics.RunAsync(args[1]).GetAwaiter().GetResult();
+if (args.Length == 2 && args[0] == "--preview-performance")
+    return PerformanceDiagnostics.Preview(args[1]);
+
 var tests = new (string Name, Action Run)[]
 {
+    ("A2S rejects malformed and foreign responses", PerformanceTests.ParseRejectsWrongGameAndMalformedResponses),
+    ("Steam query port matches game endpoint", PerformanceTests.SteamSelectsMatchingGamePort),
+    ("UDP challenge exchange and timeout", PerformanceTests.UdpChallengeAndTimeout),
+    ("PresentMon v1 and v2 CSV both yield frames", PerformanceTests.PresentMonV1AndV2Csv),
+    ("Network events match PID and bidirectional flow", PerformanceTests.ConnectionSelectionIsProcessSpecific),
+    ("Overlay settings survive save and monitor changes", PerformanceTests.OverlaySettingsSurviveSaveAndMonitorChanges),
+    ("Frame statistics retain stutters and isolate swap chains", PerformanceTests.FrameStatisticsHandleStuttersAndSwapChains),
+    ("Jitter and graph expire missing or old samples", PerformanceTests.JitterAndGraphExpireOldSamples),
+    ("Overlay alpha is independent and thresholds apply", PerformanceTests.OverlayAlphaAndThresholds),
+    ("Helper IPC bounds messages and validates commands", PerformanceHelperTests.ProtocolIsBounded),
+    ("Helper pipe authenticates both process endpoints", PerformanceHelperTests.PipeIdentifiesProcesses),
+    ("Helper checkbox starts measurements and reverts after cancelled UAC", PerformanceHelperTests.CancelledElevationAllowsRetry),
+    ("Persistent helper rejects writable installations", PerformanceHelperTests.TaskIdentityIsInstallationSpecific),
     ("merge удаляет дубликаты и обновляет UID", MergeDeduplicatesAndUpdates),
     ("replace сохраняет другие серверы", ReplacePreservesOtherServers),
     ("создаётся backup", CreatesBackup),
@@ -261,12 +289,15 @@ static void CompanionSettingsStoreRoundTrips()
             Port = 49980,
             AllowDevelopmentOrigin = true,
             BackupLimit = 7,
+            Performance = new PerformanceSettings { Enabled = true, ShowOverlay = false, QueryPort = 2207 },
             EditorWindowBounds = new EditorWindowBounds { Left = 1, Top = 2, Width = 1200, Height = 800 }
         });
         var loaded = store.Load();
         Equal(49980, loaded.Port, "ручной порт не восстановлен");
         True(loaded.AllowDevelopmentOrigin, "dev Origin не восстановлен");
         Equal(7, loaded.BackupLimit, "лимит backup не восстановлен");
+        True(loaded.Performance.Enabled && !loaded.Performance.ShowOverlay, "переключатели Пинг и FPS не восстановлены");
+        Equal(2207, loaded.Performance.QueryPort, "query-порт не восстановлен");
         Equal(1200, loaded.EditorWindowBounds!.Width, "размер окна не восстановлен");
 
         File.WriteAllText(store.SettingsPath, "{ broken");
