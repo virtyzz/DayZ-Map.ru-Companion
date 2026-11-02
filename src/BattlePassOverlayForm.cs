@@ -6,6 +6,7 @@ namespace CrosshairMarker;
 
 internal sealed class BattlePassOverlayForm : Form
 {
+    private readonly OverlayWindowWatchdog watchdog;
     private const int WmNcHitTest = 0x0084;
     private const int WmMouseActivate = 0x0021;
     private const int CollapsedHeight = 52;
@@ -88,6 +89,13 @@ internal sealed class BattlePassOverlayForm : Form
         MouseMove += OnMouseMove;
         MouseUp += OnMouseUp;
         MouseWheel += (_, e) => ScrollBy(-Math.Sign(e.Delta) * 42);
+        watchdog = new OverlayWindowWatchdog(this, () => Invalidate(true));
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) watchdog.Dispose();
+        base.Dispose(disposing);
     }
 
     protected override bool ShowWithoutActivation => !editing;

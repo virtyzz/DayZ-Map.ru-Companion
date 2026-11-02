@@ -2,6 +2,7 @@ namespace CrosshairMarker;
 
 internal sealed class PerformanceOverlayForm : Form
 {
+    private readonly OverlayWindowWatchdog watchdog;
     private PerformanceSnapshot snapshot = new();
     private PerformanceSettings settings = new();
     private bool adjusting;
@@ -18,6 +19,7 @@ internal sealed class PerformanceOverlayForm : Form
         MaximumSize = new Size(1200, 500);
         DoubleBuffered = true;
         ResizeRedraw = true;
+        watchdog = new OverlayWindowWatchdog(this, RenderOverlay);
     }
 
     protected override bool ShowWithoutActivation => true;
@@ -57,6 +59,18 @@ internal sealed class PerformanceOverlayForm : Form
     {
         base.OnShown(e);
         RenderOverlay();
+    }
+
+    protected override void OnVisibleChanged(EventArgs e)
+    {
+        base.OnVisibleChanged(e);
+        AppRuntimeLog.Info($"Performance overlay visibility={Visible}; ShowOverlay={settings.ShowOverlay}, Enabled={settings.Enabled}, Running={snapshot.Running}, Editing={settings.EditingEnabled}.");
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) watchdog.Dispose();
+        base.Dispose(disposing);
     }
 
     protected override void OnResize(EventArgs e)

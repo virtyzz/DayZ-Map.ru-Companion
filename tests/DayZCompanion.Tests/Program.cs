@@ -19,6 +19,7 @@ if (args.Length == 2 && args[0] == "--preview-performance")
 
 var tests = new (string Name, Action Run)[]
 {
+    ("Quest and performance overlays recover topmost without changing focus or hidden state", OverlayWindowTests.RecoverTopmost),
     ("A2S rejects malformed and foreign responses", PerformanceTests.ParseRejectsWrongGameAndMalformedResponses),
     ("Steam query port matches game endpoint", PerformanceTests.SteamSelectsMatchingGamePort),
     ("UDP challenge exchange and timeout", PerformanceTests.UdpChallengeAndTimeout),
