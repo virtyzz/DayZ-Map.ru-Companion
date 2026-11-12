@@ -4,6 +4,7 @@ internal sealed class PerformanceSettings
 {
     public bool Enabled { get; set; }
     public bool ShowOverlay { get; set; } = true;
+    public bool ShowOnlyInGame { get; set; } = true;
     public int QueryPort { get; set; } // 0 = automatic
     public bool EditingEnabled { get; set; }
     public string? MonitorDeviceName { get; set; }
@@ -88,4 +89,5 @@ internal sealed record PerformanceSnapshot(
     string Server = "", string Adapter = "", string Query = "",
     string FpsStatus = "Ожидание DayZ", string PingStatus = "Ожидание подключения",
     double? FrameTime = null, double? OnePercentLow = null, double? Jitter = null, double?[]? FrameTimeHistory = null,
-    string HelperStatus = "", bool HelperCanStart = false, bool HelperStarting = false);
+    string HelperStatus = "", bool HelperCanStart = false, bool HelperStarting = false,
+    string MapName = "", DateTimeOffset? MapMeasuredAt = null, string ServerName = "");

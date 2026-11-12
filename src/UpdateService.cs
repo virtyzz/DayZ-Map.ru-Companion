@@ -3,6 +3,7 @@ using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using System.Security.Cryptography;
 
 namespace CrosshairMarker;
 
@@ -17,15 +18,18 @@ internal sealed class UpdateService
         PropertyNameCaseInsensitive = true
     };
 
-    private readonly HttpClient httpClient = new();
+    private readonly HttpClient httpClient;
     private UpdateInfo? cachedInfo;
+    public UpdateProgress Progress { get; private set; } = new(false, "");
+    public event Action? ProgressChanged;
 
-    public UpdateService()
+    public UpdateService(HttpClient? client = null)
     {
+        httpClient = client ?? new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
         httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("DayZMapCompanion-Updater");
     }
 
-    public async Task<UpdateInfo> GetLatestAsync(bool forceRefresh = false)
+    public async Task<UpdateInfo> GetLatestAsync(bool forceRefresh = false, CancellationToken token = default)
     {
         if (!forceRefresh && cachedInfo is not null)
         {
@@ -34,20 +38,22 @@ internal sealed class UpdateService
 
         try
         {
-            using var response = await httpClient.GetAsync(LatestReleaseUrl);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+            timeout.CancelAfter(TimeSpan.FromSeconds(30));
+            using var response = await httpClient.GetAsync(LatestReleaseUrl, timeout.Token);
             response.EnsureSuccessStatusCode();
 
             await using var stream = await response.Content.ReadAsStreamAsync();
-            var release = await JsonSerializer.DeserializeAsync<GitHubRelease>(stream, JsonOptions);
+            var release = await JsonSerializer.DeserializeAsync<GitHubRelease>(stream, JsonOptions, timeout.Token);
             if (release is null)
             {
                 return cachedInfo = UpdateInfo.Failed(CurrentVersionText, "GitHub вернул пустой ответ.");
             }
 
-            var installerUrl = release.Assets?
+            var installer = release.Assets?
+                .OrderBy(asset => asset.Name.Contains("latest", StringComparison.OrdinalIgnoreCase))
                 .FirstOrDefault(asset => asset.Name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
-                    && asset.Name.Contains("Setup", StringComparison.OrdinalIgnoreCase))
-                ?.BrowserDownloadUrl;
+                    && asset.Name.Contains("Setup", StringComparison.OrdinalIgnoreCase));
 
             var latestVersion = NormalizeVersionText(release.TagName);
             return cachedInfo = new UpdateInfo(
@@ -56,15 +62,75 @@ internal sealed class UpdateService
                 LatestTag: release.TagName,
                 IsUpdateAvailable: IsNewerVersion(latestVersion, CurrentVersionText),
                 ReleaseUrl: release.HtmlUrl,
-                InstallerUrl: installerUrl,
+                InstallerUrl: installer?.BrowserDownloadUrl,
                 ReleaseNotes: BuildDisplayReleaseNotes(release.Body),
                 PublishedAt: release.PublishedAt,
-                ErrorMessage: null);
+                ErrorMessage: null,
+                InstallerSha256: ParseDigest(installer?.Digest),
+                InstallerSize: installer?.Size ?? 0);
         }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
             return cachedInfo = UpdateInfo.Failed(CurrentVersionText, ex.Message);
         }
+    }
+
+    internal static string? ParseDigest(string? digest) => digest is not null
+        && Regex.IsMatch(digest, "^sha256:[0-9a-fA-F]{64}$") ? digest[7..].ToLowerInvariant() : null;
+
+    internal static bool IsInstallerUrl(string? value) => Uri.TryCreate(value, UriKind.Absolute, out var url)
+        && url.Scheme == "https" && url.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase)
+        && url.AbsolutePath.StartsWith("/virtyzz/DayZ-Map.ru-Companion/releases/download/", StringComparison.Ordinal)
+        && url.AbsolutePath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+        && string.IsNullOrEmpty(url.UserInfo);
+
+    public void Report(UpdateProgress value) { Progress = value; ProgressChanged?.Invoke(); }
+
+    public async Task<string> DownloadInstallerAsync(UpdateInfo info, string directory, CancellationToken token)
+    {
+        if (!info.CanInstall) throw new InvalidOperationException("Для этого релиза нет проверенного обновления. Используйте «Скачать установщик».");
+        Directory.CreateDirectory(directory);
+        var partial = Path.Combine(directory, "installer.download");
+        var target = Path.Combine(directory, "installer.exe");
+        try
+        {
+            Report(new(true, "Скачивание обновления…", 0, true));
+            using var response = await httpClient.GetAsync(info.InstallerUrl, HttpCompletionOption.ResponseHeadersRead, token);
+            response.EnsureSuccessStatusCode();
+            var expected = info.InstallerSize;
+            if (response.Content.Headers.ContentLength is long length && length != expected)
+                throw new InvalidDataException("Размер обновления не совпадает с данными релиза.");
+            await using (var input = await response.Content.ReadAsStreamAsync(token))
+            await using (var output = new FileStream(partial, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true))
+            using (var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
+            {
+                var buffer = new byte[81920];
+                long received = 0;
+                var lastPercent = -1;
+                int count;
+                while ((count = await input.ReadAsync(buffer, token)) > 0)
+                {
+                    received += count;
+                    if (received > expected) throw new InvalidDataException("Размер обновления превышает ожидаемый.");
+                    hash.AppendData(buffer, 0, count);
+                    await output.WriteAsync(buffer.AsMemory(0, count), token);
+                    var percent = (int)(received * 100 / expected);
+                    if (percent != lastPercent)
+                    {
+                        Report(new(true, $"Скачивание обновления — {percent}%", percent, true));
+                        lastPercent = percent;
+                    }
+                }
+                Report(new(true, "Проверка обновления…"));
+                if (received != expected || !Convert.ToHexString(hash.GetHashAndReset()).Equals(info.InstallerSha256, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("Проверка обновления не пройдена. Файл не будет запущен.");
+            }
+            token.ThrowIfCancellationRequested();
+            File.Move(partial, target);
+            return target;
+        }
+        catch { File.Delete(partial); throw; }
     }
 
     public static void OpenDownload(UpdateInfo info)
@@ -198,6 +264,10 @@ internal sealed class UpdateService
 
         [JsonPropertyName("browser_download_url")]
         public string BrowserDownloadUrl { get; set; } = "";
+        [JsonPropertyName("digest")]
+        public string? Digest { get; set; }
+        [JsonPropertyName("size")]
+        public long Size { get; set; }
     }
 }
 
@@ -210,8 +280,13 @@ internal sealed record UpdateInfo(
     string? InstallerUrl,
     string ReleaseNotes,
     DateTimeOffset? PublishedAt,
-    string? ErrorMessage)
+    string? ErrorMessage,
+    string? InstallerSha256 = null,
+    long InstallerSize = 0)
 {
+    public bool CanInstall => IsUpdateAvailable && UpdateService.IsInstallerUrl(InstallerUrl)
+        && InstallerSize is > 0 and <= 2L * 1024 * 1024 * 1024
+        && Regex.IsMatch(InstallerSha256 ?? "", "^[0-9a-fA-F]{64}$");
     public static UpdateInfo Failed(string currentVersion, string message) => new(
         CurrentVersion: currentVersion,
         LatestVersion: currentVersion,
@@ -223,3 +298,5 @@ internal sealed record UpdateInfo(
         PublishedAt: null,
         ErrorMessage: message);
 }
+
+internal sealed record UpdateProgress(bool IsBusy, string Message, int? Percent = null, bool CanCancel = false);

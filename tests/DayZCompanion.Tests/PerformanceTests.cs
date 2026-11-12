@@ -15,6 +15,7 @@ internal static class PerformanceTests
     {
         var reply = A2sQueryClient.Parse(Reply(), 55);
         Check(reply.GamePort == 2206 && reply.Name == "Test DayZ", "Game port/name parsed incorrectly");
+        Check(reply.MapName == "ChernarusPlus", "A2S map name was discarded");
         foreach (var bytes in new[] { new byte[] { 255, 255, 255, 255, 0x41 }, Reply()[..^1],
                      Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(Reply()).Replace("dayz", "rust")) })
         {
@@ -194,5 +195,15 @@ internal static class PerformanceTests
             new(Fps: 72, Ping: 118, FrameTime: 13.9, OnePercentLow: 45, Jitter: 5.5,
                 FrameTimeHistory: Enumerable.Range(0, 60).Select(i => (double?)(i % 17 == 0 ? 75 : 14 + i % 5)).ToArray()));
         preview.Save(System.IO.Path.Combine(AppContext.BaseDirectory, "performance-metrics-preview.png"));
+    }
+
+    public static void GameOnlySettingRoundTrips()
+    {
+        var legacy = JsonSerializer.Deserialize<PerformanceSettings>("{}")!;
+        Check(legacy.ShowOnlyInGame, "Existing settings must default to game-only visibility");
+        legacy.ShowOnlyInGame = false;
+        var restored = JsonSerializer.Deserialize<PerformanceSettings>(JsonSerializer.Serialize(legacy.Clone()))!;
+        restored.Normalize();
+        Check(!restored.ShowOnlyInGame, "Always-visible preference was not saved");
     }
 }

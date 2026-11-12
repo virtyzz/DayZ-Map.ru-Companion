@@ -65,7 +65,7 @@ internal sealed class PerformanceMonitor : IDisposable
         failures = 0;
         pingStatistics.Clear();
         nextPing = DateTime.MinValue;
-        Snapshot = Snapshot with { Ping = null, Jitter = null, Server = "", Adapter = "", Query = "", PingStatus = "Ожидание подключения" };
+        Snapshot = Snapshot with { Ping = null, Jitter = null, Server = "", ServerName = "", Adapter = "", Query = "", MapName = "", MapMeasuredAt = null, PingStatus = "Ожидание подключения" };
     }
 
     private void Tick()
@@ -160,8 +160,8 @@ internal sealed class PerformanceMonitor : IDisposable
                         var endpoint = new IPEndPoint(target.Server.Address, port);
                         var reply = await A2sQueryClient.QueryAsync(endpoint, target.LocalAddress, token);
                         // Several DayZ servers can share one IP. Never choose a neighbour's query service.
-                        if (settings.QueryPort == 0 && (reply.GamePort is { } gamePort
-                                ? gamePort != target.Server.Port : !steamPorts.Contains(port))) continue;
+                        if (reply.GamePort is { } gamePort && gamePort != target.Server.Port) continue;
+                        if (settings.QueryPort == 0 && reply.GamePort is null && !steamPorts.Contains(port)) continue;
                         result = reply;
                         token.ThrowIfCancellationRequested();
                         query = endpoint;
@@ -179,7 +179,8 @@ internal sealed class PerformanceMonitor : IDisposable
             token.ThrowIfCancellationRequested();
             failures = 0;
             Snapshot = Snapshot with { Ping = result.Milliseconds, Jitter = pingStatistics.Add(DateTimeOffset.UtcNow, result.Milliseconds),
-                Query = query!.ToString(), PingStatus = result.Name + " · A2S_INFO · каждую секунду" };
+                Query = query!.ToString(), ServerName = result.Name, MapName = result.MapName, MapMeasuredAt = DateTimeOffset.UtcNow,
+                PingStatus = result.Name + " · A2S_INFO · каждую секунду" };
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (Exception ex)
@@ -188,7 +189,7 @@ internal sealed class PerformanceMonitor : IDisposable
             {
                 failures++;
                 pingStatistics.Clear();
-                Snapshot = Snapshot with { Ping = null, Jitter = null, PingStatus = query is null ? ex.Message : "Нет ответа от query-порта" };
+                Snapshot = Snapshot with { Ping = null, Jitter = null, ServerName = "", MapName = "", MapMeasuredAt = null, PingStatus = query is null ? ex.Message : "Нет ответа от query-порта" };
                 if (query is null)
                 {
                     // Do not repeat discovery on every update when the port is unavailable.

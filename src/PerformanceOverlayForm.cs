@@ -3,14 +3,17 @@ namespace CrosshairMarker;
 internal sealed class PerformanceOverlayForm : Form
 {
     private readonly OverlayWindowWatchdog watchdog;
+    private readonly Func<GameWindowState?> getGameWindow;
+    private readonly System.Windows.Forms.Timer visibilityTimer = new() { Interval = 250 };
     private PerformanceSnapshot snapshot = new();
     private PerformanceSettings settings = new();
     private bool adjusting;
     private bool rendering;
     public event Action<PerformanceOverlayPlacement>? PlacementChanged;
 
-    public PerformanceOverlayForm()
+    public PerformanceOverlayForm(Func<GameWindowState?>? getGameWindow = null)
     {
+        this.getGameWindow = getGameWindow ?? GameWindowActivity.GetVisibleDayZWindow;
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
@@ -19,7 +22,8 @@ internal sealed class PerformanceOverlayForm : Form
         MaximumSize = new Size(1200, 500);
         DoubleBuffered = true;
         ResizeRedraw = true;
-        watchdog = new OverlayWindowWatchdog(this, RenderOverlay);
+        watchdog = new OverlayWindowWatchdog(this, RenderOverlay, () => !settings.ShowOnlyInGame || settings.EditingEnabled);
+        visibilityTimer.Tick += (_, _) => RefreshVisibility();
     }
 
     protected override bool ShowWithoutActivation => true;
@@ -42,15 +46,30 @@ internal sealed class PerformanceOverlayForm : Form
         settings.Normalize();
         snapshot = value;
         if (modeChanged && IsHandleCreated) RecreateHandle();
-        if (!adjusting)
+        visibilityTimer.Enabled = settings.ShowOverlay && settings.Enabled && settings.ShowOnlyInGame && !settings.EditingEnabled;
+        RefreshVisibility();
+        RenderOverlay();
+    }
+
+    private void RefreshVisibility()
+    {
+        if (IsDisposed) return;
+        // Editing is an explicit preview so the user can position the overlay
+        // from the settings window without switching back to the game.
+        var boundToGame = settings.ShowOnlyInGame && !settings.EditingEnabled;
+        var game = settings.ShowOnlyInGame ? getGameWindow() : null;
+        if (settings.ShowOverlay && (settings.EditingEnabled || (settings.Enabled && (!boundToGame || game is not null))))
         {
-            var area = MonitorInfo.ResolveScreen(settings.MonitorDeviceName).Bounds;
-            Bounds = settings.GetBounds(area);
-        }
-        if (settings.ShowOverlay && (settings.EditingEnabled || (settings.Enabled && value.Running)))
-        {
-            if (!Visible) Show();
-            RenderOverlay();
+            var topmost = !boundToGame || GameWindowActivity.IsTopmost(game!.Handle);
+            if (TopMost != topmost) TopMost = topmost;
+            if (!adjusting)
+            {
+                var area = game?.ClientBounds ?? MonitorInfo.ResolveScreen(settings.MonitorDeviceName).Bounds;
+                var bounds = settings.GetBounds(area);
+                if (Bounds != bounds) Bounds = bounds;
+            }
+            if (!Visible) { Show(); RenderOverlay(); }
+            if (boundToGame && !GameWindowActivity.PlaceAboveGame(this, game!)) Hide();
         }
         else Hide();
     }
@@ -69,7 +88,12 @@ internal sealed class PerformanceOverlayForm : Form
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) watchdog.Dispose();
+        if (disposing)
+        {
+            visibilityTimer.Stop();
+            visibilityTimer.Dispose();
+            watchdog.Dispose();
+        }
         base.Dispose(disposing);
     }
 
@@ -118,7 +142,7 @@ internal sealed class PerformanceOverlayForm : Form
     private void SavePlacement()
     {
         var screen = Screen.FromRectangle(Bounds);
-        var area = screen.Bounds;
+        var area = (settings.ShowOnlyInGame ? getGameWindow()?.ClientBounds : null) ?? screen.Bounds;
         settings.MonitorDeviceName = screen.DeviceName;
         settings.Left = Math.Max(0, Left - area.Left);
         settings.Top = Math.Max(0, Top - area.Top);

@@ -8,13 +8,15 @@ internal sealed class PlayerPositionTrackingController : IDisposable
     private readonly PlayerPositionMapBridge bridge;
     private readonly Func<PlayerPositionTrackingSettings> getSettings;
     private readonly Action<PlayerPositionTrackingSettings> save;
+    private readonly Func<PerformanceSnapshot>? getServer;
     private CancellationTokenSource? cancellation;
     private Task? worker;
+    private readonly object lifecycle = new();
     private DateTimeOffset lastErrorLoggedAt;
     private string lastLoggedError = "";
 
-    public PlayerPositionTrackingController(PlayerPositionCaptureService capture, PlayerPositionMapBridge bridge, Func<PlayerPositionTrackingSettings> getSettings, Action<PlayerPositionTrackingSettings> save)
-    { this.capture = capture; this.bridge = bridge; this.getSettings = getSettings; this.save = save; }
+    public PlayerPositionTrackingController(PlayerPositionCaptureService capture, PlayerPositionMapBridge bridge, Func<PlayerPositionTrackingSettings> getSettings, Action<PlayerPositionTrackingSettings> save, Func<PerformanceSnapshot>? getServer = null)
+    { this.capture = capture; this.bridge = bridge; this.getSettings = getSettings; this.save = save; this.getServer = getServer; }
 
     public void Refresh()
     {
@@ -22,9 +24,26 @@ internal sealed class PlayerPositionTrackingController : IDisposable
         if (settings.Enabled && !settings.Paused && cancellation is null) Start();
         if ((!settings.Enabled || settings.Paused) && cancellation is not null) Stop();
     }
-    private void Start() { cancellation = new CancellationTokenSource(); worker = Task.Run(() => RunAsync(cancellation.Token)); }
-    private void Stop() { cancellation?.Cancel(); cancellation?.Dispose(); cancellation = null; worker = null; }
-    private async Task RunAsync(CancellationToken token)
+    private void Start()
+    {
+        lock (lifecycle)
+        {
+            if (cancellation is not null) return;
+            var owner = cancellation = new CancellationTokenSource();
+            var token = owner.Token;
+            capture.SetTrackingEnabled(true);
+            worker = Task.Run(() => RunAsync(owner, token));
+        }
+    }
+    private void Stop()
+    {
+        lock (lifecycle)
+        {
+            cancellation?.Cancel(); cancellation?.Dispose(); cancellation = null; worker = null;
+            capture.SetTrackingEnabled(false);
+        }
+    }
+    private async Task RunAsync(CancellationTokenSource owner, CancellationToken token)
     {
         try
         {
@@ -36,14 +55,26 @@ internal sealed class PlayerPositionTrackingController : IDisposable
                 try
                 {
                     var session = bridge.GetSession();
-                    var map = ResolveMap(session, settings);
+                    var server = getServer?.Invoke();
+                    var map = session is null ? null : PlayerPositionMapResolver.Resolve(session, server ?? new PerformanceSnapshot());
                     if (session is null || map is null)
                     {
-                        throw new DayZCompanionException("Выбранная карта изменилась или стала недоступна. Подтвердите её на вкладке перед продолжением.");
+                        throw new DayZCompanionException("Откройте DayZ-Map в браузере — карта будет определена по текущему серверу DayZ.");
                     }
+                    settings.MapId = map.Id;
+                    var originalRegion = settings.Clone();
                     var recognized = await capture.CaptureAndRecognizeAsync(settings, map, token);
                     if (recognized.Position is null) throw new DayZCompanionException(recognized.Message);
-                    bridge.Queue(settings, recognized.Position);
+                    var current = getSettings();
+                    if (current.HasSameRegion(originalRegion) && !current.RegionRelativeToWindow && settings.RegionRelativeToWindow)
+                        current.CopyRegionFrom(settings);
+                    if (!current.Enabled || current.Paused) continue;
+                    var currentServer = getServer?.Invoke();
+                    if (server?.Server != currentServer?.Server) continue;
+                    if (PlayerPositionMapResolver.Resolve(session, currentServer ?? new PerformanceSnapshot()).Id != map.Id) continue;
+                    current.MapId = map.Id;
+                    settings = current;
+                    bridge.Queue(settings, recognized.Position, currentServer);
                     settings.LastX = recognized.Position.X; settings.LastY = recognized.Position.Y; settings.LastZ = recognized.Position.Z;
                     settings.LastError = ""; settings.ConsecutiveErrors = 0;
                     lastLoggedError = "";
@@ -76,25 +107,19 @@ internal sealed class PlayerPositionTrackingController : IDisposable
             }
         }
         catch (OperationCanceledException) { }
-        finally { cancellation = null; }
-    }
-    private static TreasureMapOption? ResolveMap(TreasureDestinationSession? session, PlayerPositionTrackingSettings settings)
-    {
-        if (session is null) return null;
-
-        var map = session.Maps.SingleOrDefault(item => string.Equals(item.Id, settings.MapId, StringComparison.Ordinal));
-        if (map is null && !string.IsNullOrWhiteSpace(settings.MapId))
+        finally
         {
-            map = session.Maps.SingleOrDefault(item => string.Equals(item.Id, settings.MapId, StringComparison.OrdinalIgnoreCase)
-                || string.Equals(item.Name, settings.MapId, StringComparison.OrdinalIgnoreCase));
+            // A stopped worker may finish after tracking has already restarted.
+            lock (lifecycle)
+            {
+                if (ReferenceEquals(cancellation, owner))
+                {
+                    cancellation = null;
+                    capture.SetTrackingEnabled(false);
+                    owner.Dispose();
+                }
+            }
         }
-
-        // The local development page exposes one map. Accept it as the
-        // destination even if an older Companion version saved a stale ID.
-        if (map is null && session.Maps.Count == 1) map = session.Maps[0];
-        if (map is not null && !string.Equals(settings.MapId, map.Id, StringComparison.Ordinal)) settings.MapId = map.Id;
-        return map;
     }
-
     public void Dispose() => Stop();
 }

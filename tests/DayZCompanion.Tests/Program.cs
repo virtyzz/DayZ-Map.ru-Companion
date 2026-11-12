@@ -2,6 +2,20 @@ using System.Text.Json;
 using System.Net;
 using CrosshairMarker;
 
+if (args.Length == 2 && args[0] == AppUpdater.ReadyArgument)
+{
+    if (int.TryParse(Environment.GetEnvironmentVariable("COMPANION_TEST_UPDATE_DELAY_MS"), out var restartDelay))
+        Thread.Sleep(Math.Clamp(restartDelay, 0, 10000));
+    AppUpdater.SignalRestartReady(args[1]);
+    return 0;
+}
+if (args.Contains("/VERYSILENT"))
+{
+    if (int.TryParse(Environment.GetEnvironmentVariable("COMPANION_TEST_UPDATE_DELAY_MS"), out var installerDelay))
+        Thread.Sleep(Math.Clamp(installerDelay, 0, 10000));
+    return int.TryParse(Environment.GetEnvironmentVariable("COMPANION_TEST_INSTALL_EXIT"), out var updateFixtureExit) ? updateFixtureExit : 0;
+}
+
 if (args.Length > 0 && args[0] == PerformanceScheduledTask.SetupArgument)
     return PerformanceScheduledTask.Configure(args[1..]);
 if (args.Length == 1 && args[0] == PerformanceScheduledTask.RemoveArgument)
@@ -19,7 +33,19 @@ if (args.Length == 2 && args[0] == "--preview-performance")
 
 var tests = new (string Name, Action Run)[]
 {
+    ("Editor renders all tabs with and without a connected map", EditorRenderingTests.AllTabsRender),
+    ("Window capture region follows movement, resize and legacy migration", WindowCaptureTests.RegionGeometryAndMigration),
+    ("Window capture rejects stale frames and respects cancellation", WindowCaptureTests.FreshnessAndCancellation),
+    ("Window capture reads covered content and recovers after restore", WindowCaptureTests.CapturesCoveredWindowAndRecovers),
+    ("Player position resolves server maps and preserves privacy", PlayerPositionSharingTests.MapResolutionAndPrivacy),
+    ("Player position acknowledgement releases bridge lock before notifying", PlayerPositionSharingTests.AcknowledgementReleasesBridgeLock),
+    ("Updater cleanup removes completed attempts and preserves active handoff", UpdateTests.CleanupPreservesActiveAttempts),
+    ("Updater verifies downloads and supports cancellation", UpdateTests.DownloadsAreVerified),
+    ("Updater reads release digest and uses silent installation without reboot", UpdateTests.ReleaseMetadata),
+    ("Updater window handles installation, failure and restart acknowledgement", UpdateTests.HostShowsUntilRestart),
     ("Quest and performance overlays recover topmost without changing focus or hidden state", OverlayWindowTests.RecoverTopmost),
+    ("Performance overlay follows game window, occlusion and minimize state", OverlayWindowTests.PerformanceVisibilityFollowsGame),
+    ("Performance game-only preference defaults and round trips", PerformanceTests.GameOnlySettingRoundTrips),
     ("A2S rejects malformed and foreign responses", PerformanceTests.ParseRejectsWrongGameAndMalformedResponses),
     ("Steam query port matches game endpoint", PerformanceTests.SteamSelectsMatchingGamePort),
     ("UDP challenge exchange and timeout", PerformanceTests.UdpChallengeAndTimeout),
@@ -60,11 +86,16 @@ var tests = new (string Name, Action Run)[]
     ("Treasure OCR recognizes labeled coordinates", TreasureOcrRecognizesCoordinates),
     ("Treasure bridge sends coordinates", TreasureBridgeQueuesCoordinates),
     ("Player position OCR requires exactly X Y Z", PlayerPositionOcrIsStrict),
-    ("Player position bridge keeps one pending update", PlayerPositionBridgeUpserts)
+    ("Player position bridge keeps one pending update", PlayerPositionBridgeUpserts),
+    ("Player position display settings survive storage and normalize", PlayerPositionDisplaySettings),
+    ("Player position display changes refresh an acknowledged marker", PlayerPositionDisplayUpdates)
 };
 
 var failures = new List<string>();
 var skipped = new List<string>();
+if (args.Length == 2 && args[0] == "--filter")
+    tests = tests.Where(test => test.Name.Contains(args[1], StringComparison.OrdinalIgnoreCase)).ToArray();
+if (tests.Length == 0) throw new ArgumentException("No tests match the requested filter.");
 foreach (var test in tests)
 {
     try
@@ -468,6 +499,63 @@ static void PlayerPositionBridgeUpserts()
     var update = bridge.GetPending("12345678901234567890");
     Equal(4, update!.X, "latest position did not replace pending update");
     Equal("marker", update.MarkerUid, "stable marker uid was not preserved");
+}
+
+static void PlayerPositionDisplaySettings()
+{
+    var legacy = JsonSerializer.Deserialize<PlayerPositionTrackingSettings>("{}")!;
+    True(!legacy.CenterOnPlayer && legacy.KeepZoom && legacy.ShowLabel, "legacy display defaults changed");
+    Equal(32, legacy.MarkerSize, "default marker size changed");
+    Equal("name", legacy.LabelContent, "legacy label content changed");
+    var settings = new PlayerPositionTrackingSettings
+    {
+        CenterOnPlayer = true, KeepZoom = false, CenteringZoom = 10, ShowLabel = false, MarkerSize = 40, LabelContent = "position", AutoSelectMap = false
+    };
+    var restored = JsonSerializer.Deserialize<PlayerPositionTrackingSettings>(JsonSerializer.Serialize(settings))!;
+    restored.Normalize();
+    True(restored.CenterOnPlayer && !restored.KeepZoom && restored.ShowLabel && restored.AutoSelectMap, "display flags did not round trip");
+    Equal(10, restored.CenteringZoom, "centering zoom did not round trip");
+    Equal(40, restored.MarkerSize, "marker size did not round trip");
+    Equal("name", restored.LabelContent, "label content did not round trip");
+    restored.LabelContent = "invalid"; restored.Normalize();
+    Equal("name", restored.LabelContent, "invalid label content was accepted");
+    restored.CenteringZoom = 99; restored.MarkerSize = -1; restored.Normalize();
+    Equal(12, restored.CenteringZoom, "zoom upper bound failed");
+    Equal(16, restored.MarkerSize, "size lower bound failed");
+    restored.CenteringZoom = -1; restored.MarkerSize = 999; restored.Normalize();
+    Equal(2, restored.CenteringZoom, "zoom lower bound failed");
+    Equal(48, restored.MarkerSize, "size upper bound failed");
+}
+
+static void PlayerPositionDisplayUpdates()
+{
+    const string session = "12345678901234567890";
+    var bridge = new PlayerPositionMapBridge();
+    bridge.SetSession(new TreasureDestinationSession(session, DateTimeOffset.UtcNow, [new TreasureMapOption("cherno", "Chernarus", 15360, 15360)], []));
+    bridge.SetTrackingEnabled(true);
+    var settings = new PlayerPositionTrackingSettings { MapId = "cherno" };
+    bridge.Queue(settings, new PlayerPosition(100, 200, 300, DateTimeOffset.UtcNow));
+    bridge.Acknowledge(session, settings.TrackingId, true, "ok");
+    True(bridge.GetPending(session) is null, "ack did not clear pending position");
+    settings.CenterOnPlayer = true; settings.KeepZoom = false; settings.CenteringZoom = 10;
+    settings.ShowLabel = false; settings.MarkerSize = 40; settings.LabelContent = "position";
+    bridge.UpdateSettings(settings);
+    var update = bridge.GetPending(session)!;
+    True(update.CenterOnPlayer && !update.KeepZoom && update.ShowLabel && update.AutoSelectMap, "display flags were not delivered");
+    Equal(10, update.CenteringZoom, "zoom was not delivered");
+    Equal(40, update.MarkerSize, "size was not delivered");
+    Equal("name", update.LabelContent, "label content was not delivered");
+    Equal(100, update.X, "display update moved the marker");
+    bridge.Acknowledge(session, settings.TrackingId, true, "ok");
+    bridge.UpdateSettings(settings);
+    True(bridge.GetPending(session) is null, "unchanged settings requeued a position");
+    settings.MarkerName = "Updated name";
+    bridge.UpdateSettings(settings);
+    Equal("Updated name", bridge.GetPending(session)!.Template.Name, "name change did not refresh marker");
+    bridge.SetTrackingEnabled(false);
+    settings.MarkerSize = 32;
+    bridge.UpdateSettings(settings);
+    True(bridge.GetPending(session) is null, "disabled tracking requeued a position");
 }
 
 static void Equal<T>(T expected, T actual, string message)

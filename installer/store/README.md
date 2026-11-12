@@ -44,12 +44,14 @@ installing the test copy. The unsigned Store upload package is unchanged.
 
 ## Separate distribution builds
 
-`StoreBuild=true` enables the Windows SDK target and `MICROSOFT_STORE` compilation
+`StoreBuild=true` enables the `MICROSOFT_STORE` compilation
 symbol. Store builds use StartupTask instead of the registry Run key, and open
 Microsoft Store for updates instead of offering a GitHub EXE installer.
 
 Without this flag the existing GitHub/Inno Setup build remains unchanged in
-distribution mode. Its target remains `net8.0-windows`.
+distribution mode. Both distributions target `net8.0-windows10.0.22000.0` for window capture,
+with Windows 10 build 19041 as the minimum supported version. Windows 11 capture
+can request permission to suppress the system capture border.
 
 ## Before submitting for certification
 

@@ -6,8 +6,12 @@ using System.Text.RegularExpressions;
 
 namespace CrosshairMarker;
 
-internal sealed class PlayerPositionCaptureService
+internal sealed class PlayerPositionCaptureService : IDisposable
 {
+    private readonly WindowGraphicsCapture.PersistentCapture capture = new();
+    private volatile bool tracking;
+    public void SetTrackingEnabled(bool enabled) { tracking = enabled; if (!enabled) capture.Stop(); }
+    public void Dispose() => capture.Dispose();
     private static readonly Regex StrictPosition = new(@"^\s*(?:x\s*[:=]?\s*)?(?<x>\d{1,6})\s+\s*(?:y\s*[:=]?\s*)?(?<y>\d{1,6})\s+\s*(?:z\s*[:=]?\s*)?(?<z>\d{1,6})\s*$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private string? tesseractExecutable;
     private readonly object diagnosticsSync = new();
@@ -20,28 +24,32 @@ internal sealed class PlayerPositionCaptureService
 
     public async Task<PlayerPositionOcrResult> TestAsync(PlayerPositionTrackingSettings settings, TreasureMapOption? map)
     {
-        if (!settings.HasRegion) return new PlayerPositionOcrResult("", null, "Сначала выделите область HUD с X Y Z.");
-        var bounds = SystemInformation.VirtualScreen;
-        var region = settings.GetScreenRectangle(bounds);
-        if (region.Width <= 0 || region.Height <= 0) return new PlayerPositionOcrResult("", null, "Сохранённая область вне текущих экранов.");
-        using var image = new Bitmap(region.Width, region.Height, PixelFormat.Format32bppArgb);
-        using (var graphics = Graphics.FromImage(image)) graphics.CopyFromScreen(region.Location, Point.Empty, region.Size);
-        var executable = GetTesseractExecutable();
-        if (string.IsNullOrWhiteSpace(executable)) return new PlayerPositionOcrResult("", null, "Tesseract с языками rus и eng не найден.");
-        return await RecognizeAsync(executable, image, map, CancellationToken.None, saveDiagnostics: true);
+        return await CaptureAndRecognizeCoreAsync(settings, map, CancellationToken.None, saveDiagnostics: true);
     }
 
     public async Task<PlayerPositionOcrResult> CaptureAndRecognizeAsync(PlayerPositionTrackingSettings settings, TreasureMapOption? map, CancellationToken cancellationToken)
+        => await CaptureAndRecognizeCoreAsync(settings, map, cancellationToken, saveDiagnostics: false);
+
+    public async Task<CapturedWindowImage> CaptureSelectionImageAsync(CancellationToken token = default)
+    {
+        var window = GameWindowActivity.GetVisibleDayZWindow() ?? throw new DayZCompanionException("Изображение игры недоступно. Повторите попытку после возвращения в DayZ.");
+        var borderless = await WindowGraphicsCapture.GetBorderlessAccessAsync();
+        return await capture.CaptureAsync(window, null, token, tracking, borderless);
+    }
+
+    private async Task<PlayerPositionOcrResult> CaptureAndRecognizeCoreAsync(PlayerPositionTrackingSettings settings, TreasureMapOption? map, CancellationToken cancellationToken, bool saveDiagnostics)
     {
         if (!settings.HasRegion) return new PlayerPositionOcrResult("", null, "Не настроена область координат.");
-        var bounds = SystemInformation.VirtualScreen;
-        var region = settings.GetScreenRectangle(bounds);
-        if (region.Width <= 0 || region.Height <= 0) return new PlayerPositionOcrResult("", null, "Область координат недоступна на текущем экране.");
-        using var image = new Bitmap(region.Width, region.Height, PixelFormat.Format32bppArgb);
-        using (var graphics = Graphics.FromImage(image)) graphics.CopyFromScreen(region.Location, Point.Empty, region.Size);
         var executable = GetTesseractExecutable();
         if (string.IsNullOrWhiteSpace(executable)) return new PlayerPositionOcrResult("", null, "Tesseract с языками rus и eng не найден.");
-        return await RecognizeAsync(executable, image, map, cancellationToken, saveDiagnostics: false);
+        var window = GameWindowActivity.GetVisibleDayZWindow() ?? throw new DayZCompanionException("Изображение игры недоступно. Повторите попытку после возвращения в DayZ.");
+        settings.AttachRegionToWindow(window.ClientBounds, SystemInformation.VirtualScreen);
+        var region = settings.GetScreenRectangle(new Rectangle(Point.Empty, window.ClientBounds.Size));
+        var borderless = await WindowGraphicsCapture.GetBorderlessAccessAsync();
+        using var frame = await capture.CaptureAsync(window, region, cancellationToken, tracking, borderless);
+        var result = await RecognizeAsync(executable, frame.Image, map, cancellationToken, saveDiagnostics);
+        if (result.Position is null) return result;
+        return result with { Position = result.Position with { MeasuredAt = frame.MeasuredAt } };
     }
 
     private async Task<PlayerPositionOcrResult> RecognizeAsync(string executable, Bitmap image, TreasureMapOption? map, CancellationToken cancellationToken, bool saveDiagnostics)

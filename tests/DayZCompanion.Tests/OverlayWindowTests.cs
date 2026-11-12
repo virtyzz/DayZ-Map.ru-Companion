@@ -4,6 +4,71 @@ using CrosshairMarker;
 
 internal static class OverlayWindowTests
 {
+    public static void PerformanceVisibilityFollowsGame()
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                using var game = new System.Windows.Forms.Form { Bounds = new System.Drawing.Rectangle(120, 120, 700, 450) };
+                game.Show();
+                var available = false;
+                using var overlay = new PerformanceOverlayForm(() => available && game.Visible && game.WindowState != System.Windows.Forms.FormWindowState.Minimized
+                    ? new GameWindowState(game.Handle, game.RectangleToScreen(game.ClientRectangle)) : null);
+                var settings = new PerformanceSettings { Enabled = true };
+                overlay.Apply(settings, new PerformanceSnapshot(Running: true));
+                if (overlay.Visible) throw new Exception("Default overlay is visible outside the game");
+                available = true;
+                PumpUntil(() => overlay.Visible);
+                using var other = new System.Windows.Forms.Form { Bounds = new System.Drawing.Rectangle(150, 150, 160, 100) };
+                other.Show(); other.Activate();
+                var foreground = GetForegroundWindow();
+                PumpUntil(() => overlay.Visible && GetWindow(overlay.Handle, 2) == game.Handle);
+                var until = Stopwatch.StartNew();
+                while (until.ElapsedMilliseconds < 3300)
+                {
+                    System.Windows.Forms.Application.DoEvents(); Thread.Sleep(15);
+                    if (!overlay.Visible || IsTopmost(overlay)) throw new Exception("Background overlay disappeared or became globally topmost");
+                }
+                if (GetForegroundWindow() != foreground) throw new Exception("Game attachment stole focus");
+                if (GetWindow(overlay.Handle, 2) != game.Handle) throw new Exception("Overlay escaped game's Z order");
+                game.Location = new System.Drawing.Point(180, 190);
+                PumpUntil(() => overlay.Left == game.RectangleToScreen(game.ClientRectangle).Left + settings.Left);
+                if (!game.RectangleToScreen(game.ClientRectangle).Contains(overlay.Bounds)) throw new Exception("Overlay extends beyond game client area");
+                game.WindowState = System.Windows.Forms.FormWindowState.Minimized;
+                PumpUntil(() => !overlay.Visible);
+                game.WindowState = System.Windows.Forms.FormWindowState.Normal;
+                PumpUntil(() => overlay.Visible);
+                // Hidden/closed games hide it without a measurement update.
+                available = false;
+                PumpUntil(() => !overlay.Visible);
+                settings.ShowOnlyInGame = false;
+                overlay.Apply(settings, new PerformanceSnapshot(Running: false));
+                if (!overlay.Visible) throw new Exception("Unchecked option hides overlay after game exits");
+                settings.ShowOnlyInGame = true;
+                overlay.Apply(settings, new PerformanceSnapshot(Running: false));
+                if (overlay.Visible) throw new Exception("Checkbox change did not hide overlay immediately");
+                settings.ShowOnlyInGame = false; settings.ShowOverlay = false;
+                overlay.Apply(settings, new PerformanceSnapshot(Running: true));
+                if (overlay.Visible) throw new Exception("Master show setting was ignored");
+                settings.ShowOverlay = true; settings.Enabled = false;
+                overlay.Apply(settings, new PerformanceSnapshot());
+                if (overlay.Visible) throw new Exception("Disabled measurements show a normal overlay");
+                settings.ShowOnlyInGame = true; settings.EditingEnabled = true;
+                overlay.Apply(settings, new PerformanceSnapshot());
+                if (!overlay.Visible) throw new Exception("Positioning preview is unavailable outside game");
+                settings.EditingEnabled = false;
+                overlay.Apply(settings, new PerformanceSnapshot());
+                if (overlay.Visible) throw new Exception("Finishing positioning did not restore game-only policy");
+            }
+            catch (Exception ex) { failure = ex; }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start(); thread.Join();
+        if (failure is not null) throw new Exception("Performance visibility failed", failure);
+    }
+
     public static void RecoverTopmost()
     {
         Exception? failure = null;
@@ -24,7 +89,7 @@ internal static class OverlayWindowTests
         using var performance = new PerformanceOverlayForm();
         quests.Apply(new BattlePassSettings(), new BattlePassSnapshot());
         quests.Show();
-        performance.Apply(new PerformanceSettings { ShowOverlay = true, Enabled = true }, new PerformanceSnapshot(Running: true));
+        performance.Apply(new PerformanceSettings { ShowOverlay = true, Enabled = true, ShowOnlyInGame = false }, new PerformanceSnapshot(Running: true));
         var windows = new System.Windows.Forms.Form[] { quests, performance };
         var bounds = windows.Select(window => window.Bounds).ToArray();
         var foreground = GetForegroundWindow();
@@ -70,6 +135,7 @@ internal static class OverlayWindowTests
     }
 
     [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr window, uint command);
     [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] private static extern int GetWindowLong(IntPtr window, int index);
     [DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);
 }

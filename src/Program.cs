@@ -9,6 +9,11 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        if (args.Length == 2 && args[0] == AppUpdater.HostArgument)
+        {
+            Environment.ExitCode = AppUpdater.RunHost(args[1]);
+            return;
+        }
         if (args.Length == 1 && args[0] is LegacyInstallMigration.PrepareArgument or LegacyInstallMigration.FinishArgument)
         {
             Environment.ExitCode = args[0] == LegacyInstallMigration.PrepareArgument ? LegacyInstallMigration.Prepare() : LegacyInstallMigration.Finish();
@@ -44,8 +49,14 @@ internal static class Program
 
         try
         {
+            AppUpdater.CleanupCompletedAttempts();
             ApplicationConfiguration.Initialize();
             using var appContext = new CrosshairApplicationContext();
+            if (args.Length == 2 && args[0] == AppUpdater.ReadyArgument)
+            {
+                appContext.OpenUpdates();
+                AppUpdater.SignalRestartReady(args[1]);
+            }
             Application.Run(appContext);
         }
         finally

@@ -7,7 +7,7 @@ using System.Text.Json;
 
 namespace CrosshairMarker;
 
-internal sealed record A2sReply(double Milliseconds, string Name, int? GamePort);
+internal sealed record A2sReply(double Milliseconds, string Name, int? GamePort, string MapName = "");
 
 internal static class A2sQueryClient
 {
@@ -51,7 +51,7 @@ internal static class A2sQueryClient
             return value;
         }
         var name = ReadString();
-        ReadString();
+        var mapName = ReadString();
         var folder = ReadString();
         ReadString();
         if (!string.Equals(folder, "dayz", StringComparison.OrdinalIgnoreCase))
@@ -65,7 +65,7 @@ internal static class A2sQueryClient
             if (position + 2 > packet.Length) throw new InvalidDataException("Неполный EDF-порт");
             gamePort = BinaryPrimitives.ReadUInt16LittleEndian(packet.AsSpan(position, 2));
         }
-        return new A2sReply(elapsed, name, gamePort);
+        return new A2sReply(elapsed, name, gamePort, mapName);
     }
 
     internal static List<int> PortsFromSteam(JsonElement root, IPEndPoint game)

@@ -43,7 +43,7 @@ internal sealed class PerformanceHelperClient : IDisposable
         {
             if (session?.Connected == true && lastUpdate != 0 && Stopwatch.GetElapsedTime(lastUpdate).TotalSeconds > 5)
                 Set(Snapshot with { Fps = null, Ping = null, FrameTime = null, OnePercentLow = null, Jitter = null,
-                    FrameTimeHistory = null, HelperStatus = "Ожидание данных помощника…" });
+                    FrameTimeHistory = null, MapName = "", MapMeasuredAt = null, HelperStatus = "Ожидание данных помощника…" });
         };
         freshness.Start();
     }

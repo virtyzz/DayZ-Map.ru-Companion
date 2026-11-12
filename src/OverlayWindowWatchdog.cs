@@ -8,13 +8,15 @@ internal sealed class OverlayWindowWatchdog : IDisposable
 {
     private readonly Form window;
     private readonly Action repaint;
+    private readonly Func<bool> maintainTopmost;
     private readonly System.Windows.Forms.Timer timer = new() { Interval = 3000 };
     private DateTime nextFailureLog;
 
-    public OverlayWindowWatchdog(Form window, Action repaint)
+    public OverlayWindowWatchdog(Form window, Action repaint, Func<bool>? maintainTopmost = null)
     {
         this.window = window;
         this.repaint = repaint;
+        this.maintainTopmost = maintainTopmost ?? (() => true);
         window.VisibleChanged += OnVisibleChanged;
         timer.Tick += OnTick;
     }
@@ -29,7 +31,7 @@ internal sealed class OverlayWindowWatchdog : IDisposable
 
     private void Refresh()
     {
-        if (window.IsDisposed || !window.Visible || !window.IsHandleCreated) return;
+        if (window.IsDisposed || !window.Visible || !window.IsHandleCreated || !maintainTopmost()) return;
         const uint noSize = 0x0001, noMove = 0x0002, noActivate = 0x0010, noOwnerZOrder = 0x0200;
         if (!SetWindowPos(window.Handle, new IntPtr(-1), 0, 0, 0, 0, noSize | noMove | noActivate | noOwnerZOrder)
             && DateTime.UtcNow >= nextFailureLog)

@@ -30,6 +30,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
     private readonly System.Windows.Forms.Timer updateTimer = new() { Interval = 60 * 60 * 1000 };
     private bool updateCheckInProgress;
     private bool exitInProgress;
+    private CancellationTokenSource? updateCancellation;
     private AppConfig config;
 
     public CrosshairApplicationContext()
@@ -112,24 +113,9 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             performanceOverlay.Apply(dayZSettings.Performance, snapshot);
             editor?.ApplyPerformanceState(snapshot);
         };
-        performanceMonitor.Apply(dayZSettings.Performance);
-        playerPositionMapBridge.SetTrackingEnabled(dayZSettings.PlayerPositionTracking.Enabled);
-        playerPositionMapBridge.SessionChanged += session =>
-        {
-            lock (playerPositionSettingsSync)
-            {
-                var tracking = dayZSettings.PlayerPositionTracking;
-                var map = session.Maps.SingleOrDefault(item => string.Equals(item.Id, tracking.MapId, StringComparison.Ordinal)
-                    || string.Equals(item.Id, tracking.MapId, StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(item.Name, tracking.MapId, StringComparison.OrdinalIgnoreCase));
-                if (map is null && session.Maps.Count == 1) map = session.Maps[0];
-                if (map is null || string.Equals(tracking.MapId, map.Id, StringComparison.Ordinal)) return;
-                tracking.MapId = map.Id;
-                tracking.LastError = "";
-                dayZSettingsStore.Save(dayZSettings);
-                AppRuntimeLog.Info($"Player position map destination synchronized: {map.Id}.");
-            }
-        };
+        ApplyMeasurementSettings();
+        playerPositionMapBridge.SetTrackingEnabled(dayZSettings.PlayerPositionTracking.Enabled && !dayZSettings.PlayerPositionTracking.Paused);
+        playerPositionMapBridge.UpdateSettings(dayZSettings.PlayerPositionTracking);
         playerPositionMapBridge.Delivered += update =>
         {
             lock (playerPositionSettingsSync)
@@ -148,10 +134,20 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
                 // Delivery can be acknowledged while OCR is running. Do not let
                 // the older OCR snapshot erase that acknowledgement.
                 if (current.LastSentAt > settings.LastSentAt) settings.LastSentAt = current.LastSentAt;
-                dayZSettings.PlayerPositionTracking = settings.Clone();
+                // Keep configuration edited during capture; merge only runtime
+                // results and the automatically resolved destination map.
+                current.MapId = settings.MapId;
+                if (!current.RegionRelativeToWindow && settings.RegionRelativeToWindow) current.CopyRegionFrom(settings);
+                current.LastX = settings.LastX;
+                current.LastY = settings.LastY;
+                current.LastZ = settings.LastZ;
+                current.LastSentAt = settings.LastSentAt;
+                current.LastError = settings.LastError;
+                current.ConsecutiveErrors = settings.ConsecutiveErrors;
+                playerPositionMapBridge.UpdateSettings(current);
                 dayZSettingsStore.Save(dayZSettings);
             }
-        });
+        }, () => performanceMonitor.Snapshot);
         if (DayZSettingsMigration.ApplyLegacyWindowBounds(config, dayZSettings))
         {
             dayZSettingsStore.Save(dayZSettings);
@@ -382,6 +378,13 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
 
     private void OpenPlayerPosition() => OpenEditor("player-position");
 
+    private void ApplyMeasurementSettings(bool allowElevation = false)
+    {
+        var effective = dayZSettings.Performance.Clone();
+        effective.Enabled |= dayZSettings.PlayerPositionTracking is { Enabled: true, Paused: false };
+        performanceMonitor.Apply(effective, allowElevation);
+    }
+
     private void CaptureTreasure()
     {
         // The frame must be captured while DayZ still owns the foreground.
@@ -457,7 +460,8 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
                 dayZSettings.PlayerPositionTracking.LastSentAt = runtime.LastSentAt;
                 dayZSettings.PlayerPositionTracking.ConsecutiveErrors = runtime.ConsecutiveErrors;
                 dayZSettings.PlayerPositionTracking.LastError = runtime.LastError;
-                playerPositionMapBridge.SetTrackingEnabled(dayZSettings.PlayerPositionTracking.Enabled);
+                playerPositionMapBridge.SetTrackingEnabled(dayZSettings.PlayerPositionTracking.Enabled && !dayZSettings.PlayerPositionTracking.Paused);
+                playerPositionMapBridge.UpdateSettings(dayZSettings.PlayerPositionTracking);
                 dayZSettingsStore.Save(dayZSettings);
             }
             if (restartHttp)
@@ -467,12 +471,13 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
                 dayZCompanion.Start();
             }
             playerPositionTracker.Refresh();
-            performanceMonitor.Apply(dayZSettings.Performance, allowElevation: requestPerformanceElevation);
+            ApplyMeasurementSettings(requestPerformanceElevation);
+            performanceOverlay.Apply(dayZSettings.Performance, performanceMonitor.Snapshot);
             editor?.ApplyDayZState(dayZSettings, dayZCompanion.GetStatus());
         };
         editor.DayZStatusRequested += () => editor?.ApplyDayZState(dayZSettings, dayZCompanion.GetStatus());
         editor.ApplyPerformanceState(performanceMonitor.Snapshot);
-        editor.PlayerPositionRegionRequested += () => editor?.SelectPlayerPositionRegion();
+        editor.PlayerPositionRegionRequested += () => editor?.SelectPlayerPositionRegionAsync() ?? Task.CompletedTask;
         editor.BattlePassSettingsChanged += SaveBattlePassSettings;
         editor.BattlePassCommandRequested += HandleBattlePassCommand;
         editor.ManualTaskCommandRequested += (action, task) =>
@@ -492,6 +497,8 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             editor.ApplyBattlePassState(battlePassSettings, battlePassStore.LoadSnapshot());
         };
         editor.ExitRequested += ExitApplication;
+        editor.UpdateRequested += async () => await InstallUpdateAsync();
+        editor.UpdateCancelRequested += () => { if (updateService.Progress.CanCancel) updateCancellation?.Cancel(); };
         editor.Show();
     }
 
@@ -511,16 +518,51 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             store.SaveAtomic(config);
 
             var result = MessageBox.Show(
-                $"Доступна новая версия {AppIdentity.DisplayName} {info.LatestVersion}.\n\nТекущая версия: {info.CurrentVersion}\n\nСкачать установщик?",
+                $"Доступна новая версия {AppIdentity.DisplayName} {info.LatestVersion}.\n\nТекущая версия: {info.CurrentVersion}\n\nОткрыть обновление в Companion?",
                 $"Обновление {AppIdentity.DisplayName}",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Information);
 
-            if (result == DialogResult.Yes) UpdateService.OpenDownload(info);
+            if (result == DialogResult.Yes) OpenUpdates();
         }
         finally
         {
             updateCheckInProgress = false;
+        }
+    }
+
+    public void OpenUpdates() => OpenEditor("updates");
+
+    private async Task InstallUpdateAsync()
+    {
+        if (AppDistribution.IsMicrosoftStore) { AppDistribution.OpenStore(); return; }
+        if (updateCancellation is not null) return;
+        using var cancellation = new CancellationTokenSource();
+        updateCancellation = cancellation;
+        try
+        {
+            updateService.Report(new(true, "Проверка доступной версии…", CanCancel: true));
+            var info = await updateService.GetLatestAsync(true, cancellation.Token);
+            cancellation.Token.ThrowIfCancellationRequested();
+            var directory = AppUpdater.CreateDirectory();
+            using var lease = AppUpdater.AcquireDirectory(directory);
+            var installer = await updateService.DownloadInstallerAsync(info, directory, cancellation.Token);
+            updateService.Report(new(true, "Открытие окна установки…"));
+            await AppUpdater.StartHostAsync(installer, info.InstallerSha256!);
+            // Leave the WebView callback before disposing its owning window.
+            if (editor is { IsDisposed: false }) editor.BeginInvoke(new Action(ExitApplication));
+            else ExitApplication();
+        }
+        catch (OperationCanceledException) { updateService.Report(new(false, "Скачивание обновления отменено.")); }
+        catch (Exception ex)
+        {
+            AppRuntimeLog.Error("In-app update failed", ex);
+            updateService.Report(new(false, "Не удалось обновить Companion: " + ex.Message));
+        }
+        finally
+        {
+            updateCancellation = null;
+            AppUpdater.CleanupCompletedAttempts();
         }
     }
 
@@ -640,10 +682,12 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         }
 
         exitInProgress = true;
+        updateCancellation?.Cancel();
         AppRuntimeLog.Info("Application shutdown requested.");
         try
         {
             ShutdownStep("player position tracker", () => playerPositionTracker.Dispose());
+            ShutdownStep("player position capture", () => playerPositionCaptureService.Dispose());
             ShutdownStep("performance monitor", () => performanceMonitor.Dispose());
             ShutdownStep("performance overlay", () => performanceOverlay.Dispose());
             ShutdownStep("update timer", () => { updateTimer.Stop(); updateTimer.Dispose(); });

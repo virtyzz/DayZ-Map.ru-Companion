@@ -54,6 +54,35 @@ internal sealed class ScreenRegionSelector : Form
         return selector.ShowDialog() == DialogResult.OK ? selector.Selection : null;
     }
 
+    public static Rectangle? SelectImageRegion(Bitmap image, Rectangle displayArea)
+    {
+        var bounds = GetImagePreviewBounds(image.Size, displayArea);
+        using var preview = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppArgb);
+        using (var graphics = Graphics.FromImage(preview))
+            graphics.DrawImage(image, new Rectangle(Point.Empty, preview.Size));
+        var selected = SelectRegion(preview, bounds);
+        if (selected is null) return null;
+        return GetImageSelection(selected.Value, bounds, image.Size);
+    }
+
+    internal static Rectangle GetImagePreviewBounds(Size image, Rectangle displayArea)
+    {
+        if (image.Width <= 0 || image.Height <= 0 || displayArea.Width <= 0 || displayArea.Height <= 0)
+            throw new ArgumentException("Image and display bounds must have positive dimensions.");
+        var scale = Math.Min(1, Math.Min((double)displayArea.Width / image.Width, (double)displayArea.Height / image.Height));
+        var size = new Size(Math.Max(1, (int)Math.Round(image.Width * scale)), Math.Max(1, (int)Math.Round(image.Height * scale)));
+        return new Rectangle(displayArea.Left + (displayArea.Width - size.Width) / 2, displayArea.Top + (displayArea.Height - size.Height) / 2, size.Width, size.Height);
+    }
+
+    internal static Rectangle GetImageSelection(Rectangle selected, Rectangle preview, Size image)
+    {
+        var clipped = Rectangle.Intersect(selected, preview);
+        return Rectangle.FromLTRB((int)Math.Round((double)(clipped.Left - preview.Left) * image.Width / preview.Width),
+            (int)Math.Round((double)(clipped.Top - preview.Top) * image.Height / preview.Height),
+            (int)Math.Round((double)(clipped.Right - preview.Left) * image.Width / preview.Width),
+            (int)Math.Round((double)(clipped.Bottom - preview.Top) * image.Height / preview.Height));
+    }
+
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);

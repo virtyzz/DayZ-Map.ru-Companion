@@ -14,7 +14,7 @@
 
 **DayZ-Map.ru Companion** — локальное Windows-приложение для обмена личными метками между DayZ-Map.ru и игрой DayZ. В приложение также входит самостоятельный модуль экранного прицела с профилями, изображениями и горячими клавишами.
 
-Companion работает только на компьютере пользователя: API слушает `127.0.0.1`, а данные маркеров сохраняются в локальном `PrivateMarkers.json`. Приложение не требует публикации данных во внешний сервис.
+Локальный API Companion слушает `127.0.0.1`, а игровые метки сохраняются в `PrivateMarkers.json`. Позиция игрока по умолчанию видна только ему. По желанию её можно передавать всем на сайте или пользователям выбранных серверных профилей через открытую вкладку карты.
 
 ### Скачать
 
@@ -25,6 +25,8 @@ Companion работает только на компьютере пользов
 </p>
 
 Скачайте установщик из [последнего релиза](https://github.com/virtyzz/DayZ-Map.ru-Companion/releases/latest), запустите его и следуйте шагам установки. После запуска приложение находится в системном трее: двойной клик открывает окно, правый клик — меню.
+
+Для следующих обновлений откройте вкладку «Обновление» и нажмите «Обновить и перезапустить». Companion покажет прогресс скачивания, проверит файл и откроет отдельное окно установки, которое останется до запуска новой версии. Windows запросит разрешение на установку. Кнопка «Скачать установщик» остаётся альтернативой; она также используется для релизов без контрольной суммы. Версия Microsoft Store обновляется через магазин.
 
 К каждому релизу прикладывается полное описание изменений на русском языке: новые возможности, исправления и важные замечания по обновлению.
 
@@ -39,6 +41,15 @@ Companion работает только на компьютере пользов
 - Безопасная замена либо объединение меток по `uid`.
 - Резервные копии `PrivateMarkers.json` перед записью и настройка их хранения.
 - Наглядное состояние поиска, API, доступности файла и последней операции в разделе «Синхронизация меток».
+
+### Позиция игрока
+
+- Карта всегда определяется автоматически по A2S_INFO текущего сервера DayZ. Для автоматического определения подключения используется помощник измерений; при первом запуске Windows может запросить разрешение.
+- Под индикатором всегда показывается только имя; координаты доступны в карточке по клику.
+- Видимость: «Только для меня» (по умолчанию), «Всем на сайте» или «Выбранные профили» с мультивыбором.
+- Общая передача требует входа в аккаунт сайта и открытой вкладки карты. Позиции видны на соответствующей карте; кнопка «Другие игроки» скрывает общий слой, сохраняя личный индикатор.
+- Клик по индикатору открывает закреплённую карточку с именем игрока, названием сервера, IP и игровым портом, картой, координатами и видимостью. Выбор другого игрока переключает карточку; исчезновение выбранной позиции закрывает её.
+- При неизвестной карте или отсутствии свежего ответа сервера автоматическая передача приостанавливается. Неактуальные общие позиции исчезают автоматически.
 
 ### Модуль прицела
 
@@ -63,7 +74,7 @@ Companion работает только на компьютере пользов
 
 **DayZ-Map.ru Companion** is a local Windows app for exchanging personal markers between DayZ-Map.ru and DayZ. It also includes an independent crosshair overlay with profiles, images, and hotkeys.
 
-The Companion only works on the user's computer: its API listens on `127.0.0.1`, and marker data is stored in the local `PrivateMarkers.json` file. No marker data is published to an external service.
+The Companion API listens on `127.0.0.1`, and game markers are stored in the local `PrivateMarkers.json` file. Player positions are private by default. Users may opt in to sharing with everyone on the site or members of selected server profiles through an open map tab.
 
 ### Download
 
@@ -74,6 +85,8 @@ The Companion only works on the user's computer: its API listens on `127.0.0.1`,
 </p>
 
 Download the installer from the [latest release](https://github.com/virtyzz/DayZ-Map.ru-Companion/releases/latest), run it, and follow the setup steps. The app then lives in the system tray: double-click opens the window and right-click opens its menu.
+
+For subsequent updates, open the Update tab and choose Update and restart. Companion downloads and verifies the installer, then keeps a separate update window open until the new version starts. Windows will ask for installation permission. Download installer remains available as an alternative, including releases without a checksum. Microsoft Store builds update through the Store.
 
 Each release includes detailed Russian release notes covering new features, fixes, and important update notes.
 

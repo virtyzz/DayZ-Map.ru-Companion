@@ -49,8 +49,11 @@ internal sealed class EditorForm : Form
     public event Action<string?>? MonitorChanged;
     public event Action<EditorWindowBounds>? EditorBoundsChanged;
     public event Action? ExitRequested;
+    public event Action? UpdateRequested;
+    public event Action? UpdateCancelRequested;
     public event Action<DayZCompanionSettings>? DayZSettingsChanged;
-    public event Action? PlayerPositionRegionRequested;
+    public event Func<Task>? PlayerPositionRegionRequested;
+    private bool selectingPlayerPositionRegion;
     public event Action? DayZStatusRequested;
     public event Action<BattlePassSettings>? BattlePassSettingsChanged;
     public event Action<string>? BattlePassCommandRequested;
@@ -59,6 +62,7 @@ internal sealed class EditorForm : Form
     public EditorForm(AppConfig source, UpdateService updateService, DayZCompanionSettings dayZSettings, DayZCompanionStatus dayZStatus, BattlePassSettings battlePassSettings, BattlePassSnapshot battlePassSnapshot, TreasureCaptureStore treasureStore, TreasureCaptureService treasureCaptureService, TreasureMapBridge treasureMapBridge, PlayerPositionMapBridge playerPositionMapBridge, PlayerPositionCaptureService playerPositionCaptureService, string? initialTab = null)
     {
         this.updateService = updateService;
+        updateService.ProgressChanged += OnUpdateProgressChanged;
         this.treasureStore = treasureStore;
         this.treasureCaptureService = treasureCaptureService;
         this.treasureMapBridge = treasureMapBridge;
@@ -101,6 +105,7 @@ internal sealed class EditorForm : Form
         };
         FormClosed += (_, _) =>
         {
+            updateService.ProgressChanged -= OnUpdateProgressChanged;
             dayZStatusTimer.Stop();
             dayZStatusTimer.Dispose();
             ocrInstallPollTimer.Stop();
@@ -325,7 +330,7 @@ internal sealed class EditorForm : Form
                     ManualTaskCommandRequested?.Invoke(action, manualTask);
                     break;
                 case "updatePlayerPositionSettings":
-                    ApplyPlayerPositionSettingsFromWeb(root.GetProperty("settings"));
+                    await ApplyPlayerPositionSettingsFromWebAsync(root.GetProperty("settings"));
                     break;
                 case "treasure":
                     HandleTreasureFromWeb(root);
@@ -389,6 +394,12 @@ internal sealed class EditorForm : Form
                 }
                 UpdateService.OpenDownload(updateInfo);
                 break;
+            case "installUpdate":
+                UpdateRequested?.Invoke();
+                break;
+            case "cancelUpdate":
+                UpdateCancelRequested?.Invoke();
+                break;
             case "openCompanionReleases":
                 UpdateService.OpenReleasesPage();
                 break;
@@ -450,7 +461,7 @@ internal sealed class EditorForm : Form
                 await CaptureTreasureAsync();
                 break;
             case "selectPlayerPositionRegion":
-                PlayerPositionRegionRequested?.Invoke();
+                if (PlayerPositionRegionRequested is { } selectRegion) await selectRegion();
                 break;
             case "showPlayerPositionHint":
                 PlayerPositionSelectionHintForm.ShowHint(this);
@@ -481,24 +492,34 @@ internal sealed class EditorForm : Form
         DayZSettingsChanged?.Invoke(next);
     }
 
-    private void ApplyPlayerPositionSettingsFromWeb(JsonElement settingsElement)
+    private async Task ApplyPlayerPositionSettingsFromWebAsync(JsonElement settingsElement)
     {
         var next = settingsElement.Deserialize<PlayerPositionTrackingSettings>(JsonOptions);
         if (next is null) return;
+        // The web form edits display options; only the native selector can change the OCR region.
+        next.CopyRegionFrom(dayZSettings.PlayerPositionTracking);
         next.Normalize();
+        if (next.Enabled && !next.Paused) await WindowGraphicsCapture.GetBorderlessAccessAsync();
         dayZSettings.PlayerPositionTracking = next;
         DayZSettingsChanged?.Invoke(dayZSettings);
     }
 
-    public void SelectPlayerPositionRegion()
+    public async Task SelectPlayerPositionRegionAsync()
     {
-        var bounds = SystemInformation.VirtualScreen;
-        using var screenshot = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppArgb);
-        using (var graphics = Graphics.FromImage(screenshot)) graphics.CopyFromScreen(bounds.Location, Point.Empty, bounds.Size);
-        var region = ScreenRegionSelector.SelectRegion(screenshot);
-        if (!region.HasValue) return;
-        dayZSettings.PlayerPositionTracking.SetScreenRectangle(region.Value, bounds);
-        DayZSettingsChanged?.Invoke(dayZSettings);
+        if (selectingPlayerPositionRegion) return;
+        selectingPlayerPositionRegion = true;
+        try
+        {
+            using var frame = await playerPositionCaptureService.CaptureSelectionImageAsync();
+            if (IsDisposed) return;
+            var display = Screen.FromRectangle(frame.ClientBounds).WorkingArea;
+            var region = ScreenRegionSelector.SelectImageRegion(frame.Image, display);
+            if (!region.HasValue) return;
+            dayZSettings.PlayerPositionTracking.SetScreenRectangle(region.Value, new Rectangle(Point.Empty, frame.Image.Size));
+            dayZSettings.PlayerPositionTracking.RegionRelativeToWindow = true;
+            DayZSettingsChanged?.Invoke(dayZSettings);
+        }
+        finally { selectingPlayerPositionRegion = false; }
     }
 
     public async Task TestPlayerPositionAsync()
@@ -721,6 +742,7 @@ internal sealed class EditorForm : Form
             config,
             openTab,
             update = updateInfo,
+            updateProgress = updateService.Progress,
             dayZ = new { settings = dayZSettings, status = dayZStatus },
             performance = performanceSnapshot,
             performanceDefaults = new PerformanceSettings(),
@@ -757,6 +779,11 @@ internal sealed class EditorForm : Form
         if (AppDistribution.IsMicrosoftStore) { await SendStateAsync(); return; }
         updateInfo = await updateService.GetLatestAsync(forceRefresh);
         await SendStateAsync();
+    }
+
+    private void OnUpdateProgressChanged()
+    {
+        if (!IsDisposed && webReady) _ = SendStateAsync();
     }
 
     private async Task SendErrorAsync(string message)
@@ -1803,10 +1830,12 @@ function renderDataChanged(previous, next) {
     config: value.config,
     openTab: value.openTab,
     update: value.update,
+    updateProgress: value.updateProgress,
     ocr: value.ocr,
     dayZSettings: value.dayZ?.settings,
     battlePass: value.battlePass,
     treasures: value.treasures,
+    positionDestination: { maps: value.playerPosition?.destination?.Maps, profiles: value.playerPosition?.destination?.Profiles },
     hotkeyErrors: value.hotkeyErrors,
     monitors: value.monitors,
     preview: value.preview
@@ -2076,8 +2105,9 @@ function renderPerformanceSettings() {
   const monitors = (state.monitors || []).map(m => `<option value="${escapeHtml(m.DeviceName)}" ${m.DeviceName === s.MonitorDeviceName ? "selected" : ""}>${escapeHtml(m.DisplayName)}</option>`).join("");
   return `<h2>Настройки оверлея</h2><div class="control-group">
     <div class="field">${check("Показывать оверлей", "ShowOverlay")}</div>
+    <div class="field">${check("Показывать только в игре", "ShowOnlyInGame")}<div class="limit">Оверлей привязан к окну DayZ, следует за ним и перекрывается другими окнами вместе с игрой. При сворачивании или закрытии игры скрывается. Положение отсчитывается от окна игры. Снимите галочку, чтобы показывать оверлей поверх всех окон, включая закрытую игру.</div></div>
     <div class="field">${check("Разрешить перемещение и изменение размера", "EditingEnabled")}</div>
-    <div class="limit">При включённом перемещении перетащите окно мышью, а за края — измените размер. После настройки выключите перемещение: клики будут проходить в игру. Положение сохраняется автоматически.</div>
+    <div class="limit">При включённом перемещении оверлей виден и вне игры для настройки: перетащите окно мышью, а за края — измените размер. После настройки выключите перемещение: клики будут проходить в игру. Положение сохраняется автоматически.</div>
     <div class="field"><label>Монитор<br><select data-performance-select="MonitorDeviceName"><option value="" ${!s.MonitorDeviceName ? "selected" : ""}>Основной монитор</option>${monitors}</select></label></div>
     <div class="performance-grid">
       ${number("Ширина окна, px", "Width", 120, 1200)}${number("Высота окна, px", "Height", 32, 500)}
@@ -2141,6 +2171,8 @@ function renderPlayerPosition() {
   const s = data.settings || {};
   const destination = data.destination;
   const diagnostics = data.diagnostics;
+  const profiles = (destination?.Profiles || []).filter(item => item.MapId === s.MapId);
+  const selectedProfiles = new Set(s.ProfileIds || []);
   const selectedShape = playerPositionShapes.find(item => item.id === s.IndicatorShape) || playerPositionShapes[0];
   const shapeOptions = playerPositionShapes.map(item => `<option value="${item.id}" ${item.id === selectedShape.id ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("");
   const last = Number.isInteger(s.LastX) ? `X=${s.LastX}, Y=${s.LastY}, Z=${s.LastZ}` : "ещё не распознана";
@@ -2149,9 +2181,28 @@ function renderPlayerPosition() {
     <div class="limit">Захватывается только выделенная область видимого HUD; память игры, инъекции и игровой ввод не используются.</div>
     <div class="field"><label><input type="checkbox" data-position-enabled ${s.Enabled ? "checked" : ""}> Отслеживание: ${status} (${s.Enabled ? "снимите галочку, чтобы отключить отслеживание" : "поставьте галочку, чтобы включить отслеживание"})</label></div>
     <div class="field"><label><input type="checkbox" data-position-paused ${s.Paused ? "checked" : ""}> Пауза</label></div>
-    <div class="limit">Карта определяется автоматически по открытой вкладке DayZ-Map.</div>
-    <div class="actions"><input data-position-name value="${escapeHtml(s.MarkerName || "")}" placeholder="Подпись маркера"><input class="treasure-color-picker" data-position-color type="color" value="${escapeHtml(s.MarkerColor || "#3498db")}" title="Цвет индикатора"></div>
-    <div class="field"><label>Фигура индикатора <select data-position-shape>${shapeOptions}</select></label><div class="limit">Это временный индикатор позиции — он не добавляется в профиль, списки и экспорт карты.</div></div>
+    <div class="field"><label>Кому показывать позицию <select data-position-visibility>
+      <option value="private" ${!["public", "profiles"].includes(s.Visibility) ? "selected" : ""}>Только для меня</option>
+      <option value="public" ${s.Visibility === "public" ? "selected" : ""}>Всем на сайте</option>
+      <option value="profiles" ${s.Visibility === "profiles" ? "selected" : ""}>Выбранные профили</option>
+    </select></label>
+      <div class="limit">${s.Visibility === "public" ? "Позицию увидят все посетители соответствующей карты. Для передачи войдите в аккаунт сайта." : s.Visibility === "profiles" ? "Позиция видна только внутри выбранных серверных профилей участникам с доступом к ним. В других активных профилях она скрыта." : "Позиция остаётся в вашем браузере и не отправляется другим пользователям."}</div>
+      ${s.Visibility === "profiles" ? `<div class="position-profile-choices">${profiles.map(item => `<label><input type="checkbox" data-position-profile value="${escapeHtml(item.Id)}" ${selectedProfiles.has(item.Id) ? "checked" : ""}> ${escapeHtml(item.Name)}</label>`).join("") || `<div class="limit">Нет доступных серверных профилей для этой карты. Войдите в аккаунт на сайте и создайте профиль или получите доступ к общему.</div>`}</div>` : ""}
+    </div>
+    <div class="field" data-position-centering-block>
+      <label><input type="checkbox" data-position-center ${s.CenterOnPlayer ? "checked" : ""}> Центрировать карту на позиции игрока</label>
+      <label><input type="checkbox" data-position-keep-zoom ${s.KeepZoom !== false ? "checked" : ""} ${s.CenterOnPlayer ? "" : "disabled"}> Не изменять зум при центрировании</label>
+      <label>Зум центрирования <input class="number" data-position-zoom type="number" min="2" max="12" step="1" value="${s.CenteringZoom ?? 8}" ${s.CenterOnPlayer && s.KeepZoom === false ? "" : "disabled"}></label>
+      <div class="limit">Допустимый диапазон: 2–12.</div>
+    </div>
+    <div class="field" data-position-marker-block>
+      <label>Имя маркера <input data-position-name type="text" value="${escapeHtml(s.MarkerName || "")}" placeholder="Подпись маркера"></label>
+      <label>Цвет индикатора <input class="treasure-color-picker" data-position-color type="color" value="${escapeHtml(s.MarkerColor || "#3498db")}" title="Цвет индикатора"></label>
+      <label>Фигура индикатора <select data-position-shape>${shapeOptions}</select></label>
+      <label>Размер маркера, пикселей <input class="number" data-position-size type="number" min="16" max="48" step="1" value="${s.MarkerSize ?? 32}"></label>
+      <div class="limit">Допустимый диапазон размера: 16–48 пикселей.</div>
+      <div class="limit">Это временный индикатор позиции — он не добавляется в профиль, списки и экспорт карты.</div>
+    </div>
     <div class="field"><label>Интервал, секунд <input class="number" data-position-interval type="number" min="2" max="300" value="${s.IntervalSeconds || 5}"></label><div class="limit">Допустимый диапазон: 2–300 секунд.</div></div>
     <div class="actions"><button class="action" data-command="selectPlayerPositionRegion">Настроить область координат</button><button class="action" data-command="showPlayerPositionHint">Подсказка</button><button class="action" data-command="testPlayerPosition">Тест распознавания</button><button class="action" data-command="openPlayerPositionDiagnostics" ${diagnostics ? "" : "disabled"}>Открыть диагностику OCR</button></div>
     <div class="limit" data-player-position-status>Область: ${s.HasRegion ? "настроена" : "не выбрана"}. Последняя позиция: ${last}. Последняя отправка: ${s.LastSentAt ? new Date(s.LastSentAt).toLocaleString() : "—"}. Ошибок подряд: ${s.ConsecutiveErrors || 0}.</div>
@@ -2386,9 +2437,13 @@ function renderDayZ() {
 function renderUpdates() {
   if (state.microsoftStore) return `<h2>Обновление</h2><div class="limit">Эта версия обновляется через Microsoft Store. Проверить обновления можно в библиотеке магазина.</div><div class="actions"><button class="action primary" data-command="checkUpdate">Открыть Microsoft Store</button></div>`;
   const info = state.update;
+  const operation = state.updateProgress || {};
+  const busy = !!operation.IsBusy;
+  const progressHtml = operation.Message ? field("Обновление Companion", { input: `<div class="update-status" role="status" aria-live="polite">${escapeHtml(operation.Message)}</div>${busy ? `<progress style="width:100%;accent-color:#efb458" max="100" ${Number.isInteger(operation.Percent) ? `value="${operation.Percent}"` : ""}></progress>` : ""}${operation.CanCancel ? `<button class="action" data-command="cancelUpdate">Отменить скачивание</button>` : ""}` }) : "";
   if (!info) {
     return `
       <h2>Обновление</h2>
+      ${progressHtml}
       ${field("Статус", { input: `<div class="update-status">Проверка еще не выполнялась.</div>` })}
       <div class="actions">
         <button class="action primary" data-command="checkUpdate">Проверить</button>
@@ -2408,13 +2463,16 @@ function renderUpdates() {
 
   return `<div class="updates-layout">
       <h2>Обновление</h2>
+      ${progressHtml}
       ${field("Статус", { input: `<div class="update-status">${status}<span>Текущая версия: ${escapeHtml(info.CurrentVersion)}</span><span>Последняя версия: ${escapeHtml(info.LatestVersion || "-")}${published ? " от " + escapeHtml(published) : ""}</span></div>` })}
       <div class="update-notes-slot">${field("Описание версии", { input: `<div class="release-notes">${renderMarkdown(notes)}</div>` })}</div>
       <div class="actions">
-        <button class="action" data-command="checkUpdate">Проверить снова</button>
-        <button class="action primary" data-command="downloadUpdate" ${downloadDisabled}>Скачать установщик</button>
+        <button class="action primary" data-command="installUpdate" ${info.CanInstall && !busy ? "" : "disabled"}>Обновить и перезапустить</button>
+        <button class="action" data-command="checkUpdate" ${busy ? "disabled" : ""}>Проверить снова</button>
+        <button class="action" data-command="downloadUpdate" ${busy ? "disabled" : downloadDisabled}>Скачать установщик</button>
         <button class="action" data-command="openCompanionReleases">Открыть релизы</button>
       </div>
+      <div class="limit">Обновление загрузится в Companion. Для установки приложение закроется и запустится снова. Windows запросит разрешение на установку.${info.IsUpdateAvailable && !info.CanInstall ? " Для этого релиза встроенное обновление недоступно — используйте кнопку «Скачать установщик»." : ""}</div>
   </div>`;
 }
 
@@ -2444,8 +2502,8 @@ function bindEditorEvents() {
     if (key === "VerticalLayout" && settings.Performance.VerticalLayout) settings.Performance.Height = Math.max(settings.Performance.Height, 64);
   })));
   document.querySelector("[data-performance-reset]")?.addEventListener("click", () => updateDayZ(settings => {
-    const { Enabled, QueryPort, ShowOverlay } = settings.Performance;
-    settings.Performance = { ...clone(state.performanceDefaults), Enabled, QueryPort, ShowOverlay };
+    const { Enabled, QueryPort, ShowOverlay, ShowOnlyInGame } = settings.Performance;
+    settings.Performance = { ...clone(state.performanceDefaults), Enabled, QueryPort, ShowOverlay, ShowOnlyInGame };
   }));
   document.querySelector("[data-performance-save-port]")?.addEventListener("click", () => {
     const input = document.querySelector("[data-performance-port]");
@@ -2597,15 +2655,27 @@ function bindEditorEvents() {
     ...(state.playerPosition?.settings || {}),
     Enabled: document.querySelector("[data-position-enabled]")?.checked || false,
     Paused: document.querySelector("[data-position-paused]")?.checked || false,
+    AutoSelectMap: true,
     MapId: state.playerPosition?.settings?.MapId || "",
     ProfileId: "",
+    Visibility: document.querySelector("[data-position-visibility]")?.value || state.playerPosition?.settings?.Visibility || "private",
+    ProfileIds: (document.querySelector("[data-position-visibility]")?.value || state.playerPosition?.settings?.Visibility) === "profiles"
+      ? Array.from(document.querySelectorAll("[data-position-profile]")).filter(input => input.checked).map(input => input.value)
+      : (state.playerPosition?.settings?.ProfileIds || []),
     MarkerName: document.querySelector("[data-position-name]")?.value || "",
     MarkerType: "player",
     IndicatorShape: document.querySelector("[data-position-shape]")?.value || "triangle",
     MarkerColor: document.querySelector("[data-position-color]")?.value || "#3498db",
+    CenterOnPlayer: document.querySelector("[data-position-center]")?.checked || false,
+    KeepZoom: document.querySelector("[data-position-keep-zoom]")?.checked ?? true,
+    CenteringZoom: Math.max(2, Math.min(12, Math.round(Number(document.querySelector("[data-position-zoom]")?.value || 8)))),
+    ShowLabel: true,
+    LabelContent: "name",
+    MarkerSize: Math.max(16, Math.min(48, Math.round(Number(document.querySelector("[data-position-size]")?.value || 32)))),
     IntervalSeconds: Number(document.querySelector("[data-position-interval]")?.value || 5)
   });
   const savePlayerPositionSettings = (refreshEditor = false) => {
+    clearTimeout(playerPositionSettingsTimer);
     const next = positionSetting();
     state.playerPosition = { ...(state.playerPosition || {}), settings: next };
     // Checkbox state is also reflected in the surrounding label. Update the
@@ -2617,11 +2687,12 @@ function bindEditorEvents() {
     clearTimeout(playerPositionSettingsTimer);
     playerPositionSettingsTimer = setTimeout(savePlayerPositionSettings, 180);
   };
-  document.querySelectorAll("[data-position-enabled], [data-position-paused]").forEach(input => input.addEventListener("change", () => savePlayerPositionSettings(true)));
-  document.querySelector("[data-position-interval]")?.addEventListener("change", savePlayerPositionSettings);
+  document.querySelectorAll("[data-position-enabled], [data-position-paused], [data-position-center], [data-position-keep-zoom]").forEach(input => input.addEventListener("change", () => savePlayerPositionSettings(true)));
+  document.querySelectorAll("[data-position-interval], [data-position-zoom], [data-position-size]").forEach(input => input.addEventListener("change", () => savePlayerPositionSettings(true)));
   document.querySelector("[data-position-name]")?.addEventListener("input", debouncePlayerPositionSettings);
   document.querySelector("[data-position-color]")?.addEventListener("input", debouncePlayerPositionSettings);
-  document.querySelector("[data-position-shape]")?.addEventListener("change", savePlayerPositionSettings);
+  document.querySelector("[data-position-shape]")?.addEventListener("change", () => savePlayerPositionSettings());
+  document.querySelectorAll("[data-position-visibility], [data-position-profile]").forEach(input => input.addEventListener("change", () => savePlayerPositionSettings(true)));
   document.querySelectorAll("[data-treasure]").forEach(button => {
     button.addEventListener("click", () => {
       const id = button.dataset.id;

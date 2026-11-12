@@ -237,7 +237,8 @@ internal sealed class DayZCompanionServer : IDisposable
     private Task GetPositionPendingAsync(HttpListenerContext context)
     {
         var sessionId = context.Request.QueryString["session"] ?? "";
-        return WriteJsonAsync(context.Response, 200, new { ok = true, active = positionBridge.IsActiveSession(sessionId), trackingEnabled = positionBridge.IsTrackingEnabled, update = positionBridge.GetPending(sessionId) });
+        return WriteJsonAsync(context.Response, 200, new { ok = true, active = positionBridge.IsActiveSession(sessionId), trackingEnabled = positionBridge.IsTrackingEnabled,
+            publication = positionBridge.GetPublication(), update = positionBridge.GetPending(sessionId) });
     }
     private async Task AcknowledgePositionAsync(HttpListenerContext context)
     {

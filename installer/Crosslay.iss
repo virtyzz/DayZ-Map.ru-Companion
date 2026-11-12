@@ -8,7 +8,7 @@
 #define MyAppVersion GetEnv("DAYZ_COMPANION_VERSION")
 
 #if MyAppVersion == ""
-  #define MyAppVersion "0.7.1"
+  #define MyAppVersion "0.8.0"
 #endif
 
 [Setup]
