@@ -7,7 +7,7 @@ using Microsoft.Diagnostics.Tracing.Session;
 
 namespace CrosshairMarker;
 
-internal sealed record DayZConnection(IPEndPoint Server, IPAddress LocalAddress, string Adapter);
+internal sealed record DayZConnection(IPEndPoint Server, IPAddress LocalAddress, int LocalPort, string Adapter);
 internal sealed record DayZNetworkSample(int ProcessId, IPAddress Local, IPAddress Remote, int LocalPort, int RemotePort, bool Sent);
 
 internal static class DayZConnectionProbe
@@ -65,7 +65,7 @@ internal static class DayZConnectionProbe
             .GroupBy(s => (s.Local, s.Remote, s.LocalPort, s.RemotePort))
             .Where(g => g.Count(s => s.Sent) >= 3 && g.Any(s => !s.Sent))
             .OrderByDescending(g => g.Count()).FirstOrDefault();
-        return winner is null ? null : new DayZConnection(new IPEndPoint(winner.Key.Remote, winner.Key.RemotePort), winner.Key.Local, "");
+        return winner is null ? null : new DayZConnection(new IPEndPoint(winner.Key.Remote, winner.Key.RemotePort), winner.Key.Local, winner.Key.LocalPort, "");
     }
 
     internal static void Kill(Process? process)

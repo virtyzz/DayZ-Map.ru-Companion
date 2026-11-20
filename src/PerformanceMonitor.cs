@@ -67,7 +67,7 @@ internal sealed class PerformanceMonitor : IDisposable
         failures = 0;
         pingStatistics.Clear();
         nextPing = DateTime.MinValue;
-        Snapshot = Snapshot with { Ping = null, Jitter = null, Server = "", ServerName = "", Adapter = "", Query = "", MapName = "", MapMeasuredAt = null, PingStatus = "Ожидание подключения" };
+        Snapshot = Snapshot with { Ping = null, Jitter = null, Server = "", ServerName = "", Adapter = "", Query = "", MapName = "", MapMeasuredAt = null, ConnectionId = null, PingStatus = "Ожидание подключения" };
     }
 
     private void Tick()
@@ -124,9 +124,9 @@ internal sealed class PerformanceMonitor : IDisposable
             {
                 ResetConnection();
                 connection = found;
+                if (found is not null)
+                    Snapshot = Snapshot with { Server = found.Server.ToString(), Adapter = found.Adapter, ConnectionId = Guid.NewGuid() };
             }
-            if (found is not null)
-                Snapshot = Snapshot with { Server = found.Server.ToString(), Adapter = found.Adapter };
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (Exception ex)

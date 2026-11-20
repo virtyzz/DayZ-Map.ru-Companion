@@ -38,6 +38,7 @@ var tests = new (string Name, Action Run)[]
     ("Window capture rejects stale frames and respects cancellation", WindowCaptureTests.FreshnessAndCancellation),
     ("Window capture reads covered content and recovers after restore", WindowCaptureTests.CapturesCoveredWindowAndRecovers),
     ("Player position resolves server maps and preserves privacy", PlayerPositionSharingTests.MapResolutionAndPrivacy),
+    ("Player position requires a fresh confirmation for GPS jumps", PlayerPositionSharingTests.GpsJumpsRequireConfirmation),
     ("Player position acknowledgement releases bridge lock before notifying", PlayerPositionSharingTests.AcknowledgementReleasesBridgeLock),
     ("Updater cleanup removes completed attempts and preserves active handoff", UpdateTests.CleanupPreservesActiveAttempts),
     ("Updater verifies downloads and supports cancellation", UpdateTests.DownloadsAreVerified),

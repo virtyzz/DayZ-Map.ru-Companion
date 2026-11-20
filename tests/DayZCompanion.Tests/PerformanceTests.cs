@@ -97,6 +97,7 @@ internal static class PerformanceTests
         for (var i = 0; i < 100; i++) data.Add(new(123, local, remote, 50003, 2218, true));
         var selected = DayZConnectionProbe.SelectConnection(data, 123);
         Check(selected?.Server.Port == 2206 && selected.LocalAddress.Equals(local), "Unrelated or one-way UDP flow selected");
+        Check(selected?.LocalPort == 50001, "Local port was lost, so reconnects to the same server cannot be distinguished");
         Check(DayZConnectionProbe.SelectConnection(data, 456) is null, "Disconnected process has a server");
     }
 

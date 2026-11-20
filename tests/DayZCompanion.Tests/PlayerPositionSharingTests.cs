@@ -2,6 +2,30 @@ using CrosshairMarker;
 
 internal static class PlayerPositionSharingTests
 {
+    public static void GpsJumpsRequireConfirmation()
+    {
+        var previous = new PlayerPosition(1000, 100, 1000, DateTimeOffset.UnixEpoch);
+        var normal = previous with { X = 1180, Z = 1070, MeasuredAt = previous.MeasuredAt.AddSeconds(5) };
+        Check(!PlayerPositionTrackingController.RequiresConfirmation(previous, normal), "Normal vehicle movement required confirmation");
+        Check(!PlayerPositionTrackingController.RequiresConfirmation(previous, normal with { Y = 2500 }), "Altitude was used for the map jump check");
+
+        var jump = normal with { X = 8000, Z = 9000 };
+        Check(PlayerPositionTrackingController.RequiresConfirmation(previous, jump), "A valid-looking OCR jump was accepted on the first frame");
+        Check(PlayerPositionTrackingController.RequiresConfirmation(previous, jump with { MeasuredAt = previous.MeasuredAt.AddMinutes(5) }),
+            "A long sampling interval disabled the jump check");
+
+        var corrected = normal with { MeasuredAt = normal.MeasuredAt.AddSeconds(1) };
+        var confirmed = corrected with { X = jump.X + 30, Z = jump.Z };
+        var different = corrected with { X = 2000, Z = 8200 };
+        Check(PlayerPositionTrackingController.ResolveConfirmation(previous, jump, corrected) == corrected, "A corrected OCR reading was discarded");
+        Check(PlayerPositionTrackingController.ResolveConfirmation(previous, jump, confirmed) == confirmed, "A confirmed relocation was discarded");
+        Check(PlayerPositionTrackingController.ResolveConfirmation(previous, jump, different) is null, "Conflicting readings confirmed a relocation");
+        Check(PlayerPositionTrackingController.ResolveConfirmation(previous, jump, jump) is null, "The same frame confirmed a relocation");
+        Check(PlayerPositionTrackingController.ResolveConfirmation(previous, jump, confirmed with { MeasuredAt = jump.MeasuredAt.AddSeconds(6) }) is null,
+            "A late second reading confirmed a relocation");
+        Check(PlayerPositionTrackingController.ResolveConfirmation(previous, jump, null) is null, "A missing second reading confirmed a relocation");
+    }
+
     public static void AcknowledgementReleasesBridgeLock()
     {
         var bridge = new PlayerPositionMapBridge();

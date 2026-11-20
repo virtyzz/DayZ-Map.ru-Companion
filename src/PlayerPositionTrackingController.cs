@@ -45,6 +45,8 @@ internal sealed class PlayerPositionTrackingController : IDisposable
     }
     private async Task RunAsync(CancellationTokenSource owner, CancellationToken token)
     {
+        (string Server, Guid? ConnectionId, string MapId)? lastSource = null;
+        PlayerPosition? lastPosition = null;
         try
         {
             while (!token.IsCancellationRequested)
@@ -55,27 +57,37 @@ internal sealed class PlayerPositionTrackingController : IDisposable
                 try
                 {
                     var session = bridge.GetSession();
-                    var server = getServer?.Invoke();
-                    var map = session is null ? null : PlayerPositionMapResolver.Resolve(session, server ?? new PerformanceSnapshot());
-                    if (session is null || map is null)
+                    var server = getServer?.Invoke() ?? new PerformanceSnapshot();
+                    if (session is null)
                     {
                         throw new DayZCompanionException("Откройте DayZ-Map в браузере — карта будет определена по текущему серверу DayZ.");
                     }
+                    var map = PlayerPositionMapResolver.Resolve(session, server);
+                    var source = (server.Server, server.ConnectionId, map.Id);
+                    if (source != lastSource) lastPosition = null;
+                    lastSource = source;
                     settings.MapId = map.Id;
                     var originalRegion = settings.Clone();
                     var recognized = await capture.CaptureAndRecognizeAsync(settings, map, token);
-                    if (recognized.Position is null) throw new DayZCompanionException(recognized.Message);
+                    PlayerPosition? position = recognized.Position ?? throw new DayZCompanionException(recognized.Message);
+                    if (lastPosition is { } previous && RequiresConfirmation(previous, position))
+                    {
+                        var retry = await capture.CaptureAndRecognizeAsync(settings, map, token);
+                        position = ResolveConfirmation(previous, position, retry.Position);
+                    }
+                    token.ThrowIfCancellationRequested();
                     var current = getSettings();
-                    if (current.HasSameRegion(originalRegion) && !current.RegionRelativeToWindow && settings.RegionRelativeToWindow)
-                        current.CopyRegionFrom(settings);
-                    if (!current.Enabled || current.Paused) continue;
-                    var currentServer = getServer?.Invoke();
-                    if (server?.Server != currentServer?.Server) continue;
-                    if (PlayerPositionMapResolver.Resolve(session, currentServer ?? new PerformanceSnapshot()).Id != map.Id) continue;
+                    if (!current.Enabled || current.Paused || !current.HasSameRegion(originalRegion)) continue;
+                    var currentServer = getServer?.Invoke() ?? new PerformanceSnapshot();
+                    if (server.Server != currentServer.Server || server.ConnectionId != currentServer.ConnectionId) continue;
+                    if (PlayerPositionMapResolver.Resolve(session, currentServer).Id != map.Id) continue;
+                    if (!current.RegionRelativeToWindow && settings.RegionRelativeToWindow) current.CopyRegionFrom(settings);
                     current.MapId = map.Id;
                     settings = current;
-                    bridge.Queue(settings, recognized.Position, currentServer);
-                    settings.LastX = recognized.Position.X; settings.LastY = recognized.Position.Y; settings.LastZ = recognized.Position.Z;
+                    if (position is null) throw new DayZCompanionException("Скачок координат не подтвердился при повторном считывании.");
+                    bridge.Queue(settings, position, currentServer);
+                    lastPosition = position;
+                    settings.LastX = position.X; settings.LastY = position.Y; settings.LastZ = position.Z;
                     settings.LastError = ""; settings.ConsecutiveErrors = 0;
                     lastLoggedError = "";
                 }
@@ -121,5 +133,32 @@ internal sealed class PlayerPositionTrackingController : IDisposable
             }
         }
     }
+
+    internal static bool RequiresConfirmation(PlayerPosition previous, PlayerPosition candidate)
+    {
+        var seconds = Math.Clamp((candidate.MeasuredAt - previous.MeasuredAt).TotalSeconds, 0, 10);
+        // Allow HUD rounding and vehicle movement. Cap the allowance so a long
+        // interval cannot make a single bad OCR reading look credible.
+        return HorizontalDistance(previous, candidate) > 50 + 45 * seconds;
+    }
+
+    internal static PlayerPosition? ResolveConfirmation(PlayerPosition previous, PlayerPosition candidate, PlayerPosition? retry)
+    {
+        if (retry is null || retry.MeasuredAt <= candidate.MeasuredAt) return null;
+        if (!RequiresConfirmation(previous, retry)) return retry;
+
+        var seconds = (retry.MeasuredAt - candidate.MeasuredAt).TotalSeconds;
+        // Allow movement between reads while requiring both reads to place the
+        // player in the same area.
+        return seconds <= 5 && HorizontalDistance(candidate, retry) <= 15 + 45 * seconds ? retry : null;
+    }
+
+    private static double HorizontalDistance(PlayerPosition first, PlayerPosition second)
+    {
+        var dx = (double)first.X - second.X;
+        var dz = (double)first.Z - second.Z;
+        return Math.Sqrt(dx * dx + dz * dz);
+    }
+
     public void Dispose() => Stop();
 }
