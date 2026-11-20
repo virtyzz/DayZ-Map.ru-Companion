@@ -13,6 +13,7 @@ internal sealed class PerformanceMonitor : IDisposable
     private int? pid;
     private DayZConnection? connection;
     private IPEndPoint? query;
+    private A2sQueryClient? queryClient;
     private bool detecting, pinging, disposed;
     private DateTime nextDetection, nextPing, nextFpsStart;
     private int failures;
@@ -58,6 +59,7 @@ internal sealed class PerformanceMonitor : IDisposable
     {
         connectionLifetime.Cancel();
         connectionLifetime.Dispose();
+        CloseQueryClient();
         connectionLifetime = CancellationTokenSource.CreateLinkedTokenSource(session.Token);
         connection = null;
         query = null;
@@ -142,6 +144,7 @@ internal sealed class PerformanceMonitor : IDisposable
     {
         try
         {
+            var firstReply = queryClient is null;
             A2sReply? result = null;
             if (query is null)
             {
@@ -155,31 +158,42 @@ internal sealed class PerformanceMonitor : IDisposable
                 foreach (var port in ports.Where(p => p is > 0 and <= 65535).Distinct().Take(8))
                 {
                     token.ThrowIfCancellationRequested();
+                    A2sQueryClient? candidate = null;
                     try
                     {
                         var endpoint = new IPEndPoint(target.Server.Address, port);
-                        var reply = await A2sQueryClient.QueryAsync(endpoint, target.LocalAddress, token);
+                        candidate = new A2sQueryClient(endpoint, target.LocalAddress);
+                        var reply = await candidate.QueryAsync(token);
                         // Several DayZ servers can share one IP. Never choose a neighbour's query service.
                         if (reply.GamePort is { } gamePort && gamePort != target.Server.Port) continue;
                         if (settings.QueryPort == 0 && reply.GamePort is null && !steamPorts.Contains(port)) continue;
-                        result = reply;
                         token.ThrowIfCancellationRequested();
+                        result = reply;
                         query = endpoint;
+                        queryClient = candidate;
+                        candidate = null;
                         break;
                     }
                     catch (Exception ex) when (ex is IOException or System.Net.Sockets.SocketException or OperationCanceledException)
                     {
                         token.ThrowIfCancellationRequested();
                     }
+                    finally { candidate?.Dispose(); }
                     await Task.Delay(600, token);
                 }
                 if (result is null) throw new IOException("Сервер не ответил на запрос пинга.");
             }
-            else result = await A2sQueryClient.QueryAsync(query, target.LocalAddress, token);
+            else
+            {
+                queryClient ??= new A2sQueryClient(query, target.LocalAddress);
+                result = await queryClient.QueryAsync(token);
+            }
             token.ThrowIfCancellationRequested();
             failures = 0;
-            Snapshot = Snapshot with { Ping = result.Milliseconds, Jitter = pingStatistics.Add(DateTimeOffset.UtcNow, result.Milliseconds),
-                Query = query!.ToString(), ServerName = result.Name, MapName = result.MapName, MapMeasuredAt = DateTimeOffset.UtcNow,
+            var measuredAt = DateTimeOffset.UtcNow;
+            Snapshot = Snapshot with { Ping = firstReply ? null : result.Milliseconds,
+                Jitter = firstReply ? null : pingStatistics.Add(measuredAt, result.Milliseconds),
+                Query = query!.ToString(), ServerName = result.Name, MapName = result.MapName, MapMeasuredAt = measuredAt,
                 PingStatus = result.Name + " · A2S_INFO · каждую секунду" };
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
@@ -187,6 +201,7 @@ internal sealed class PerformanceMonitor : IDisposable
         {
             if (!token.IsCancellationRequested)
             {
+                CloseQueryClient();
                 failures++;
                 pingStatistics.Clear();
                 Snapshot = Snapshot with { Ping = null, Jitter = null, ServerName = "", MapName = "", MapMeasuredAt = null, PingStatus = query is null ? ex.Message : "Нет ответа от query-порта" };
@@ -209,6 +224,12 @@ internal sealed class PerformanceMonitor : IDisposable
         }
     }
 
+    private void CloseQueryClient()
+    {
+        queryClient?.Dispose();
+        queryClient = null;
+    }
+
     public void Dispose()
     {
         if (disposed) return;
@@ -217,6 +238,7 @@ internal sealed class PerformanceMonitor : IDisposable
         timer.Dispose();
         session.Cancel();
         connectionLifetime.Cancel();
+        CloseQueryClient();
         StopReader();
         session.Dispose();
         connectionLifetime.Dispose();

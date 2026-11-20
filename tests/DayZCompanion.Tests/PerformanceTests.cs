@@ -43,6 +43,7 @@ internal static class PerformanceTests
         using var server = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(8));
         var endpoint = (IPEndPoint)server.Client.LocalEndPoint!;
+        using var client = new A2sQueryClient(endpoint, IPAddress.Loopback);
         var responder = Task.Run(async () =>
         {
             var first = await server.ReceiveAsync(deadline.Token);
@@ -50,13 +51,19 @@ internal static class PerformanceTests
             await server.SendAsync(challenge, first.RemoteEndPoint, deadline.Token);
             var second = await server.ReceiveAsync(deadline.Token);
             Check(second.Buffer.TakeLast(4).SequenceEqual(new byte[] { 1, 2, 3, 4 }), "Challenge was not echoed");
+            Check(second.RemoteEndPoint.Equals(first.RemoteEndPoint), "Challenge changed the source endpoint");
             await server.SendAsync(Reply(), second.RemoteEndPoint, deadline.Token);
+            var next = await server.ReceiveAsync(deadline.Token);
+            Check(next.RemoteEndPoint.Equals(first.RemoteEndPoint), "A new query changed the source endpoint");
+            await server.SendAsync(Reply(), next.RemoteEndPoint, deadline.Token);
         });
-        var reply = await A2sQueryClient.QueryAsync(endpoint, IPAddress.Loopback, deadline.Token);
+        var reply = await client.QueryAsync(deadline.Token);
+        var nextReply = await client.QueryAsync(deadline.Token);
         await responder;
         Check(reply.Name == "Test DayZ" && reply.Milliseconds >= 0, "UDP measurement failed");
+        Check(nextReply.Name == reply.Name, "Follow-up query failed");
         // The same socket stays open and deliberately stops answering.
-        try { await A2sQueryClient.QueryAsync(endpoint, IPAddress.Loopback, deadline.Token); }
+        try { await client.QueryAsync(deadline.Token); }
         catch (OperationCanceledException) when (!deadline.IsCancellationRequested) { return; }
         throw new Exception("Unanswered query did not time out within its own deadline");
     }

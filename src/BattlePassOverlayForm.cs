@@ -1,5 +1,6 @@
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace CrosshairMarker;
@@ -7,6 +8,8 @@ namespace CrosshairMarker;
 internal sealed class BattlePassOverlayForm : Form
 {
     private readonly OverlayWindowWatchdog watchdog;
+    private readonly System.Windows.Forms.Timer visibilityTimer = new() { Interval = 250 };
+    private readonly Func<GameWindowState?> getGameWindow;
     private const int WmNcHitTest = 0x0084;
     private const int WmMouseActivate = 0x0021;
     private const int CollapsedHeight = 52;
@@ -18,6 +21,8 @@ internal sealed class BattlePassOverlayForm : Form
     private BattlePassSnapshot snapshot = new();
     private List<ManualTask> manualTasks = [];
     private bool editing;
+    private int visibilitySuspensions;
+    private Rectangle placementArea;
     private Point dragOrigin;
     private bool dragging;
     private bool resizing;
@@ -48,10 +53,11 @@ internal sealed class BattlePassOverlayForm : Form
     public event Action<BattlePassPage>? ScanRequested;
     public event Action<IReadOnlyList<ManualTask>>? ManualTasksChanged;
     public bool Editing => editing;
+    internal bool BoundToGame => settings.ShowOnlyInGame && !editing;
 
     public bool TryInterceptActionMouseDown(Point screenPoint)
     {
-        if (!Visible) return false;
+        if (!CanInterceptActionAt(screenPoint)) return false;
         var action = HitTestAction(PointToClient(screenPoint));
         if (action is null || (action != "manual:add" && !action.StartsWith("scan:", StringComparison.Ordinal))) return false;
         ArmActionInput();
@@ -65,7 +71,7 @@ internal sealed class BattlePassOverlayForm : Form
         var action = interceptedAction;
         if (action is null) return false;
         interceptedAction = null;
-        if (HitTestAction(PointToClient(screenPoint)) != action)
+        if (!CanInterceptActionAt(screenPoint) || HitTestAction(PointToClient(screenPoint)) != action)
         {
             AppRuntimeLog.Info($"Battle Pass mouse up intercepted outside {action}.");
             return true;
@@ -75,8 +81,14 @@ internal sealed class BattlePassOverlayForm : Form
         return true;
     }
 
-    public BattlePassOverlayForm()
+    private bool CanInterceptActionAt(Point point) => Visible && (!BoundToGame || WindowFromPoint(point) == Handle);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr WindowFromPoint(Point point);
+
+    public BattlePassOverlayForm(Func<GameWindowState?>? getGameWindow = null)
     {
+        this.getGameWindow = getGameWindow ?? GameWindowActivity.GetVisibleDayZWindow;
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
         TopMost = true;
@@ -89,12 +101,17 @@ internal sealed class BattlePassOverlayForm : Form
         MouseMove += OnMouseMove;
         MouseUp += OnMouseUp;
         MouseWheel += (_, e) => ScrollBy(-Math.Sign(e.Delta) * 42);
-        watchdog = new OverlayWindowWatchdog(this, () => Invalidate(true));
+        watchdog = new OverlayWindowWatchdog(this, () => Invalidate(true), () => !BoundToGame);
+        visibilityTimer.Tick += (_, _) => RefreshVisibility();
     }
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) watchdog.Dispose();
+        if (disposing)
+        {
+            visibilityTimer.Dispose();
+            watchdog.Dispose();
+        }
         base.Dispose(disposing);
     }
 
@@ -120,27 +137,74 @@ internal sealed class BattlePassOverlayForm : Form
             manualEditors.Clear();
             manualTasks = nextManualTasks.ToList();
         }
-        var screen = MonitorInfo.ResolveScreen(settings.MonitorDeviceName);
-        var height = settings.OverlayCollapsed ? CollapsedHeight : settings.Height;
-        Bounds = new Rectangle(screen.Bounds.Left + settings.Left, screen.Bounds.Top + settings.Top, settings.Width, height);
-        ConstrainToVirtualDesktop();
+        SetEditing(settings.OverlayEditingEnabled);
         Opacity = settings.Opacity / 255d;
+        RefreshVisibilityPolicy();
         Invalidate();
     }
 
-    public void SetEditing(bool value)
+    private void SetEditing(bool value)
     {
         if (editing == value) return;
         editing = value;
         Cursor = Cursors.Default;
-        RecreateHandle();
+        if (IsHandleCreated) RecreateHandle();
         Invalidate();
     }
 
-    public void RestoreOverlayBounds(Rectangle bounds)
+    public void SuspendVisibility()
     {
-        Bounds = bounds;
-        SyncCurrentBoundsToSettings();
+        visibilitySuspensions++;
+        RefreshVisibilityPolicy();
+    }
+
+    public void ResumeVisibility()
+    {
+        visibilitySuspensions--;
+        RefreshVisibilityPolicy();
+    }
+
+    private void RefreshVisibilityPolicy()
+    {
+        if (IsDisposed) return;
+        visibilityTimer.Enabled = visibilitySuspensions == 0 && settings.OverlayVisible && BoundToGame;
+        RefreshVisibility();
+    }
+
+    private void RefreshVisibility()
+    {
+        if (visibilitySuspensions > 0 || !settings.OverlayVisible)
+        {
+            Hide();
+            return;
+        }
+
+        var game = settings.ShowOnlyInGame ? getGameWindow() : null;
+        if (BoundToGame && game is null)
+        {
+            Hide();
+            return;
+        }
+
+        var topmost = !BoundToGame || GameWindowActivity.IsTopmost(game!.Handle);
+        if (TopMost != topmost) TopMost = topmost;
+        placementArea = game?.ClientBounds ?? MonitorInfo.ResolveScreen(settings.MonitorDeviceName).Bounds;
+        var width = settings.Width;
+        var height = settings.OverlayCollapsed ? CollapsedHeight : settings.Height;
+        var left = settings.Left;
+        var top = settings.Top;
+        if (BoundToGame)
+        {
+            width = Math.Min(width, placementArea.Width);
+            height = Math.Min(height, placementArea.Height);
+            left = Math.Min(left, placementArea.Width - width);
+            top = Math.Min(top, placementArea.Height - height);
+        }
+        var bounds = new Rectangle(placementArea.Left + left, placementArea.Top + top, width, height);
+        if (Bounds != bounds) Bounds = bounds;
+        if (!BoundToGame) ConstrainToVirtualDesktop();
+        if (!Visible) Show();
+        if (BoundToGame && !GameWindowActivity.PlaceAboveGame(this, game!)) Hide();
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -587,9 +651,8 @@ internal sealed class BattlePassOverlayForm : Form
                 SyncCurrentBoundsToSettings();
                 settings.OverlayCollapsed = !settings.OverlayCollapsed;
                 scrollOffset = 0;
-                var location = Location;
-                Height = settings.OverlayCollapsed ? CollapsedHeight : settings.Height;
-                Location = location;
+                if (BoundToGame) RefreshVisibility();
+                else Height = settings.OverlayCollapsed ? CollapsedHeight : settings.Height;
                 Invalidate();
                 SettingsPersistRequested?.Invoke(settings.Clone());
                 return;
@@ -702,8 +765,8 @@ internal sealed class BattlePassOverlayForm : Form
 
     private void SyncCurrentBoundsToSettings()
     {
-        var screen = MonitorInfo.ResolveScreen(settings.MonitorDeviceName);
-        settings.Left = Math.Max(0, Left - screen.Bounds.Left); settings.Top = Math.Max(0, Top - screen.Bounds.Top);
+        if (BoundToGame) return;
+        settings.Left = Math.Max(0, Left - placementArea.Left); settings.Top = Math.Max(0, Top - placementArea.Top);
         settings.Width = Width;
         if (!settings.OverlayCollapsed) settings.Height = Height;
     }

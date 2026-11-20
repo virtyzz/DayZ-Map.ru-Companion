@@ -1952,10 +1952,6 @@ function organizeCrosshairSection() {
     crosshairOpacityLabel.textContent = "Прозрачность перекрестия";
   }
   const proceduralField = byPath("[data-check='ProceduralEnabled']");
-  const proceduralLabel = proceduralField?.querySelector("label");
-  if (proceduralLabel) {
-    proceduralLabel.textContent = String.fromCharCode(1054, 1090, 1086, 1073, 1088, 1072, 1078, 1077, 1085, 1080, 1077, 32, 1087, 1088, 1080, 1094, 1077, 1083, 1072);
-  }
 
   if (!section.querySelector("[data-check='CrosshairEnabled']")) {
     section.insertAdjacentHTML("beforeend", check(crosshairGroup.querySelector(".group-title").textContent, "CrosshairEnabled"));
@@ -2013,7 +2009,10 @@ function renderCrosshair() {
       <button class="action" data-preset="t">T-форма</button>
       <button class="action" data-preset="x">X</button>
     </div>
-    ${check("Процедурный прицел", "ProceduralEnabled")}
+    ${field("Отображение прицела", {
+      value: `<input type="checkbox" data-check="ProceduralEnabled" ${profile().ProceduralEnabled ? "checked" : ""}>`,
+      input: `<label class="field-row"><span>Показывать только в DayZ</span><input type="checkbox" data-general-check="ShowOnlyInGame" ${state.config.ShowOnlyInGame ? "checked" : ""}></label>`
+    })}
     ${slider("Длина", "Length", 1, 80)}
     ${slider("Зазор", "Gap", 0, 50)}
     ${slider("Толщина", "Thickness", 1, 20)}
@@ -2105,7 +2104,7 @@ function renderPerformanceSettings() {
   const monitors = (state.monitors || []).map(m => `<option value="${escapeHtml(m.DeviceName)}" ${m.DeviceName === s.MonitorDeviceName ? "selected" : ""}>${escapeHtml(m.DisplayName)}</option>`).join("");
   return `<h2>Настройки оверлея</h2><div class="control-group">
     <div class="field">${check("Показывать оверлей", "ShowOverlay")}</div>
-    <div class="field">${check("Показывать только в игре", "ShowOnlyInGame")}<div class="limit">Оверлей привязан к окну DayZ, следует за ним и перекрывается другими окнами вместе с игрой. При сворачивании или закрытии игры скрывается. Положение отсчитывается от окна игры. Снимите галочку, чтобы показывать оверлей поверх всех окон, включая закрытую игру.</div></div>
+    <div class="field">${check("Показывать только в DayZ", "ShowOnlyInGame")}<div class="limit">Оверлей привязан к окну DayZ, следует за ним и перекрывается другими окнами вместе с игрой. При сворачивании или закрытии игры скрывается. Положение отсчитывается от окна игры. Снимите галочку, чтобы показывать оверлей поверх всех окон, включая закрытую игру.</div></div>
     <div class="field">${check("Разрешить перемещение и изменение размера", "EditingEnabled")}</div>
     <div class="limit">При включённом перемещении оверлей виден и вне игры для настройки: перетащите окно мышью, а за края — измените размер. После настройки выключите перемещение: клики будут проходить в игру. Положение сохраняется автоматически.</div>
     <div class="field"><label>Монитор<br><select data-performance-select="MonitorDeviceName"><option value="" ${!s.MonitorDeviceName ? "selected" : ""}>Основной монитор</option>${monitors}</select></label></div>
@@ -2312,7 +2311,14 @@ function renderBattlePass() {
     <div class="settings-columns">
     <div class="settings-card">
     <h3>Отображение заданий</h3>
-    ${field("Оверлей", { input: `<label><input type="checkbox" data-bp-check="OverlayVisible" ${s.OverlayVisible ? "checked" : ""}> Показывать</label> <label><input type="checkbox" data-bp-check="ShowCompleted" ${s.ShowCompleted ? "checked" : ""}> Выполненные</label> <label><input type="checkbox" data-bp-check="ShowSeasonal" ${s.ShowSeasonal ? "checked" : ""}> Сезонные</label> <label><input type="checkbox" data-bp-check="ShowTaskDescriptions" ${s.ShowTaskDescriptions ? "checked" : ""}> Показывать описания</label> <label><input type="checkbox" data-bp-check="OverlayEditingEnabled" ${s.OverlayEditingEnabled ? "checked" : ""}> Перемещение и изменение размера</label> <label><input type="checkbox" data-bp-check="SaveDebugScreenshot" ${s.SaveDebugScreenshot ? "checked" : ""}> Сохранять отладочный снимок</label>` })}
+    ${field("Оверлей", { input: `
+      <label><input type="checkbox" data-bp-check="OverlayVisible" ${s.OverlayVisible ? "checked" : ""}> Включить</label>
+      <label><input type="checkbox" data-bp-check="ShowOnlyInGame" ${s.ShowOnlyInGame ? "checked" : ""}> Показывать только в DayZ</label>
+      <label><input type="checkbox" data-bp-check="ShowCompleted" ${s.ShowCompleted ? "checked" : ""}> Выполненные</label>
+      <label><input type="checkbox" data-bp-check="ShowSeasonal" ${s.ShowSeasonal ? "checked" : ""}> Сезонные</label>
+      <label><input type="checkbox" data-bp-check="ShowTaskDescriptions" ${s.ShowTaskDescriptions ? "checked" : ""}> Показывать описания</label>
+      <label><input type="checkbox" data-bp-check="OverlayEditingEnabled" ${s.OverlayEditingEnabled ? "checked" : ""}> Перемещение и изменение размера</label>
+      <label><input type="checkbox" data-bp-check="SaveDebugScreenshot" ${s.SaveDebugScreenshot ? "checked" : ""}> Сохранять отладочный снимок</label>` })}
     </div>
     <div class="settings-card">
     <h3>Размер и оформление</h3>

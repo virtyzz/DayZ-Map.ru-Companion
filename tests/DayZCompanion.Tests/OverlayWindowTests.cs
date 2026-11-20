@@ -70,17 +70,23 @@ internal static class OverlayWindowTests
     }
 
     public static void RecoverTopmost()
+        => RunOnSta(Run, "Overlay recovery failed");
+
+    public static void CrosshairAndQuestsFollowGame()
+        => RunOnSta(TestCrosshairAndQuests, "DayZ-only visibility failed");
+
+    private static void RunOnSta(Action action, string message)
     {
         Exception? failure = null;
         var thread = new Thread(() =>
         {
-            try { Run(); }
+            try { action(); }
             catch (Exception ex) { failure = ex; }
         });
         thread.SetApartmentState(ApartmentState.STA);
         thread.Start();
         thread.Join();
-        if (failure is not null) throw new Exception("Overlay recovery failed", failure);
+        if (failure is not null) throw new Exception(message, failure);
     }
 
     private static void Run()
@@ -88,7 +94,6 @@ internal static class OverlayWindowTests
         using var quests = new BattlePassOverlayForm();
         using var performance = new PerformanceOverlayForm();
         quests.Apply(new BattlePassSettings(), new BattlePassSnapshot());
-        quests.Show();
         performance.Apply(new PerformanceSettings { ShowOverlay = true, Enabled = true, ShowOnlyInGame = false }, new PerformanceSnapshot(Running: true));
         var windows = new System.Windows.Forms.Form[] { quests, performance };
         var bounds = windows.Select(window => window.Bounds).ToArray();
@@ -105,12 +110,12 @@ internal static class OverlayWindowTests
             if (windows[i].Bounds != bounds[i]) throw new Exception("Recovery changed placement");
 
         // Editing recreates the native handles; recovery must still target the new ones.
-        quests.SetEditing(true);
+        quests.Apply(new BattlePassSettings { OverlayEditingEnabled = true }, new BattlePassSnapshot());
         performance.Apply(new PerformanceSettings { ShowOverlay = true, Enabled = true, EditingEnabled = true }, new PerformanceSnapshot(Running: true));
         foreach (var window in windows) SetWindowPos(window.Handle, new IntPtr(-2), 0, 0, 0, 0, 0x13);
         PumpUntil(() => windows.All(IsTopmost));
 
-        quests.Hide(); // OCR temporarily hides this form without changing the saved visibility setting.
+        quests.SuspendVisibility();
         performance.Apply(new PerformanceSettings { ShowOverlay = false }, new PerformanceSnapshot());
         var until = Stopwatch.StartNew();
         while (until.ElapsedMilliseconds < 3300)
@@ -119,6 +124,59 @@ internal static class OverlayWindowTests
             if (windows.Any(window => window.Visible)) throw new Exception("Watchdog resurrected a hidden overlay");
             Thread.Sleep(15);
         }
+    }
+
+    private static void TestCrosshairAndQuests()
+    {
+        using var game = new System.Windows.Forms.Form { Bounds = new System.Drawing.Rectangle(120, 120, 700, 450) };
+        game.Show();
+        var available = false;
+        GameWindowState? FindGame() => available ? GameWindowActivity.GetVisibleWindowState(game.Handle) : null;
+        using var crosshair = new OverlayForm(FindGame);
+        using var quests = new BattlePassOverlayForm(FindGame);
+        var config = new AppConfig { ShowOnlyInGame = true };
+        var settings = new BattlePassSettings { ShowOnlyInGame = true };
+        crosshair.ApplySettings(config.Clone());
+        quests.Apply(settings.Clone(), new BattlePassSnapshot());
+        if (crosshair.Visible || quests.Visible) throw new Exception("An overlay was visible without a game window");
+
+        available = true;
+        PumpUntil(() => crosshair.Visible && quests.Visible);
+        using var other = new System.Windows.Forms.Form();
+        other.Show(); other.Activate();
+        var foreground = GetForegroundWindow();
+        IntPtr Below(IntPtr window) => GetWindow(window, 2);
+        PumpUntil(() => (Below(crosshair.Handle) == quests.Handle && Below(quests.Handle) == game.Handle)
+            || (Below(quests.Handle) == crosshair.Handle && Below(crosshair.Handle) == game.Handle));
+        var order = Below(quests.Handle);
+        game.Location = new System.Drawing.Point(180, 190);
+        var client = FindGame()!.ClientBounds;
+        PumpUntil(() => crosshair.Left == client.Left + (client.Width - crosshair.Width) / 2
+            && quests.Left == client.Left + settings.Left);
+        if (Below(quests.Handle) != order || IsTopmost(crosshair) || IsTopmost(quests) || GetForegroundWindow() != foreground)
+            throw new Exception("Game-bound overlays changed their order, became globally topmost or stole focus");
+
+        quests.SuspendVisibility();
+        quests.Apply(settings, new BattlePassSnapshot());
+        if (quests.Visible) throw new Exception("Applying settings exposed the overlay during capture");
+        quests.ResumeVisibility();
+        if (!quests.Visible) throw new Exception("The quest overlay did not resume after capture");
+
+        game.WindowState = System.Windows.Forms.FormWindowState.Minimized;
+        PumpUntil(() => !crosshair.Visible && !quests.Visible);
+        settings.OverlayEditingEnabled = true;
+        quests.Apply(settings, new BattlePassSnapshot());
+        if (!quests.Visible) throw new Exception("The quest overlay could not be positioned outside the game");
+        settings.OverlayEditingEnabled = false;
+        quests.Apply(settings, new BattlePassSnapshot());
+        if (quests.Visible) throw new Exception("The quest overlay stayed visible after positioning ended");
+
+        config.ShowOnlyInGame = false;
+        settings.ShowOnlyInGame = false;
+        crosshair.ApplySettings(config);
+        quests.Apply(settings, new BattlePassSnapshot());
+        if (!crosshair.Visible || !quests.Visible || !IsTopmost(crosshair) || !IsTopmost(quests))
+            throw new Exception("Disabling the option did not restore desktop overlays");
     }
 
     private static bool IsTopmost(System.Windows.Forms.Form window) => (GetWindowLong(window.Handle, -20) & 8) != 0;

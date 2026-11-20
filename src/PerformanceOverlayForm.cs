@@ -9,6 +9,7 @@ internal sealed class PerformanceOverlayForm : Form
     private PerformanceSettings settings = new();
     private bool adjusting;
     private bool rendering;
+    internal bool BoundToGame => settings.ShowOnlyInGame && !settings.EditingEnabled;
     public event Action<PerformanceOverlayPlacement>? PlacementChanged;
 
     public PerformanceOverlayForm(Func<GameWindowState?>? getGameWindow = null)
@@ -22,7 +23,7 @@ internal sealed class PerformanceOverlayForm : Form
         MaximumSize = new Size(1200, 500);
         DoubleBuffered = true;
         ResizeRedraw = true;
-        watchdog = new OverlayWindowWatchdog(this, RenderOverlay, () => !settings.ShowOnlyInGame || settings.EditingEnabled);
+        watchdog = new OverlayWindowWatchdog(this, RenderOverlay, () => !BoundToGame);
         visibilityTimer.Tick += (_, _) => RefreshVisibility();
     }
 
@@ -46,7 +47,7 @@ internal sealed class PerformanceOverlayForm : Form
         settings.Normalize();
         snapshot = value;
         if (modeChanged && IsHandleCreated) RecreateHandle();
-        visibilityTimer.Enabled = settings.ShowOverlay && settings.Enabled && settings.ShowOnlyInGame && !settings.EditingEnabled;
+        visibilityTimer.Enabled = settings.ShowOverlay && settings.Enabled && BoundToGame;
         RefreshVisibility();
         RenderOverlay();
     }
@@ -56,7 +57,7 @@ internal sealed class PerformanceOverlayForm : Form
         if (IsDisposed) return;
         // Editing is an explicit preview so the user can position the overlay
         // from the settings window without switching back to the game.
-        var boundToGame = settings.ShowOnlyInGame && !settings.EditingEnabled;
+        var boundToGame = BoundToGame;
         var game = settings.ShowOnlyInGame ? getGameWindow() : null;
         if (settings.ShowOverlay && (settings.EditingEnabled || (settings.Enabled && (!boundToGame || game is not null))))
         {

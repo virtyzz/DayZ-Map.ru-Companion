@@ -6,6 +6,7 @@ namespace CrosshairMarker;
 internal sealed class AppConfig
 {
     public bool OverlayVisible { get; set; } = true;
+    public bool ShowOnlyInGame { get; set; }
     public bool StartWithWindows { get; set; }
     public bool StartMinimizedToTray { get; set; } = true;
     public string? TargetMonitorDeviceName { get; set; }
@@ -97,6 +98,7 @@ internal sealed class AppConfig
     public AppConfig Clone() => new()
     {
         OverlayVisible = OverlayVisible,
+        ShowOnlyInGame = ShowOnlyInGame,
         StartWithWindows = StartWithWindows,
         StartMinimizedToTray = StartMinimizedToTray,
         TargetMonitorDeviceName = TargetMonitorDeviceName,

@@ -57,6 +57,20 @@ internal static class EditorRenderingTests
                                 if (!heading || editor.dataset.page !== tab) throw new Error('Empty editor tab: ' + tab);
                                 result.push({ tab, heading });
                             }
+                            for (const [tab, selector, readValue] of [
+                                ['crosshair', '[data-general-check="ShowOnlyInGame"]', () => state.config.ShowOnlyInGame],
+                                ['tasks', '[data-bp-check="ShowOnlyInGame"]', () => state.battlePass.settings.ShowOnlyInGame],
+                                ['performance-settings', '[data-performance-check="ShowOnlyInGame"]', () => state.dayZ.settings.Performance.ShowOnlyInGame]
+                            ]) {
+                                window.DayZMapCompanion.openTab(tab);
+                                const checkbox = document.querySelector(selector);
+                                if (checkbox?.closest('label')?.textContent.trim() !== 'Показывать только в DayZ')
+                                    throw new Error('Missing DayZ visibility setting: ' + tab);
+                                const expected = !checkbox.checked;
+                                checkbox.click();
+                                if (readValue() !== expected || document.querySelector(selector).checked !== expected)
+                                    throw new Error('DayZ visibility setting did not update: ' + tab);
+                            }
                             window.DayZMapCompanion.openTab('player-position');
                             if (document.querySelector('[data-position-map], [data-position-auto-map], [data-position-label], [data-position-label-content]'))
                                 throw new Error('Removed position settings are still present');

@@ -58,6 +58,7 @@ internal sealed class ManualTask
 internal sealed class BattlePassSettings
 {
     public bool OverlayVisible { get; set; } = true;
+    public bool ShowOnlyInGame { get; set; }
     public string? MonitorDeviceName { get; set; }
     public int Left { get; set; } = 24;
     public int Top { get; set; } = 160;

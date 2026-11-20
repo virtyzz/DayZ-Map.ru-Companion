@@ -46,7 +46,7 @@ internal static class GameWindowActivity
         return bounds.Width >= 120 && bounds.Height >= 32 ? new(handle, bounds) : null;
     }
 
-    // Keep our window directly above DayZ, below windows that cover the game.
+    // Keep the group of game overlays directly above DayZ, below windows that cover the game.
     // Do not set a foreign owner: its destruction would destroy our HWND too.
     public static bool PlaceAboveGame(Form overlay, GameWindowState game)
     {
@@ -54,11 +54,19 @@ internal static class GameWindowActivity
         var gameTopmost = IsTopmost(game.Handle);
         if (overlay.TopMost != gameTopmost) overlay.TopMost = gameTopmost;
         var previous = GetWindow(game.Handle, 3); // GW_HWNDPREV
-        if (previous == overlay.Handle) return true;
-        if (previous != IntPtr.Zero && !gameTopmost && (GetWindowLongPtr(previous, -20).ToInt64() & 8) != 0)
+        while (previous != IntPtr.Zero && IsTopmost(previous) == gameTopmost)
+        {
+            if (previous == overlay.Handle) return true;
+            if (!IsGameOverlay(Control.FromHandle(previous))) break;
+            previous = GetWindow(previous, 3);
+        }
+        if (previous != IntPtr.Zero && !gameTopmost && IsTopmost(previous))
             previous = IntPtr.Zero; // HWND_TOP preserves the non-topmost band.
         return SetWindowPos(overlay.Handle, previous, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010 | 0x0200);
     }
+
+    private static bool IsGameOverlay(Control? control) => control is
+        OverlayForm { BoundToGame: true } or BattlePassOverlayForm { BoundToGame: true } or PerformanceOverlayForm { BoundToGame: true };
 
     public static bool IsTopmost(IntPtr window) => (GetWindowLongPtr(window, -20).ToInt64() & 8) != 0;
 

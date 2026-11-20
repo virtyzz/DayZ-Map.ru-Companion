@@ -40,14 +40,8 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         config = store.Load();
         if (!AppDistribution.IsMicrosoftStore) StartupManager.SetEnabled(config.StartWithWindows);
         overlay = new OverlayForm();
-        overlay.ApplyMonitor(config.TargetMonitorDeviceName);
-        overlay.ApplyWindowSize(config.OverlayWindowSize);
         overlay.ApplyProfile(config.CurrentProfile);
-
-        if (config.OverlayVisible)
-        {
-            overlay.Show();
-        }
+        overlay.ApplySettings(config);
 
         tray = new TrayController(
             onOpenGeneral: OpenGeneral,
@@ -84,8 +78,6 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         };
         battlePassOverlay.ScanRequested += page => ScanBattlePass(page);
         ApplyBattlePassOverlay();
-        battlePassOverlay.SetEditing(battlePassSettings.OverlayEditingEnabled);
-        if (battlePassSettings.OverlayVisible) battlePassOverlay.Show();
         RegisterConfiguredHotkeys();
         dayZSettingsStore = new DayZCompanionSettingsStore();
         dayZSettings = dayZSettingsStore.Load();
@@ -168,15 +160,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
     private void ToggleOverlay()
     {
         config.OverlayVisible = !config.OverlayVisible;
-        if (config.OverlayVisible)
-        {
-            overlay.Show();
-        }
-        else
-        {
-            overlay.Hide();
-        }
-
+        overlay.ApplySettings(config);
         store.SaveAtomic(config);
     }
 
@@ -221,11 +205,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
 
     private void ToggleBattlePassEditing()
     {
-        if (!battlePassOverlay.Visible)
-        {
-            battlePassSettings.OverlayVisible = true;
-            SaveBattlePassSettings(battlePassSettings);
-        }
+        battlePassSettings.OverlayVisible = true;
         battlePassSettings.OverlayEditingEnabled = !battlePassSettings.OverlayEditingEnabled;
         SaveBattlePassSettings(battlePassSettings);
     }
@@ -234,15 +214,12 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
     {
         var editorWasVisible = hideEditor && editor is { Visible: true };
         if (editorWasVisible) editor?.Hide();
-        var wasVisible = battlePassOverlay.Visible;
-        var originalBounds = battlePassOverlay.Bounds;
-        if (wasVisible) battlePassOverlay.Hide();
+        battlePassOverlay.SuspendVisibility();
         try
         {
             await Task.Delay(editorWasVisible ? 350 : 120);
             var result = await battlePassTracker.ScanAsync(requestedPage ?? battlePassSettings.CapturePage, battlePassSettings);
             ApplyBattlePassOverlay();
-            battlePassOverlay.RestoreOverlayBounds(originalBounds);
             if (!result.Success)
             {
                 MessageBox.Show(result.Message, "Battle Pass", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -255,16 +232,12 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         }
         finally
         {
+            battlePassOverlay.ResumeVisibility();
             if (editorWasVisible && editor is { IsDisposed: false })
             {
                 editor.ApplyBattlePassState(battlePassSettings, battlePassStore.LoadSnapshot());
                 editor.Show();
                 editor.Activate();
-            }
-            if (wasVisible && battlePassSettings.OverlayVisible)
-            {
-                battlePassOverlay.Show();
-                battlePassOverlay.Refresh();
             }
         }
     }
@@ -275,9 +248,6 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         battlePassSettings.Normalize();
         battlePassStore.SaveSettings(battlePassSettings);
         ApplyBattlePassOverlay();
-        battlePassOverlay.SetEditing(battlePassSettings.OverlayEditingEnabled);
-        if (battlePassSettings.OverlayVisible && !battlePassOverlay.Visible) battlePassOverlay.Show();
-        if (!battlePassSettings.OverlayVisible && battlePassOverlay.Visible) battlePassOverlay.Hide();
         editor?.ApplyBattlePassState(battlePassSettings, battlePassStore.LoadSnapshot());
     }
 
@@ -315,8 +285,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
 
     private void CalibrateBattlePassZones()
     {
-        var wasVisible = battlePassOverlay.Visible;
-        if (wasVisible) battlePassOverlay.Hide();
+        battlePassOverlay.SuspendVisibility();
         try
         {
             using var screenshot = battlePassTracker.CaptureCalibrationImage(battlePassSettings);
@@ -331,14 +300,13 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         }
         finally
         {
-            if (wasVisible && battlePassSettings.OverlayVisible) battlePassOverlay.Show();
+            battlePassOverlay.ResumeVisibility();
         }
     }
 
     private void PreviewBattlePassZones()
     {
-        var wasVisible = battlePassOverlay.Visible;
-        if (wasVisible) battlePassOverlay.Hide();
+        battlePassOverlay.SuspendVisibility();
         try
         {
             battlePassTracker.CreateZonesPreview(battlePassSettings);
@@ -351,7 +319,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         }
         finally
         {
-            if (wasVisible && battlePassSettings.OverlayVisible) battlePassOverlay.Show();
+            battlePassOverlay.ResumeVisibility();
         }
     }
 
@@ -417,15 +385,15 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         editor.ConfigChanged += nextConfig =>
         {
             var startupChanged = config.StartWithWindows != nextConfig.StartWithWindows;
+            nextConfig.OverlayVisible = config.OverlayVisible;
             config = nextConfig;
             config.Normalize();
             if (startupChanged)
             {
                 StartupManager.SetEnabled(config.StartWithWindows);
             }
-            overlay.ApplyMonitor(config.TargetMonitorDeviceName);
-            overlay.ApplyWindowSize(config.OverlayWindowSize);
             overlay.ApplyProfile(config.CurrentProfile);
+            overlay.ApplySettings(config);
             RegisterConfiguredHotkeys();
             store.SaveAtomic(config);
             editor?.ApplyExternalConfig(config);

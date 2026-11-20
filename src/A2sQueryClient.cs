@@ -9,21 +9,33 @@ namespace CrosshairMarker;
 
 internal sealed record A2sReply(double Milliseconds, string Name, int? GamePort, string MapName = "");
 
-internal static class A2sQueryClient
+internal sealed class A2sQueryClient : IDisposable
 {
     private static readonly byte[] Request = [255, 255, 255, 255, 0x54, .. Encoding.ASCII.GetBytes("Source Engine Query\0")];
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(4) };
+    private readonly UdpClient udp;
 
-    public static async Task<A2sReply> QueryAsync(IPEndPoint endpoint, IPAddress local, CancellationToken cancellationToken)
+    public A2sQueryClient(IPEndPoint endpoint, IPAddress local)
+    {
+        udp = new UdpClient(new IPEndPoint(local, 0));
+        try { udp.Connect(endpoint); }
+        catch
+        {
+            udp.Dispose();
+            throw;
+        }
+    }
+
+    public void Dispose() => udp.Dispose();
+
+    public async Task<A2sReply> QueryAsync(CancellationToken cancellationToken)
     {
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         deadline.CancelAfter(1400);
-        using var udp = new UdpClient(new IPEndPoint(local, 0));
-        udp.Connect(endpoint);
         byte[] request = Request;
+        var start = Stopwatch.GetTimestamp();
         for (var attempt = 0; attempt < 3; attempt++)
         {
-            var start = Stopwatch.GetTimestamp();
             await udp.SendAsync(request, deadline.Token);
             var packet = (await udp.ReceiveAsync(deadline.Token)).Buffer;
             var elapsed = Stopwatch.GetElapsedTime(start).TotalMilliseconds;

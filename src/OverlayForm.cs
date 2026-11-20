@@ -14,13 +14,18 @@ internal sealed class OverlayForm : Form
     private const int WS_EX_NOACTIVATE = 0x08000000;
 
     private readonly System.Windows.Forms.Timer watchdogTimer = new();
+    private readonly System.Windows.Forms.Timer visibilityTimer = new() { Interval = 250 };
+    private readonly Func<GameWindowState?> getGameWindow;
     private CrosshairProfile profile = CrosshairProfile.Default();
     private string? targetMonitorDeviceName;
     private OverlayWindowSize windowSize = OverlayWindowSize.Compact200;
     private DateTime lastWatchdogLogUtc = DateTime.MinValue;
+    private bool showOverlay;
+    internal bool BoundToGame { get; private set; }
 
-    public OverlayForm()
+    public OverlayForm(Func<GameWindowState?>? getGameWindow = null)
     {
+        this.getGameWindow = getGameWindow ?? GameWindowActivity.GetVisibleDayZWindow;
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
         TopMost = true;
@@ -29,6 +34,7 @@ internal sealed class OverlayForm : Form
         ResizeRedraw = true;
         watchdogTimer.Interval = 15000;
         watchdogTimer.Tick += OnWatchdogTick;
+        visibilityTimer.Tick += (_, _) => RefreshVisibility();
         SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
     }
 
@@ -53,24 +59,41 @@ internal sealed class OverlayForm : Form
         }
     }
 
-    public void ApplyMonitor(string? deviceName)
+    public void ApplySettings(AppConfig config)
     {
-        targetMonitorDeviceName = deviceName;
-        if (IsHandleCreated)
-        {
-            PinToDesktop();
-            UpdateLayeredBitmap();
-        }
+        targetMonitorDeviceName = config.TargetMonitorDeviceName;
+        windowSize = config.OverlayWindowSize;
+        showOverlay = config.OverlayVisible;
+        BoundToGame = config.ShowOnlyInGame;
+        visibilityTimer.Enabled = showOverlay && BoundToGame;
+        RefreshVisibility();
+        if (!Visible) return;
+        if (!BoundToGame) SetOverlayTopmost();
+        UpdateLayeredBitmap();
     }
 
-    public void ApplyWindowSize(OverlayWindowSize nextWindowSize)
+    private void RefreshVisibility()
     {
-        windowSize = nextWindowSize;
-        if (IsHandleCreated)
+        if (!showOverlay)
         {
-            PinToDesktop();
-            UpdateLayeredBitmap();
+            Hide();
+            return;
         }
+
+        var game = BoundToGame ? getGameWindow() : null;
+        if (BoundToGame && game is null)
+        {
+            Hide();
+            return;
+        }
+
+        var topmost = game is null || GameWindowActivity.IsTopmost(game.Handle);
+        if (TopMost != topmost) TopMost = topmost;
+        var area = game?.ClientBounds ?? MonitorInfo.ResolveScreen(targetMonitorDeviceName).Bounds;
+        var bounds = GetOverlayBounds(area);
+        if (Bounds != bounds) Bounds = bounds;
+        if (!Visible) { Show(); UpdateLayeredBitmap(); }
+        if (game is not null && !GameWindowActivity.PlaceAboveGame(this, game)) Hide();
     }
 
     protected override void OnShown(EventArgs e)
@@ -78,8 +101,6 @@ internal sealed class OverlayForm : Form
         base.OnShown(e);
         watchdogTimer.Start();
         AppRuntimeLog.Info("Overlay shown.");
-        PinToDesktop();
-        UpdateLayeredBitmap();
     }
 
     protected override void OnVisibleChanged(EventArgs e)
@@ -115,9 +136,8 @@ internal sealed class OverlayForm : Form
 
         try
         {
-            var screen = MonitorInfo.ResolveScreen(targetMonitorDeviceName);
             using var bitmap = CrosshairRenderer.RenderBitmap(ClientSize, profile);
-            ClearOutsideWorkingArea(bitmap, screen);
+            if (!BoundToGame) ClearOutsideWorkingArea(bitmap, MonitorInfo.ResolveScreen(targetMonitorDeviceName));
             ApplyLayeredBitmap(bitmap);
         }
         catch (Exception ex)
@@ -180,16 +200,8 @@ internal sealed class OverlayForm : Form
         }
     }
 
-    private void PinToDesktop()
+    private Rectangle GetOverlayBounds(Rectangle bounds)
     {
-        var screen = MonitorInfo.ResolveScreen(targetMonitorDeviceName);
-        Bounds = GetOverlayBounds(screen);
-        SetOverlayTopmost();
-    }
-
-    private Rectangle GetOverlayBounds(Screen screen)
-    {
-        var bounds = screen.Bounds;
         var scale = windowSize switch
         {
             OverlayWindowSize.QuarterScreen => 0.25,
@@ -201,12 +213,13 @@ internal sealed class OverlayForm : Form
 
         if (scale == 0.0)
         {
-            const int compactSize = 200;
+            var compactWidth = Math.Min(bounds.Width, 200);
+            var compactHeight = Math.Min(bounds.Height, 200);
             return new Rectangle(
-                bounds.Left + (bounds.Width - compactSize) / 2,
-                bounds.Top + (bounds.Height - compactSize) / 2,
-                compactSize,
-                compactSize);
+                bounds.Left + (bounds.Width - compactWidth) / 2,
+                bounds.Top + (bounds.Height - compactHeight) / 2,
+                compactWidth,
+                compactHeight);
         }
 
         var width = Math.Max(1, (int)Math.Round(bounds.Width * scale));
@@ -227,7 +240,7 @@ internal sealed class OverlayForm : Form
             Top,
             Width,
             Height,
-            NativeMethods.SWP_NOACTIVATE | NativeMethods.SWP_SHOWWINDOW))
+            NativeMethods.SWP_NOACTIVATE))
         {
             AppRuntimeLog.Info($"SetWindowPos failed. Win32Error={Marshal.GetLastWin32Error()}.");
         }
@@ -238,19 +251,19 @@ internal sealed class OverlayForm : Form
         if (IsHandleCreated)
         {
             AppRuntimeLog.Info("Display settings changed; refreshing overlay.");
-            PinToDesktop();
-            UpdateLayeredBitmap();
+            RefreshVisibility();
+            if (Visible) UpdateLayeredBitmap();
         }
     }
 
     private void OnWatchdogTick(object? sender, EventArgs e)
     {
-        if (!Visible || !IsHandleCreated)
+        if (!Visible || !IsHandleCreated || BoundToGame)
         {
             return;
         }
 
-        var expectedBounds = GetOverlayBounds(MonitorInfo.ResolveScreen(targetMonitorDeviceName));
+        var expectedBounds = GetOverlayBounds(MonitorInfo.ResolveScreen(targetMonitorDeviceName).Bounds);
         if (Bounds != expectedBounds)
         {
             AppRuntimeLog.Info($"Overlay bounds drifted from {Bounds} to {expectedBounds}; correcting.");
@@ -261,7 +274,8 @@ internal sealed class OverlayForm : Form
             AppRuntimeLog.Info($"Overlay watchdog refresh. Bounds={Bounds}, profile={profile.Name}.");
         }
 
-        PinToDesktop();
+        RefreshVisibility();
+        SetOverlayTopmost();
         UpdateLayeredBitmap();
     }
 
@@ -271,6 +285,7 @@ internal sealed class OverlayForm : Form
         {
             watchdogTimer.Stop();
             watchdogTimer.Dispose();
+            visibilityTimer.Dispose();
             SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
         }
         base.Dispose(disposing);
@@ -323,7 +338,6 @@ internal sealed class OverlayForm : Form
     {
         public static readonly IntPtr HWND_TOPMOST = new(-1);
         public const uint SWP_NOACTIVATE = 0x0010;
-        public const uint SWP_SHOWWINDOW = 0x0040;
         public const byte AC_SRC_OVER = 0x00;
         public const byte AC_SRC_ALPHA = 0x01;
         public const int ULW_ALPHA = 0x00000002;

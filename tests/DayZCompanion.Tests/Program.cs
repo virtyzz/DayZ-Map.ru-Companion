@@ -45,6 +45,7 @@ var tests = new (string Name, Action Run)[]
     ("Updater window handles installation, failure and restart acknowledgement", UpdateTests.HostShowsUntilRestart),
     ("Quest and performance overlays recover topmost without changing focus or hidden state", OverlayWindowTests.RecoverTopmost),
     ("Performance overlay follows game window, occlusion and minimize state", OverlayWindowTests.PerformanceVisibilityFollowsGame),
+    ("Crosshair and quest overlays follow the DayZ window", OverlayWindowTests.CrosshairAndQuestsFollowGame),
     ("Performance game-only preference defaults and round trips", PerformanceTests.GameOnlySettingRoundTrips),
     ("A2S rejects malformed and foreign responses", PerformanceTests.ParseRejectsWrongGameAndMalformedResponses),
     ("Steam query port matches game endpoint", PerformanceTests.SteamSelectsMatchingGamePort),
