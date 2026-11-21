@@ -44,7 +44,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         overlay.ApplySettings(config);
 
         tray = new TrayController(
-            onOpenGeneral: OpenGeneral,
+            onOpenOverview: OpenOverview,
             onOpenTreasures: OpenTreasureCaptures,
             onOpenPlayerPosition: OpenPlayerPosition,
             onOpenTasks: OpenTasks,
@@ -98,7 +98,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         {
             dayZSettings.Performance.Enabled = false;
             dayZSettingsStore.Save(dayZSettings);
-            if (editor is { } currentEditor && dayZCompanion is { } server) currentEditor.ApplyDayZState(dayZSettings, server.GetStatus());
+            if (editor is { } currentEditor && dayZCompanion is { } server) currentEditor.ApplyDayZState(dayZSettings, server.GetStatus(performanceMonitor.Snapshot.Server));
         };
         performanceMonitor.Changed += snapshot =>
         {
@@ -153,7 +153,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
 
         if (!config.StartMinimizedToTray)
         {
-            OpenEditor();
+            OpenOverview();
         }
     }
 
@@ -325,15 +325,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
 
     private void ApplyBattlePassOverlay() => battlePassOverlay.Apply(battlePassSettings, battlePassStore.LoadSnapshot(), battlePassStore.LoadManualTasks());
 
-    private void OpenEditor()
-    {
-        OpenEditor(null);
-    }
-
-    private void OpenGeneral()
-    {
-        OpenEditor("general");
-    }
+    private void OpenOverview() => OpenEditor("overview");
 
     private void OpenTasks() => OpenEditor("tasks");
 
@@ -369,19 +361,16 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         if (editorWasOpen && editor is not null) editor.QueueTreasureRecognition(capture.Id);
     }
 
-    private void OpenEditor(string? initialTab)
+    private void OpenEditor(string tab)
     {
         if (editor is { IsDisposed: false })
         {
-            if (!string.IsNullOrWhiteSpace(initialTab))
-            {
-                editor.OpenTab(initialTab);
-            }
+            editor.OpenTab(tab);
             editor.Activate();
             return;
         }
 
-        editor = new EditorForm(config, updateService, dayZSettings, dayZCompanion.GetStatus(), battlePassSettings, battlePassStore.LoadSnapshot(), treasureStore, treasureCaptureService, treasureMapBridge, playerPositionMapBridge, playerPositionCaptureService, initialTab);
+        editor = new EditorForm(config, updateService, dayZSettings, dayZCompanion.GetStatus(performanceMonitor.Snapshot.Server), battlePassSettings, battlePassStore.LoadSnapshot(), treasureStore, treasureCaptureService, treasureMapBridge, playerPositionMapBridge, playerPositionCaptureService, tab);
         editor.ConfigChanged += nextConfig =>
         {
             var startupChanged = config.StartWithWindows != nextConfig.StartWithWindows;
@@ -441,9 +430,9 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             playerPositionTracker.Refresh();
             ApplyMeasurementSettings(requestPerformanceElevation);
             performanceOverlay.Apply(dayZSettings.Performance, performanceMonitor.Snapshot);
-            editor?.ApplyDayZState(dayZSettings, dayZCompanion.GetStatus());
+            editor?.ApplyDayZState(dayZSettings, dayZCompanion.GetStatus(performanceMonitor.Snapshot.Server));
         };
-        editor.DayZStatusRequested += () => editor?.ApplyDayZState(dayZSettings, dayZCompanion.GetStatus());
+        editor.DayZStatusRequested += () => editor?.ApplyDayZState(dayZSettings, dayZCompanion.GetStatus(performanceMonitor.Snapshot.Server));
         editor.ApplyPerformanceState(performanceMonitor.Snapshot);
         editor.PlayerPositionRegionRequested += () => editor?.SelectPlayerPositionRegionAsync() ?? Task.CompletedTask;
         editor.BattlePassSettingsChanged += SaveBattlePassSettings;

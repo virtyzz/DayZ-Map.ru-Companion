@@ -24,6 +24,7 @@
     <EmbeddedResource Include="assets\dayz-map-companion.ico" LogicalName="DayZMapCompanion.MainIcon" />
     <EmbeddedResource Include="assets\dayz-map-companion-tray.ico" LogicalName="DayZMapCompanion.TrayIcon" />
     <EmbeddedResource Include="assets\player-position-selection-example.png" LogicalName="DayZMapCompanion.PlayerPositionSelectionExample" />
+    <EmbeddedResource Include="assets\session-map-view.js" LogicalName="DayZMapCompanion.SessionMapView" />
     <Content Include="assets\marker-icons.svg" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="tools\PresentMon-2.6.0-x64.exe" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
     <Content Include="tools\PresentMon-LICENSE.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />

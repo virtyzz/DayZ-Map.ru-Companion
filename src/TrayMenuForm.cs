@@ -17,7 +17,7 @@ internal sealed class TrayMenuForm : Form
     };
 
     public TrayMenuForm(
-        Action onOpenGeneral,
+        Action onOpenOverview,
         Action onOpenTreasures,
         Action onOpenPlayerPosition,
         Action onOpenTasks,
@@ -34,7 +34,7 @@ internal sealed class TrayMenuForm : Form
         Width = MenuWidth;
         Controls.Add(items);
 
-        AddItem("Открыть окно", onOpenGeneral);
+        AddItem("Открыть окно", onOpenOverview);
         AddSeparator();
         AddItem("Позиция игрока", onOpenPlayerPosition);
         AddItem("Клады", onOpenTreasures);

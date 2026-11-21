@@ -90,4 +90,5 @@ internal sealed record PerformanceSnapshot(
     string FpsStatus = "Ожидание DayZ", string PingStatus = "Ожидание подключения",
     double? FrameTime = null, double? OnePercentLow = null, double? Jitter = null, double?[]? FrameTimeHistory = null,
     string HelperStatus = "", bool HelperCanStart = false, bool HelperStarting = false,
-    string MapName = "", DateTimeOffset? MapMeasuredAt = null, string ServerName = "", Guid? ConnectionId = null);
+    string MapName = "", DateTimeOffset? MapMeasuredAt = null, string ServerName = "", Guid? ConnectionId = null,
+    DateTimeOffset? ConnectionMeasuredAt = null);

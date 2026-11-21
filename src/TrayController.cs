@@ -6,7 +6,7 @@ namespace CrosshairMarker;
 internal sealed class TrayController : IDisposable
 {
     private readonly NotifyIcon notifyIcon;
-    private readonly Action onOpenGeneral;
+    private readonly Action onOpenOverview;
     private readonly Action onOpenTreasures;
     private readonly Action onOpenPlayerPosition;
     private readonly Action onOpenTasks;
@@ -15,14 +15,14 @@ internal sealed class TrayController : IDisposable
     private TrayMenuForm? popup;
 
     public TrayController(
-        Action onOpenGeneral,
+        Action onOpenOverview,
         Action onOpenTreasures,
         Action onOpenPlayerPosition,
         Action onOpenTasks,
         Action onOpenCrosshair,
         Action onExit)
     {
-        this.onOpenGeneral = onOpenGeneral;
+        this.onOpenOverview = onOpenOverview;
         this.onOpenTreasures = onOpenTreasures;
         this.onOpenPlayerPosition = onOpenPlayerPosition;
         this.onOpenTasks = onOpenTasks;
@@ -35,7 +35,7 @@ internal sealed class TrayController : IDisposable
             Icon = AppIcons.Tray(),
             Visible = true
         };
-        notifyIcon.DoubleClick += (_, _) => onOpenGeneral();
+        notifyIcon.DoubleClick += (_, _) => onOpenOverview();
         notifyIcon.MouseUp += (_, eventArgs) =>
         {
             if (eventArgs.Button == MouseButtons.Right) ShowPopup();
@@ -53,7 +53,7 @@ internal sealed class TrayController : IDisposable
     {
         popup?.Close();
         popup = new TrayMenuForm(
-            onOpenGeneral,
+            onOpenOverview,
             onOpenTreasures,
             onOpenPlayerPosition,
             onOpenTasks,

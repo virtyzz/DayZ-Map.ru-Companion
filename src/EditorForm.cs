@@ -11,6 +11,7 @@ namespace CrosshairMarker;
 
 internal sealed class EditorForm : Form
 {
+    private const int CaptionStyle = 0x00C00000;
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -25,6 +26,13 @@ internal sealed class EditorForm : Form
     private readonly PlayerPositionMapBridge playerPositionMapBridge;
     private readonly PlayerPositionCaptureService playerPositionCaptureService;
     private readonly WebView2 webView = new();
+    private bool integratedCaption;
+    private bool captionMaximized;
+    private WebView2? sessionMapView;
+    private Task? sessionMapInitialization;
+    private string? sessionMapAddress;
+    private string? requestedSessionMap;
+    private bool sessionMapLoaded;
     private readonly System.Windows.Forms.Timer dayZStatusTimer = new() { Interval = 2500 };
     private AppConfig config;
     private DayZCompanionSettings dayZSettings;
@@ -82,10 +90,11 @@ internal sealed class EditorForm : Form
 
         Text = AppIdentity.DisplayName;
         Icon = AppIcons.MainIcon();
+        ShowIcon = false;
         StartPosition = FormStartPosition.Manual;
         MinimumSize = new Size(1060, 700);
         Size = new Size(1240, 780);
-        BackColor = Color.FromArgb(11, 11, 12);
+        BackColor = Color.FromArgb(20, 24, 27);
 
         var screen = MonitorInfo.ResolveScreen(config.EditorMonitorDeviceName);
         var bounds = EditorWindowPlacement.Normalize(
@@ -118,6 +127,46 @@ internal sealed class EditorForm : Form
         {
             if (webReady && !IsDisposed) DayZStatusRequested?.Invoke();
         };
+    }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var parameters = base.CreateParams;
+            if (integratedCaption) parameters.Style &= ~CaptionStyle;
+            return parameters;
+        }
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        WindowAppearance.ApplyDarkCaption(Handle, BackColor);
+    }
+
+    protected override void WndProc(ref Message message)
+    {
+        var proposedWindow = integratedCaption ? WindowAppearance.GetProposedWindowBounds(message) : null;
+        base.WndProc(ref message);
+        if (!integratedCaption) return;
+        WindowAppearance.SetMaximizedBounds(ref message);
+        if (proposedWindow is { } bounds) WindowAppearance.AdjustCaptionClient(ref message, bounds);
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        var maximized = WindowState == FormWindowState.Maximized;
+        if (!integratedCaption || !webReady || maximized == captionMaximized) return;
+        _ = SendCaptionStateAsync();
+    }
+
+    private async Task SendCaptionStateAsync()
+    {
+        if (!integratedCaption || IsDisposed || webView.CoreWebView2 is not { } core) return;
+        captionMaximized = WindowState == FormWindowState.Maximized;
+        await core.ExecuteScriptAsync($"window.DayZMapCompanion.setWindowMaximized({JsonSerializer.Serialize(captionMaximized)});");
     }
 
     public void OpenTab(string tab)
@@ -171,7 +220,10 @@ internal sealed class EditorForm : Form
         try
         {
             if (webView.CoreWebView2 is { } core)
-                await core.ExecuteScriptAsync($"window.DayZMapCompanion.receivePerformance({JsonSerializer.Serialize(snapshot, JsonOptions)});");
+            {
+                var blocked = GetSessionMarkerImportBlockReason(snapshot, dayZStatus.DayZRunning || snapshot.Running);
+                await core.ExecuteScriptAsync($"window.DayZMapCompanion.receivePerformance({JsonSerializer.Serialize(snapshot, JsonOptions)}, {JsonSerializer.Serialize(blocked, JsonOptions)});");
+            }
         }
         catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException or System.Runtime.InteropServices.COMException)
         {
@@ -263,7 +315,19 @@ internal sealed class EditorForm : Form
             webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
             webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
             webView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
-            webView.CoreWebView2.NavigateToString(GetEditorHtml());
+            var html = GetEditorHtml();
+            try
+            {
+                webView.CoreWebView2.Settings.IsNonClientRegionSupportEnabled = true;
+                html = html.Replace("<body>", "<body class=\"integrated-frame\">", StringComparison.Ordinal);
+                integratedCaption = true;
+                UpdateStyles();
+            }
+            catch (NotImplementedException)
+            {
+                // Older WebView2 runtimes keep the system caption.
+            }
+            webView.CoreWebView2.NavigateToString(html);
         }
         catch (Exception ex)
         {
@@ -278,6 +342,7 @@ internal sealed class EditorForm : Form
 
     private async void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
     {
+        if (e.Source != "about:blank") return;
         try
         {
             using var document = JsonDocument.Parse(e.WebMessageAsJson);
@@ -289,6 +354,7 @@ internal sealed class EditorForm : Form
                 case "ready":
                     webReady = true;
                     var shouldRefreshUpdates = pendingTab == "updates";
+                    await SendCaptionStateAsync();
                     await SendStateAsync();
                     if (shouldRefreshUpdates)
                     {
@@ -321,6 +387,12 @@ internal sealed class EditorForm : Form
                 case "command":
                     await HandleCommandAsync(root.GetProperty("name").GetString());
                     break;
+                case "sessionMap":
+                    await PlaceSessionMapAsync(root);
+                    break;
+                case "copySessionMarker":
+                    await CopySessionMarkerAsync(root);
+                    break;
                 case "manualTask":
                     var manualTask = root.GetProperty("task").Deserialize<ManualTask>(JsonOptions);
                     var action = root.GetProperty("action").GetString();
@@ -344,6 +416,137 @@ internal sealed class EditorForm : Form
         catch (Exception ex)
         {
             await SendErrorAsync(ex.Message);
+        }
+    }
+
+    private static string? SessionMapAddress(string? id) => id switch
+    {
+        "cherno" or "chernarus" or "chernarusplus" => "https://dayz-map.ru/chernarus/",
+        "deerisle" => "https://dayz-map.ru/deer-isle/",
+        "deadfall" => "https://dayz-map.ru/deadfall/",
+        "nasdara" => "https://dayz-map.ru/nasdara/",
+        _ => null
+    };
+
+    private async Task PlaceSessionMapAsync(JsonElement placement)
+    {
+        var map = GetString(placement, "map");
+        var address = SessionMapAddress(map);
+        var bounds = Rectangle.Intersect(webView.ClientRectangle, new Rectangle(
+            placement.GetProperty("left").GetInt32(), placement.GetProperty("top").GetInt32(),
+            placement.GetProperty("width").GetInt32(), placement.GetProperty("height").GetInt32()));
+        if (address is null || bounds.Width < 80 || bounds.Height < 80)
+        {
+            requestedSessionMap = null;
+            if (sessionMapView is not null) sessionMapView.Visible = false;
+            return;
+        }
+
+        requestedSessionMap = address;
+        var view = sessionMapView ??= CreateSessionMapView();
+        view.Bounds = bounds;
+        try
+        {
+            await (sessionMapInitialization ??= InitializeSessionMapAsync(view));
+        }
+        catch (Exception ex)
+        {
+            if (IsDisposed || !ReferenceEquals(sessionMapView, view)) return;
+            view.Dispose();
+            sessionMapView = null;
+            sessionMapInitialization = null;
+            AppRuntimeLog.Error("Embedded DayZ-Map failed to start", ex);
+            if (requestedSessionMap == address) await ReportSessionMapFailureAsync();
+            return;
+        }
+        if (IsDisposed || view.IsDisposed || requestedSessionMap != address) return;
+        if (sessionMapAddress != address)
+        {
+            sessionMapAddress = address;
+            view.Visible = false;
+            view.CoreWebView2.Navigate(address);
+        }
+        else if (sessionMapLoaded)
+        {
+            view.Visible = true;
+        }
+    }
+
+    private WebView2 CreateSessionMapView()
+    {
+        var view = new WebView2 { Visible = false, DefaultBackgroundColor = BackColor, TabStop = true };
+        Controls.Add(view);
+        _ = view.Handle;
+        view.BringToFront();
+        return view;
+    }
+
+    private async Task InitializeSessionMapAsync(WebView2 view)
+    {
+        // The website allows framing only from its own origin. Keep it in a
+        // sibling WebView with no access to the local editor's native commands.
+        await view.EnsureCoreWebView2Async(webView.CoreWebView2.Environment);
+        var core = view.CoreWebView2;
+        core.Settings.IsWebMessageEnabled = false;
+        core.Settings.AreHostObjectsAllowed = false;
+        using var script = typeof(EditorForm).Assembly.GetManifestResourceStream("DayZMapCompanion.SessionMapView")
+            ?? throw new InvalidOperationException("Missing session map presentation.");
+        using var reader = new StreamReader(script);
+        await core.AddScriptToExecuteOnDocumentCreatedAsync(await reader.ReadToEndAsync());
+        ulong currentNavigation = 0;
+        core.NavigationStarting += (_, e) =>
+        {
+            e.Cancel = !Uri.TryCreate(e.Uri, UriKind.Absolute, out var uri)
+                || uri.Scheme != Uri.UriSchemeHttps || !uri.IsDefaultPort || uri.Host != "dayz-map.ru";
+            if (!e.Cancel)
+            {
+                currentNavigation = e.NavigationId;
+                sessionMapLoaded = false;
+            }
+        };
+        core.ContentLoading += (_, e) =>
+        {
+            if (IsDisposed || view.IsDisposed || currentNavigation != e.NavigationId || e.IsErrorPage) return;
+            sessionMapLoaded = true;
+            view.Visible = requestedSessionMap is not null && requestedSessionMap == sessionMapAddress;
+        };
+        core.NavigationCompleted += async (_, e) =>
+        {
+            if (IsDisposed || view.IsDisposed || currentNavigation != e.NavigationId) return;
+            sessionMapLoaded = e.IsSuccess;
+            view.Visible = e.IsSuccess && requestedSessionMap is not null && requestedSessionMap == sessionMapAddress;
+            if (!e.IsSuccess && requestedSessionMap is not null && requestedSessionMap == sessionMapAddress)
+            {
+                sessionMapAddress = null;
+                await ReportSessionMapFailureAsync();
+            }
+        };
+    }
+
+    private async Task ReportSessionMapFailureAsync()
+    {
+        if (!IsDisposed && webView.CoreWebView2 is { } core)
+            await core.ExecuteScriptAsync("window.DayZMapCompanion.sessionMapFailed();");
+    }
+
+    private async Task CopySessionMarkerAsync(JsonElement request)
+    {
+        var marker = request.GetProperty("marker").Deserialize<DayZSessionMarker>(JsonOptions);
+        if (marker is null) return;
+        var text = GetString(request, "action") switch
+        {
+            "coordinates" => FormattableString.Invariant($"{Math.Round(marker.X)} {Math.Round(marker.Z)}"),
+            "name" => marker.Name,
+            _ => null
+        };
+        if (string.IsNullOrEmpty(text)) return;
+        try
+        {
+            Clipboard.SetText(text);
+        }
+        catch (System.Runtime.InteropServices.ExternalException)
+        {
+            await SendErrorAsync("Не удалось скопировать данные метки в буфер обмена.");
         }
     }
 
@@ -430,6 +633,16 @@ internal sealed class EditorForm : Form
             case "openDayZMarkersFolder":
                 OpenDayZMarkersFolder();
                 break;
+            case "exportSessionMarkers":
+                ExportSessionMarkers();
+                break;
+            case "importSessionMarkers":
+                ImportSessionMarkers();
+                DayZStatusRequested?.Invoke();
+                break;
+            case "openSessionMap":
+                Process.Start(new ProcessStartInfo(SessionMapAddress(performanceSnapshot.MapName.ToLowerInvariant()) ?? "https://dayz-map.ru/") { UseShellExecute = true });
+                break;
             case "openRuntimeLog":
                 OpenFileLocation(AppRuntimeLog.FilePath);
                 break;
@@ -490,6 +703,40 @@ internal sealed class EditorForm : Form
             || (!previous.VerticalLayout && current.VerticalLayout)) PerformanceOverlayRenderer.Fit(current, onlyGrow: true);
         dayZSettings = next;
         DayZSettingsChanged?.Invoke(next);
+    }
+
+    private string? GetSessionMarkerImportBlockReason(PerformanceSnapshot snapshot, bool gameRunning) =>
+        DayZMarkersService.GetOfflineImportBlockReason(gameRunning, dayZSettings.BlockWritesWhenDayZRunning, snapshot, DateTimeOffset.UtcNow);
+
+    private void EnsureSessionMarkerImportAllowed()
+    {
+        var reason = GetSessionMarkerImportBlockReason(performanceSnapshot, DayZMarkersService.IsDayZRunning());
+        if (reason is not null) throw new DayZCompanionException(reason);
+    }
+
+    private void ExportSessionMarkers()
+    {
+        var server = DayZMarkersService.IsDayZRunning() ? performanceSnapshot.Server : null;
+        var json = new DayZMarkersService(dayZSettings).BuildExport(server);
+        using var dialog = new SaveFileDialog { Title = "Выгрузить метки из игры", Filter = "Метки DayZ (*.json)|*.json", FileName = "DayZ-Markers.json" };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        if (string.Equals(Path.GetFileName(dialog.FileName), "PrivateMarkers.json", StringComparison.OrdinalIgnoreCase))
+            throw new DayZCompanionException("Выберите другое имя для файла экспорта.");
+        File.WriteAllText(dialog.FileName, json);
+    }
+
+    private void ImportSessionMarkers()
+    {
+        EnsureSessionMarkerImportAllowed();
+        using var dialog = new OpenFileDialog { Title = "Загрузить метки в игру", Filter = "Метки DayZ (*.json)|*.json" };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        var requests = DayZMarkersService.ReadImportRequests(dialog.FileName);
+        EnsureSessionMarkerImportAllowed();
+        var targets = string.Join(", ", requests.Take(4).Select(request => request.Server));
+        if (requests.Count > 4) targets += $" и ещё {requests.Count - 4}";
+        if (MessageBox.Show(this, $"Загрузить метки из файла?\n\nСерверы: {targets}\nМеток: {requests.Sum(request => request.Markers.Count)}\n\nСуществующие метки с тем же UID будут обновлены.",
+            "Загрузить метки в игру", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+        new DayZMarkersService(dayZSettings).ImportBatch(requests, EnsureSessionMarkerImportAllowed);
     }
 
     private async Task ApplyPlayerPositionSettingsFromWebAsync(JsonElement settingsElement)
@@ -671,6 +918,9 @@ internal sealed class EditorForm : Form
     {
         switch (name)
         {
+            case "resize-top" when integratedCaption && WindowState == FormWindowState.Normal:
+                if ((MouseButtons & MouseButtons.Left) != 0) WindowAppearance.BeginTopResize(Handle, Cursor.Position);
+                break;
             case "minimize":
                 WindowState = FormWindowState.Minimized;
                 break;
@@ -680,7 +930,7 @@ internal sealed class EditorForm : Form
                     : FormWindowState.Maximized;
                 break;
             case "close":
-                Close();
+                BeginInvoke(new Action(Close));
                 break;
         }
     }
@@ -745,6 +995,7 @@ internal sealed class EditorForm : Form
             updateProgress = updateService.Progress,
             dayZ = new { settings = dayZSettings, status = dayZStatus },
             performance = performanceSnapshot,
+            markerImportBlockReason = GetSessionMarkerImportBlockReason(performanceSnapshot, dayZStatus.DayZRunning || performanceSnapshot.Running),
             performanceDefaults = new PerformanceSettings(),
             ocr = ocrStatus ??= TesseractOcr.Detect(),
             battlePass = new { settings = battlePassSettings, snapshot = battlePassSnapshot, manualTasks = battlePassStore.LoadManualTasks(), ocr = ocrStatus },
@@ -899,93 +1150,118 @@ internal sealed class EditorForm : Form
 <style>
 :root {
   color-scheme: dark;
-  --bg: #0b0b0c;
-  --chrome: #121214;
-  --surface: #17171a;
-  --raised: #202025;
-  --line: #34343a;
-  --soft: #28282e;
-  --text: #eeeeef;
-  --muted: #9b9ba3;
-  --faint: #6f6f78;
-  --accent: #eeb15b;
+  accent-color: #00e2ed;
+  --bg: #14181b;
+  --chrome: #191d21;
+  --surface: #1c2125;
+  --raised: #283037;
+  --line: #3c474e;
+  --soft: #30393f;
+  --text: #f2f5f6;
+  --muted: #b7c1c6;
+  --faint: #a0adb4;
+  --accent: #00e2ed;
+  --accent-bg: #11363e;
+  --accent-line: #28636b;
+  --accent-ink: #052023;
   --accent-2: #77d6a4;
   --danger: #d25d69;
 }
 * { box-sizing: border-box; }
 body {
   margin: 0;
-  min-width: 980px;
-  min-height: 680px;
+  --caption-space: 0px;
   background: var(--bg);
   color: var(--text);
-  font: 14px/1.45 "Segoe UI", system-ui, sans-serif;
+  font: 14px/1.45 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
   overflow: hidden;
 }
-button, input, select {
-  font: inherit;
-}
-.app {
-  height: 100vh;
-  display: grid;
-  grid-template-rows: 58px 1fr;
-  padding: 14px;
-  gap: 12px;
-}
-.titlebar {
-  display: grid;
-  grid-template-columns: 1fr;
-  align-items: center;
-  background: var(--chrome);
-  border: 1px solid var(--soft);
-  border-radius: 10px;
-  padding: 0 12px 0 18px;
-}
-.brand {
+body.integrated-frame { --caption-space: 32px; }
+body:not(.integrated-frame) .window-caption { display: none; }
+.window-caption {
+  position: fixed;
+  z-index: 40;
+  inset: 0 0 auto;
+  height: var(--caption-space);
   display: flex;
-  align-items: baseline;
-  gap: 10px;
+  justify-content: flex-end;
+  -webkit-app-region: drag;
+  app-region: drag;
 }
-.brand strong {
-  font-size: 18px;
-  letter-spacing: 0;
+.window-caption button {
+  display: grid;
+  place-items: center;
+  width: clamp(46px, 4.15vw, 66px);
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
 }
-.brand span {
-  color: var(--muted);
-  font-size: 12px;
+.window-caption button:hover { background: #ffffff16; }
+.window-caption [data-window-command="close"]:hover { background: #c42b1c; }
+.window-caption svg { width: 16px; height: 16px; }
+.window-top-resize {
+  position: absolute;
+  z-index: 1;
+  inset: 0 6px auto;
+  height: 5px;
+  cursor: ns-resize;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+body.window-maximized .window-top-resize { display: none; }
+.window-caption [data-window-command="maximize"][aria-pressed="true"] .maximize-glyph,
+.window-caption [data-window-command="maximize"][aria-pressed="false"] .restore-glyph { display: none; }
+button, input, select { font: inherit; }
+button:focus-visible, select:focus-visible, input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 .layout {
+  height: 100vh;
+  display: grid;
+  grid-template-columns: clamp(154px, 15vw, 226px) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   min-height: 0;
   min-width: 0;
-  display: grid;
-  grid-template-columns: 250px minmax(460px, 1fr);
-  gap: 12px;
 }
 .layout.with-crosshair-preview {
-  grid-template-columns: 250px minmax(0, 760px) minmax(320px, 1fr);
-  justify-content: start;
+  grid-template-columns: clamp(154px, 15vw, 226px) minmax(0, 820px) minmax(260px, 460px);
 }
-.layout:not(.with-crosshair-preview) .preview-wrap {
-  display: none;
-}
+.layout:not(.with-crosshair-preview) .preview-wrap { display: none; }
 .panel {
   min-height: 0;
   min-width: 0;
   background: var(--surface);
   border: 1px solid var(--soft);
-  border-radius: 10px;
+  border-radius: 8px;
 }
 .sidebar {
-  padding: 14px;
   display: grid;
-  grid-template-rows: 1fr auto;
-  gap: 14px;
+  grid-template-rows: auto minmax(0, 1fr);
+  background: linear-gradient(150deg, #1b1e21, var(--chrome) 65%);
+  border-right: 1px solid var(--soft);
+  gap: clamp(16px, 2vw, 30px);
 }
+.brand {
+  margin: 0 clamp(12px, 1.25vw, 20px);
+  padding: calc(var(--caption-space) + clamp(16px, 2vw, 30px)) 0 clamp(15px, 1.8vw, 27px) 4px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: clamp(15px, 1.55vw, 23px);
+  line-height: 1.12;
+  font-family: "Segoe UI Variable Display", "Segoe UI", sans-serif;
+}
+.brand-icon { width: 29px; height: 35px; flex: none; color: var(--accent); }
+.icon { width: 21px; height: 21px; flex: none; vertical-align: middle; }
 .profile-select, .field select, .field input[type="text"], .number-input {
   width: 100%;
   height: 38px;
   color: var(--text);
-  background: #101014;
+  background: #171c20;
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 0 10px;
@@ -993,49 +1269,48 @@ button, input, select {
 }
 .nav {
   display: grid;
-  gap: 8px;
   align-content: start;
+  gap: 2px;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 .nav button, .action {
-  height: 38px;
+  min-height: 38px;
   border: 1px solid transparent;
-  border-radius: 8px;
+  border-radius: 7px;
   background: transparent;
-  color: var(--muted);
+  color: var(--text);
   text-align: left;
   padding: 0 12px;
   cursor: pointer;
 }
-.nav button.active {
-  background: #2c2419;
-  border-color: #614720;
-  color: var(--accent);
+.nav button {
+  display: flex;
+  align-items: center;
+  gap: clamp(9px, 1.4vw, 21px);
+  min-height: clamp(40px, 3.65vw, 58px);
+  font-size: clamp(15px, 1.4vw, 21px);
+  border: 0;
+  border-left: 3px solid transparent;
+  border-radius: 0;
+  padding: 0 clamp(12px, 1.55vw, 24px);
 }
-.nav button:hover, .action:hover {
-  background: var(--raised);
-  color: var(--text);
+.nav .icon { width: clamp(19px, 1.75vw, 26px); height: clamp(19px, 1.75vw, 26px); }
+.nav button.active, .nav button[aria-expanded="true"].current {
+  border-left-color: var(--accent);
+  background: var(--accent-bg);
 }
-.nav-group {
-  display: grid;
-  gap: 4px;
-}
-.nav-group-toggle, .nav-main {
-  color: var(--text) !important;
-  font-weight: 600;
-}
-.nav-group-toggle span {
-  float: right;
-  color: var(--faint);
-}
-.nav-children {
-  display: grid;
-  gap: 4px;
-  margin-left: 12px;
-  padding-left: 8px;
-  border-left: 1px solid var(--soft);
-}
+.nav button.active .icon, .nav button.current .icon { color: var(--accent); }
+.nav button:hover, .action:hover { background: var(--raised); }
+.nav-group, .nav-children { display: grid; }
+.nav-main, .nav-group-toggle { font-weight: 500; }
+.nav-group-toggle { position: relative; }
+.nav-group-toggle span { position: absolute; right: 14px; color: var(--muted); }
+.nav-group-toggle[aria-expanded="false"]:not(:hover):not(:focus-visible) span { visibility: hidden; }
 .nav-children button {
-  height: 34px !important;
+  min-height: 34px;
+  padding-left: 38px;
+  color: var(--muted);
   font-size: 13px;
 }
 .limit {
@@ -1050,12 +1325,13 @@ button, input, select {
   margin-top: 6px;
 }
 .editor {
-  padding: 14px;
+  container-type: inline-size;
+  margin-top: var(--caption-space);
+  padding: clamp(12px, 1.5vw, 23px);
   overflow: auto;
-}
-.editor.updates-editor {
-  display: flex;
-  overflow: hidden;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
 }
 .section {
   display: none;
@@ -1063,25 +1339,6 @@ button, input, select {
 }
 .section.active {
   display: grid;
-}
-.section.updates-section {
-  flex: 1 1 auto;
-  min-height: 0;
-}
-.updates-layout {
-  height: 100%;
-  min-height: 0;
-  display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
-  gap: 10px;
-}
-.update-notes-slot, .update-notes-slot .field {
-  min-height: 0;
-}
-.update-notes-slot .field {
-  height: 100%;
-  box-sizing: border-box;
-  grid-template-rows: auto minmax(0, 1fr);
 }
 .section h2 {
   margin: 0 0 4px;
@@ -1098,13 +1355,17 @@ button, input, select {
 }
 .treasure-preview {
   display: block;
-  width: min(420px, 100%);
-  max-height: 220px;
+  width: 100%;
+  max-height: 280px;
   object-fit: contain;
-  object-position: left center;
-  margin: 8px 0;
-  border: 1px solid #3d4046;
+}
+.treasure-preview-button {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 1px solid var(--line);
   border-radius: 6px;
+  overflow: hidden;
   background: #090a0c;
   cursor: zoom-in;
 }
@@ -1124,7 +1385,7 @@ button, input, select {
 }
 .field {
   min-width: 0;
-  background: #1d1d21;
+  background: #232a2f;
   border: 1px solid var(--soft);
   border-radius: 8px;
   padding: 10px;
@@ -1175,21 +1436,24 @@ input[type="color"] {
   padding: 3px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #101014;
+  background: #171c20;
 }
-.treasure-destination-grid { display: grid; grid-template-columns: minmax(180px, 420px) minmax(180px, 420px); gap: 8px; align-items: end; }
+.treasure-destination-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; align-items: end; }
 .treasure-destination-grid label, .treasure-template-label { display: grid; gap: 5px; }
-.treasure-template-row { display: grid; grid-template-columns: minmax(110px, 1fr) minmax(170px, 250px) 38px; gap: 8px; align-items: center; }
+.treasure-template-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 250px) 38px; gap: 8px; align-items: center; }
 .treasure-template-row input[type="text"] { min-width: 0; }
 .treasure-color-picker { width: 38px !important; height: 38px !important; padding: 3px !important; cursor: pointer; }
 .treasure-type-picker { position: relative; min-width: 0; }
 .treasure-choice-picker { position: relative; min-width: 0; }
-.treasure-type-trigger { width: 100%; height: 38px; display: flex; align-items: center; gap: 8px; padding: 0 10px; color: var(--text); background: #101014; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; text-align: left; }
-.treasure-choice-trigger { width: 100%; height: 38px; display: flex; align-items: center; padding: 0 10px; color: var(--text); background: #101014; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; text-align: left; }
-.treasure-type-trigger::after { content: "⌄"; margin-left: auto; color: var(--faint); }
-.treasure-choice-trigger::after { content: "⌄"; margin-left: auto; color: var(--faint); }
+.treasure-type-trigger { width: 100%; height: 38px; display: flex; align-items: center; gap: 8px; padding: 0 10px; color: var(--text); background: #171c20; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; text-align: left; }
+.treasure-choice-trigger { width: 100%; height: 38px; display: flex; align-items: center; padding: 0 10px; color: var(--text); background: #171c20; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; text-align: left; }
+.treasure-type-trigger::after, .treasure-choice-trigger::after {
+  content: ""; flex: none; width: 6px; height: 6px; margin: -3px 0 0 auto;
+  border-right: 1px solid var(--muted); border-bottom: 1px solid var(--muted); transform: rotate(45deg);
+}
+.treasure-type-trigger span, .treasure-choice-trigger span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .treasure-type-icon { width: 18px; height: 18px; flex: 0 0 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.treasure-type-menu, .treasure-choice-menu { position: absolute; z-index: 20; top: calc(100% + 4px); left: 0; right: 0; display: grid; max-height: 264px; overflow-y: auto; padding: 4px; background: #101014; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 12px 24px rgba(0,0,0,.35); }
+.treasure-type-menu, .treasure-choice-menu { position: absolute; z-index: 20; top: calc(100% + 4px); left: 0; right: 0; display: grid; max-height: 264px; overflow-y: auto; padding: 4px; background: #171c20; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 12px 24px rgba(0,0,0,.35); }
 .treasure-type-picker.open-up .treasure-type-menu, .treasure-choice-picker.open-up .treasure-choice-menu { top: auto; bottom: calc(100% + 4px); }
 .treasure-type-menu[hidden] { display: none; }
 .treasure-choice-menu[hidden] { display: none; }
@@ -1197,7 +1461,11 @@ input[type="color"] {
 .treasure-choice-option { height: 32px; display: flex; align-items: center; padding: 0 8px; border: 0; border-radius: 5px; color: var(--text); background: transparent; cursor: pointer; text-align: left; }
 .treasure-type-option:hover, .treasure-type-option.active { background: #3a3a3e; }
 .treasure-choice-option:hover, .treasure-choice-option.active { background: #3a3a3e; }
-@media (max-width: 700px) { .treasure-destination-grid { grid-template-columns: 1fr; } .treasure-template-row { grid-template-columns: minmax(90px, 1fr) minmax(150px, 1fr) 38px; } }
+@container (max-width: 440px) {
+  .treasure-destination-grid { grid-template-columns: minmax(0, 1fr); }
+  .treasure-template-row { grid-template-columns: minmax(0, 1fr) 38px; }
+  .treasure-template-row > input[type="text"] { grid-column: 1 / -1; }
+}
 .actions {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -1207,14 +1475,17 @@ input[type="color"] {
 .action {
   text-align: center;
   border-color: var(--line);
-  background: #19191d;
+  background: #1b2125;
   color: var(--text);
 }
 .action.primary {
-  background: #3a2a17;
-  border-color: #6e4c1b;
-  color: var(--accent);
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 700;
 }
+.action.primary:hover:not(:disabled) { background: #61f1f7; }
+.action.primary:focus-visible { outline-color: var(--accent-ink); }
 .action:disabled, .action.primary:disabled, .action.danger:disabled {
   background: #29292d;
   border-color: #414146;
@@ -1227,25 +1498,9 @@ input[type="color"] {
   color: #8a8a90;
 }
 .action.active {
-  background: #3a2a17;
-  border-color: #6e4c1b;
+  background: var(--accent-bg);
+  border-color: var(--accent-line);
   color: var(--accent);
-}
-.layout:not(.with-crosshair-preview) .editor {
-  container-type: inline-size;
-}
-.layout:not(.with-crosshair-preview) .section {
-  width: 100%;
-  max-width: 1180px;
-  min-width: 0;
-  align-content: start;
-}
-.layout:not(.with-crosshair-preview) .editor[data-page="general"] .section,
-.layout:not(.with-crosshair-preview) .editor[data-page="taskhotkeys"] .section {
-  max-width: 760px;
-}
-.layout:not(.with-crosshair-preview) .section.updates-section {
-  align-content: stretch;
 }
 .layout:not(.with-crosshair-preview) .actions {
   display: flex;
@@ -1284,7 +1539,7 @@ input[type="color"] {
   padding: 0 8px;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: #101014;
+  background: #171c20;
   color: var(--text);
 }
 .layout:not(.with-crosshair-preview) input:disabled {
@@ -1306,31 +1561,6 @@ input[type="color"] {
   min-width: 0;
   overflow-wrap: anywhere;
 }
-.settings-columns {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 14px;
-  align-items: start;
-}
-.settings-card {
-  display: grid;
-  min-width: 0;
-  gap: 10px;
-  padding: 14px;
-  border: 1px solid var(--soft);
-  border-radius: 10px;
-}
-.settings-card h3 {
-  margin: 0 0 2px;
-  color: var(--text);
-  font-size: 14px;
-  font-weight: 650;
-}
-@container (min-width: 900px) {
-  .settings-columns {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
 .action.danger {
   color: #f0aab1;
 }
@@ -1344,15 +1574,16 @@ input[type="color"] {
   min-height: 38px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #19191d;
+  background: #1b2125;
   color: var(--text);
   text-align: left;
   padding: 0 12px;
   cursor: pointer;
+  overflow-wrap: anywhere;
 }
 .profile-list button.active {
-  background: #2c2419;
-  border-color: #614720;
+  background: var(--accent-bg);
+  border-color: var(--accent-line);
   color: var(--accent);
 }
 .update-status {
@@ -1400,10 +1631,13 @@ input[type="color"] {
 }
 .release-notes pre code { padding: 0; background: none; }
 .preview-wrap {
-  padding: 14px;
+  align-self: start;
+  margin: calc(var(--caption-space) + clamp(12px, 1.5vw, 23px)) 16px 0 0;
+  height: clamp(250px, 48vh, 460px);
+  padding: 11px;
   display: grid;
-  grid-template-rows: auto 1fr;
-  gap: 12px;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 8px;
 }
 .preview-head {
   display: flex;
@@ -1413,7 +1647,7 @@ input[type="color"] {
 }
 .preview-head h2 {
   margin: 0;
-  font-size: 18px;
+  font-size: 15px;
 }
 .preview-head span {
   color: var(--muted);
@@ -1424,7 +1658,7 @@ input[type="color"] {
   width: 100%;
   height: 100%;
   object-fit: contain;
-  background: #0f0f12;
+  background: #13181b;
   border: 1px solid var(--soft);
   border-radius: 8px;
 }
@@ -1452,39 +1686,293 @@ input[type="color"] {
 .performance-grid input[type="number"] { width: 110px; }
 .performance-grid input[type="color"] { width: 70px; height: 34px; padding: 3px; }
 .performance-grid select { max-width: 100%; }
-.performance-colors { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.section.compact-settings { width: 100%; max-width: 820px; min-width: 0; align-content: start; gap: 8px; }
+.layout.with-crosshair-preview .compact-settings .actions { display: flex; flex-wrap: wrap; }
+.compact-settings h2 { font-size: 17px; margin: 0 0 4px; }
+.compact-settings h3 { font-size: 14px; margin: 0; }
+.compact-settings :is(label, .action) { font-size: 13px; }
+.compact-settings [hidden] { display: none !important; }
+.compact-settings :is(.field, .compact-disclosure) { padding: 9px 11px; border-radius: 7px; }
+.compact-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  min-width: 0;
+}
+.compact-stack { display: grid; gap: 7px; min-width: 0; }
+.compact-settings .compact-row :is(input:not([type="checkbox"]), select) { margin-left: auto; }
+.compact-settings .compact-row input[type="text"] { width: min(100%, 250px); }
+.compact-settings .compact-row select { width: auto; max-width: 100%; }
+.compact-settings .compact-row :is(input[type="number"], input[type="text"], select) { height: 33px; }
+.compact-settings .compact-row input[type="number"] { width: 93px; }
+.compact-settings .compact-row input[type="color"] { width: 46px; height: 26px; }
+.position-profile-choices { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px 16px; }
+.position-profile-choices label {
+  display: inline-grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+}
+.position-profile-choices input[type="checkbox"] { margin: 0; }
+.position-profile-choices label > span { overflow-wrap: anywhere; }
+.compact-settings .action { min-height: 33px; }
+.compact-settings .field > label.compact-row { display: flex; gap: 6px 14px; }
+.compact-settings .compact-row :is(.profile-select, .number-input) { width: auto; }
+.compact-settings .compact-row .number-input { width: 78px; }
+.compact-settings .compact-slider { display: grid; grid-template-columns: minmax(0, 1fr) minmax(120px, 45%); align-items: center; gap: 6px 12px; }
+.compact-settings .compact-slider .slider-row { min-width: 0; }
+.compact-settings .compact-slider .slider-row input[type="range"] { width: 100%; min-width: 0; }
+.compact-control { min-width: 0; }
+.compact-control .compact-value { max-width: min(100%, 48ch); }
+.settings-workspace { display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; gap: 10px; }
+.settings-side { min-width: 0; }
+.settings-side .session-marker-list, .task-result-list { max-height: min(52vh, 460px); overflow: auto; }
+.compact-settings .session-marker { min-height: 36px; font-size: 13px; }
+.compact-settings .session-empty { font-size: 13px; }
+.update-notes-slot .release-notes { max-height: min(58vh, 480px); overflow: auto; }
+.compact-settings .release-notes :is(h1, h2, h3, h4) { font-size: 14px; }
+.treasure-workspace { --treasure-side: 0; }
+.treasure-list { display: grid; gap: 6px; }
+.treasure-entry { display: grid; gap: 6px; min-width: 0; }
+.treasure-inline:not(:has(> :not([hidden]))), .treasure-capture-side:empty { display: none; }
+.treasure-list .treasure-list-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 3px 8px;
+  text-align: left;
+  padding: 6px 9px;
+}
+.treasure-list .treasure-list-item[aria-expanded] { grid-template-columns: minmax(0, 1fr) auto 12px; }
+.treasure-list-item[aria-expanded]::after {
+  content: "";
+  grid-area: 1 / 3;
+  place-self: center;
+  width: 6px;
+  height: 6px;
+  border: solid currentColor;
+  border-width: 0 1px 1px 0;
+  transform: translateY(-2px) rotate(45deg);
+}
+.treasure-list-item[aria-expanded="true"]::after { transform: translateY(2px) rotate(225deg); }
+.treasure-list-item .compact-value { grid-column: 1 / -1; font-size: 12px; }
+.treasure-coordinates { justify-content: flex-start; }
+.manual-task-progress { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.task-result-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.task-result-list li + li { border-top: 1px solid var(--soft); padding-top: 6px; }
+@container (min-width: 980px) {
+  .section.compact-settings:has(.settings-workspace) { max-width: 1260px; }
+  .settings-workspace { grid-template-columns: minmax(0, 1.32fr) minmax(0, 1fr); gap: 14px; }
+  .treasure-workspace { --treasure-side: 1; }
+  .treasure-list { max-height: min(52vh, 460px); overflow: auto; }
+}
+@container (max-width: 440px) {
+  .compact-settings .compact-slider { grid-template-columns: minmax(0, 1fr); }
+}
+.compact-value { color: var(--text); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.compact-disclosure { background: var(--surface); border: 1px solid var(--soft); min-width: 0; }
+.compact-disclosure > summary { cursor: pointer; color: var(--text); font-weight: 600; font-size: 13px; }
+.compact-disclosure > summary::marker { color: var(--muted); }
+.compact-disclosure[open] > summary { margin-bottom: 9px; }
+.compact-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.compact-metrics .field { align-content: start; gap: 3px; }
+.compact-metrics strong { font-size: 20px; line-height: 1.15; }
+.compact-settings :is(.compact-row .compact-value, .compact-metrics strong) { min-width: 0; }
+.editor[data-page="overview"] { display: grid; grid-template-rows: minmax(0, 1fr); overflow: clip; }
+.layout:not(.with-crosshair-preview) .section.session {
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+  align-content: stretch;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  gap: clamp(12px, 2.5vh, 26px);
+}
+.session h1 {
+  margin: 0;
+  font: 750 clamp(30px, 3vw, 52px)/1.12 "Segoe UI Variable Display", "Segoe UI", sans-serif;
+}
+.session-bar, .session-card, .session-map {
+  background: linear-gradient(120deg, #1e2327, var(--surface) 75%);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.session-bar {
+  display: flex;
+  align-items: center;
+  gap: clamp(15px, 2.7vw, 42px);
+  min-height: clamp(43px, 3.7vw, 60px);
+  padding: 8px clamp(14px, 2.1vw, 32px);
+  font-size: clamp(15px, 1.45vw, 23px);
+}
+.session-bar > span { display: flex; align-items: center; gap: clamp(8px, 1.2vw, 18px); min-width: 0; }
+.session-bar > span + span { border-left: 1px solid #687176; padding-left: clamp(15px, 2.7vw, 42px); }
+.session-bar .icon { width: clamp(21px, 1.8vw, 27px); height: clamp(21px, 1.8vw, 27px); }
+.session-bar b { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.session-grid {
+  display: grid;
+  min-height: 0;
+  grid-template-columns: minmax(0, 1.44fr) minmax(258px, 1fr);
+  grid-template-rows: minmax(340px, 1fr);
+  gap: clamp(12px, 1.25vw, 22px);
+  overflow: auto;
+}
+.session-map {
+  min-height: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 10px;
+  padding: 14px;
+  text-align: center;
+  background: radial-gradient(ellipse at 40% 40%, #273333, #1a2226);
+}
+.session-map p { margin: 0; color: var(--muted); }
+.session-side { min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 14px; }
+.session-card { min-width: 0; padding: 14px; }
+.session-card h2 { font: 700 clamp(21px, 2vw, 25px)/1.16 "Segoe UI Variable Display", "Segoe UI", sans-serif; margin: 0; }
+.session-coordinates { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 18px 0 12px; }
+.session-coordinate { min-width: 0; padding: 9px 14px; background: var(--chrome); border: 1px solid var(--line); border-radius: 8px; color: var(--muted); font-size: 16px; }
+.session-coordinate b { display: block; font: 720 clamp(26px, 3.2vw, 38px)/1.1 "Segoe UI Variable Display", "Segoe UI", sans-serif; color: var(--text); font-variant-numeric: tabular-nums; }
+.session-visibility { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; min-height: 38px; font-size: 16px; }
+.session-visibility > .icon:last-child { margin-left: auto; margin-right: 3px; width: 16px; height: 16px; color: var(--text); }
+.session-markers { min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: 12px; }
+.session-marker-list { overflow: auto; scrollbar-width: thin; border-top: 1px solid var(--line); }
+.session-markers .session-marker-list { min-height: 0; overscroll-behavior: contain; }
+.session-marker {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto auto;
+  column-gap: 8px;
+  align-items: center;
+  min-height: 36px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--line);
+  font-size: clamp(14px, 1.1vw, 16px);
+  font-variant-numeric: tabular-nums;
+}
+.session-marker > :first-child { color: var(--accent); }
+.session-marker > span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-marker em { font-style: normal; color: var(--muted); }
+.session-marker-menu {
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  line-height: 1;
+  padding: 6px 5px;
+}
+.session-marker-menu:is(:hover, [aria-expanded="true"]) { background: var(--raised); }
+.session-marker-popover {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  padding: 4px;
+  min-width: 204px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px #0008;
+}
+.session-marker-popover button {
+  display: block;
+  width: 100%;
+  min-height: 32px;
+  padding: 5px 10px;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  text-align: left;
+  cursor: pointer;
+}
+.session-marker-popover button:is(:hover, :focus-visible) { background: var(--accent-bg); }
+.layout:not(.with-crosshair-preview) .session-marker-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: stretch;
+  gap: 8px 12px;
+  margin-bottom: 8px;
+}
+.layout:not(.with-crosshair-preview) .session-marker-actions .action {
+  min-height: 40px;
+  padding: 4px 6px;
+  line-height: 1.15;
+  font-size: clamp(13px, 1.1vw, 16px);
+  font-weight: 650;
+  overflow-wrap: normal;
+}
+.session-marker-actions .action:not(.primary) { border-color: #79828a; }
+.session-marker-actions .action:disabled { background: #20262b; border-color: #414b52; color: #929ca3; }
+.session-marker-actions .action.primary:disabled { background: #203e44; border-color: #31575e; color: #a9c4c8; }
+.session-marker-import-hint { grid-column: 1 / -1; flex-basis: 100%; }
+.session-empty { margin: 12px 0; color: var(--muted); font-size: clamp(14px, 1.12vw, 18px); }
+.session-footer { display: flex; align-items: center; gap: clamp(10px, 2.2vw, 38px); border-top: 1px solid var(--line); padding-top: clamp(4px, 1vh, 12px); }
+.session-footer .action { border-color: transparent; background: transparent; padding: 0 7px; color: var(--muted); font-size: clamp(15px, 1.4vw, 23px); }
+.session-footer .action + .action { border-left: 1px solid var(--line); border-radius: 0; padding-left: clamp(11px, 2vw, 32px); }
+.session-footer .action + .action:hover { border-radius: 0 7px 7px 0; }
+.session-footer .action:hover { background: var(--raised); }
+.session-footer b { margin-left: 4px; color: var(--accent); font-variant-numeric: tabular-nums; }
+@media (max-width: 1160px) {
+  .layout.with-crosshair-preview { grid-template-columns: clamp(154px, 15vw, 226px) minmax(0, 1fr); }
+  .layout.with-crosshair-preview .editor { padding-bottom: 0; }
+  .layout.with-crosshair-preview .preview-wrap { grid-column: 2; margin: 8px 14px 12px; height: clamp(145px, 26vh, 205px); max-width: 792px; }
+  .layout.with-crosshair-preview { grid-template-rows: minmax(0, 1fr) auto; }
+  .layout.with-crosshair-preview .sidebar { grid-row: span 2; }
+}
+@media (max-width: 760px) {
+  .layout, .layout.with-crosshair-preview { grid-template-columns: 142px minmax(0, 1fr); }
+  .session-grid { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto; align-content: start; }
+  .session-map { min-height: 330px; }
+  .session-markers { min-height: 170px; max-height: 330px; }
+}
 </style>
 </head>
 <body>
-<div class="app">
-  <header class="titlebar">
-    <div class="brand"><strong>DayZ-Map.ru Companion</strong></div>
-  </header>
-
-  <main class="layout with-crosshair-preview" id="layout">
-    <aside class="panel sidebar">
-      <div class="nav" id="nav"></div>
-      <button class="action danger" id="exitApplication">Выйти из приложения</button>
-    </aside>
-
-    <section class="panel editor" id="editor"></section>
-
-    <section class="panel preview-wrap">
-      <div class="preview-head">
-        <h2>Предпросмотр</h2>
-        <span id="activeProfileName"></span>
-      </div>
-      <img class="preview" id="preview" alt="">
-    </section>
-  </main>
+<div class="window-caption" role="group" aria-label="Управление окном">
+  <div class="window-top-resize" aria-hidden="true"></div>
+  <button type="button" data-window-command="minimize" aria-label="Свернуть" title="Свернуть">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" aria-hidden="true"><path d="M2 8h12"/></svg>
+  </button>
+  <button type="button" data-window-command="maximize" aria-label="Развернуть" title="Развернуть" aria-pressed="false">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" aria-hidden="true"><rect class="maximize-glyph" x="2.5" y="2.5" width="11" height="11"/><path class="restore-glyph" d="M5.5 4.5V2.5h8v8h-2m-9-5h8v8h-8z"/></svg>
+  </button>
+  <button type="button" data-window-command="close" aria-label="Закрыть" title="Закрыть">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" aria-hidden="true"><path d="m2.5 2.5 11 11m0-11-11 11"/></svg>
+  </button>
+</div>
+<main class="layout" id="layout">
+  <aside class="sidebar" aria-label="Разделы приложения">
+    <div class="brand">
+      <svg class="brand-icon" viewBox="0 0 24 28" aria-hidden="true"><path fill="currentColor" fill-rule="evenodd" d="M12 0a11 11 0 0 0-11 11c0 7 11 17 11 17s11-10 11-17A11 11 0 0 0 12 0Zm0 7a4 4 0 1 1 0 8 4 4 0 0 1 0-8Z"/></svg>
+      <strong>DayZ-Map<br>Companion</strong>
+    </div>
+    <nav class="nav" id="nav" aria-label="Навигация"></nav>
+  </aside>
+  <section class="panel editor" id="editor"></section>
+  <section class="panel preview-wrap">
+    <div class="preview-head">
+      <h2>Предпросмотр</h2>
+      <span id="activeProfileName"></span>
+    </div>
+    <img class="preview" id="preview" alt="">
+  </section>
+</main>
+<div class="session-marker-popover" id="session-marker-popover" popover="manual" role="menu" aria-label="Действия с меткой">
+  <button type="button" role="menuitem" data-copy-session-marker="coordinates">Копировать координаты</button>
+  <button type="button" role="menuitem" data-copy-session-marker="name">Копировать название</button>
 </div>
 <div class="toast" id="toast"></div>
 
 <!-- marker-icons -->
 <script>
 const bridge = window.chrome.webview;
+const sessionMarkerPopover = document.getElementById("session-marker-popover");
+let sessionMarkerSelection = null;
 let state = null;
-let activeTab = "crosshair";
+let activeTab = "overview";
 let treasureMapId = null;
 let treasureProfileId = null;
 const treasureTemplateDrafts = new Map();
@@ -1508,6 +1996,12 @@ const playerPositionShapes = [
 ].map(([id, icon, name]) => ({ id, icon, name }));
 document.addEventListener("keydown", event => {
   if (event.key === "Escape") {
+    if (sessionMarkerSelection) {
+      closeSessionMarkerMenu(true);
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     const hadPreview = Boolean(treasurePreviewUri);
     treasurePreviewUri = null;
     treasureMapMenuOpen = false;
@@ -1542,6 +2036,8 @@ let hotkeyCapture = null;
 let pendingConfig = null;
 let pendingConfigTimer = null;
 let selectedProfileId = null;
+let selectedTreasureId = null;
+let treasureCaptureExpanded = true;
 let dayZStatusPending = false;
 let dayZActionFeedback = "";
 
@@ -1560,31 +2056,54 @@ const defaultHotkeys = {
   CaptureTreasure: { Enabled: true, Key: "F7", Control: true, Alt: true, Shift: false, Win: false }
 };
 
+const iconPaths = {
+  chevronDown: '<path d="m4 8 8 8 8-8"/>',
+  overview: '<path d="m3 11 9-8 9 8M5 10v11h5v-6h4v6h5V10"/>',
+  position: '<circle cx="12" cy="12" r="8"/><path d="M12 2v4m0 12v4M2 12h4m12 0h4"/>',
+  markers: '<path d="M20 10c0 5-8 11-8 11S4 15 4 10a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="2.5"/>',
+  marker: '<path stroke="none" fill="currentColor" fill-rule="evenodd" d="M12 2a8 8 0 0 0-8 8c0 5 8 12 8 12s8-7 8-12a8 8 0 0 0-8-8Zm0 5a3 3 0 1 1 0 6 3 3 0 0 1 0-6Z"/>',
+  treasures: '<rect x="3" y="8" width="18" height="13" rx="2"/><path d="M3 12h18M10 12v4h4v-4M8 8V5h8v3"/>',
+  crosshair: '<circle cx="12" cy="12" r="7"/><path d="M12 2v6m0 8v6M2 12h6m8 0h6"/>',
+  tasks: '<rect x="5" y="5" width="14" height="16" rx="2"/><path d="M9 5V3h6v2M9 10h6m-6 4h6m-6 4h4"/>',
+  application: '<circle cx="12" cy="12" r="3"/><path d="M10 3h4l.6 2.4 2 .9 2.2-1.1 2 3.5-1.6 1.7v2.4l1.6 1.7-2 3.5-2.2-1.1-2 .9L14 21h-4l-.6-2.4-2-.9-2.2 1.1-2-3.5 1.6-1.7v-2.4L3.2 8.5l2-3.5 2.2 1.1 2-.9Z"/>',
+  server: '<rect x="3" y="4" width="18" height="7" rx="1"/><rect x="3" y="13" width="18" height="7" rx="1"/><path d="M7 7.5h.01m3 0H17M7 16.5h.01m3 0H17"/>',
+  map: '<path d="m3 6 6-3 6 3 6-3v15l-6 3-6-3-6 3Zm6-3v15m6-12v15"/>',
+  eye: '<path d="M2 12s4-6 10-6 10 6 10 6-4 6-10 6-10-6-10-6Z"/><circle cx="12" cy="12" r="2.5"/>',
+  player: '<path fill="currentColor" stroke="#152123" d="m6 4 14 8-7 1-3 7Z"/>'
+};
+const icon = name => `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${iconPaths[name]}</svg>`;
+
 const navigation = [
-  { id: "performance", label: "Пинг и FPS", tabs: [
-    ["performance", "Общее"],
-    ["performance-settings", "Настройки"]
-  ] },
-  { tab: ["player-position", "Позиция игрока"] },
-  { tab: ["treasures", "\u041a\u043b\u0430\u0434\u044b"] },
-  { tab: ["dayz", "Синхронизация меток"] },
-  { id: "tasks", label: "Отслеживание заданий", tabs: [
-    ["tasks", "Настройки"],
-    ["taskhotkeys", "Горячие клавиши"]
-  ] },
-  { id: "crosshair", label: "Прицел", tabs: [
+  { icon: "overview", tab: ["overview", "Обзор"] },
+  { icon: "position", tab: ["player-position", "Позиция"] },
+  { icon: "markers", tab: ["dayz", "Метки"] },
+  { icon: "treasures", tab: ["treasures", "Клады"] },
+  { id: "crosshair", icon: "crosshair", label: "Прицел", tabs: [
     ["crosshair", "Настройка прицела"],
     ["image", "Изображение"],
     ["profiles", "Профили"],
     ["hotkeys", "Горячие клавиши"],
     ["monitor", "Монитор"]
   ] },
-  { id: "application", label: "Приложение", tabs: [
+  { id: "tasks", icon: "tasks", label: "Задания", tabs: [
+    ["tasks", "Сканирование"],
+    ["taskhotkeys", "Горячие клавиши"]
+  ] },
+  { id: "application", icon: "application", label: "Настройки", tabs: [
     ["general", "Общие"],
+    ["performance", "Пинг и FPS"],
     ["updates", "Обновление"]
   ] }
 ];
 let expandedNavGroups = new Set();
+const expandedSettings = new Set();
+let queryPortDraft = null;
+
+function settingsDetails(key, title, content) {
+  return `<details class="compact-disclosure" data-settings-disclosure="${key}" ${expandedSettings.has(key) ? "open" : ""}>
+    <summary>${title}</summary><div class="compact-stack">${content}</div>
+  </details>`;
+}
 
 function post(message) {
   bridge.postMessage(message);
@@ -1676,43 +2195,52 @@ function field(label, inner) {
   return `<div class="field"><div class="field-row"><label>${label}</label>${inner.value || ""}</div>${inner.input}</div>`;
 }
 
+function settingRow(label, control) {
+  return `<label class="field compact-row"><span>${label}</span>${control}</label>`;
+}
+
 function slider(label, path, min, max) {
   const p = profile();
   const value = getPath(p, path);
-  return field(label, {
-    value: `<span class="value">${value}</span>`,
-    input: `<div class="slider-row"><input type="range" min="${min}" max="${max}" value="${value}" data-slider="${path}"><input class="number-input" type="number" min="${min}" max="${max}" value="${value}" data-number="${path}"></div>`
-  });
+  return `<div class="field compact-slider"><label for="range-${path}">${label}</label>
+    <div class="slider-row"><input type="range" id="range-${path}" min="${min}" max="${max}" value="${value}" data-slider="${path}">
+    <input class="number-input" type="number" min="${min}" max="${max}" value="${value}" data-number="${path}" aria-label="${label}"></div></div>`;
 }
 
 function check(label, path) {
   const checked = getPath(profile(), path) ? "checked" : "";
-  return field(label, {
-    value: `<input type="checkbox" ${checked} data-check="${path}">`,
-    input: ``
-  });
+  return settingRow(label, `<input type="checkbox" ${checked} data-check="${path}">`);
 }
 
-function color(label, path) {
+function color(label, path, shared = false) {
   const c = getPath(profile(), path);
   const hex = "#" + [c.R, c.G, c.B].map(v => v.toString(16).padStart(2, "0")).join("");
-  return field(label, {
-    input: `<input type="color" value="${hex}" data-color="${path}">`
-  });
+  return settingRow(label, `<input type="color" value="${hex}" ${shared ? "data-color-all" : `data-color="${path}"`}>`);
 }
 
-function select(label, path, options) {
-  const value = getPath(profile(), path);
-  const html = options.map(([id, name]) => `<option value="${id}" ${String(value) === String(id) ? "selected" : ""}>${name}</option>`).join("");
-  return field(label, {
-    input: `<select data-select="${path}">${html}</select>`
-  });
+const crosshairShapes = [
+  ["Classic", "Классика"], ["TightPlus", "Плотный плюс"], ["OpenPlus", "Сплошной плюс"], ["Corners", "Уголки"],
+  ["Box", "Рамка"], ["Circle", "Кольцо"], ["Arcs", "Дуги"], ["Chevron", "Шеврон"], ["Brackets", "Скобки"],
+  ["DotCorners", "Точки по углам"], ["Sniper", "Снайперский"]
+];
+const dotShapes = [
+  ["Circle", "Круг"], ["Square", "Квадрат"], ["Diamond", "Ромб"], ["Triangle", "Треугольник"],
+  ["Heart", "Сердце"], ["Cross", "Крест"], ["Star", "Звезда"], ["Hexagon", "Шестиугольник"],
+  ["Pentagon", "Пятиугольник"], ["X", "X"], ["Paw", "Лапа"]
+];
+
+function shapeIndex(value, options) {
+  return typeof value === "number" ? value : options.findIndex(([id]) => id === value);
+}
+
+function selectShape(label, path, options) {
+  const selected = shapeIndex(getPath(profile(), path), options);
+  const html = options.map(([, name], index) => `<option value="${index}" ${index === selected ? "selected" : ""}>${name}</option>`).join("");
+  return settingRow(label, `<select data-select="${path}">${html}</select>`);
 }
 
 function text(label, id, value) {
-  return field(label, {
-    input: `<input type="text" id="${id}" value="${escapeHtml(value || "")}">`
-  });
+  return settingRow(label, `<input type="text" id="${id}" value="${escapeHtml(value || "")}">`);
 }
 
 function getPath(obj, path) {
@@ -1809,12 +2337,19 @@ function renderMarkdown(markdown) {
 
 function render() {
   if (!state) return;
-  const showPreview = navigation.find(item => item.id === "crosshair").tabs.some(([id]) => id === activeTab);
+  const showPreview = ["crosshair", "image", "profiles"].includes(activeTab);
   document.getElementById("layout").classList.toggle("with-crosshair-preview", showPreview);
   renderSidebar();
   renderEditor();
-  document.getElementById("preview").src = state.preview || "";
+  setCrosshairPreview(state.preview);
+  document.querySelector(".preview-head h2").textContent = activeTab === "profiles" ? "Активный прицел" : "Предпросмотр";
   document.getElementById("activeProfileName").textContent = profile()?.Name || "";
+}
+
+function setCrosshairPreview(source) {
+  const preview = document.getElementById("preview");
+  if (source) preview.src = source;
+  else preview.removeAttribute("src");
 }
 
 function isEditingValueControl() {
@@ -1826,13 +2361,24 @@ function renderDataChanged(previous, next) {
   if (!previous) return true;
   // DayZ status is polled periodically. It is not form data, so it must not
   // recreate the whole editor and steal focus from a field or an open select.
+  const settingsWithoutPositionTelemetry = settings => {
+    if (!settings?.PlayerPositionTracking) return settings;
+    const { LastX, LastY, LastZ, LastSentAt, ConsecutiveErrors, LastError, ...tracking } = settings.PlayerPositionTracking;
+    return { ...settings, PlayerPositionTracking: tracking };
+  };
+  const markerFileStatus = status => {
+    if (!status || activeTab !== "dayz") return undefined;
+    const { SessionMarkers, MarkerServer, ...fileStatus } = status;
+    return fileStatus;
+  };
   const stable = value => ({
     config: value.config,
     openTab: value.openTab,
     update: value.update,
     updateProgress: value.updateProgress,
     ocr: value.ocr,
-    dayZSettings: value.dayZ?.settings,
+    dayZSettings: settingsWithoutPositionTelemetry(value.dayZ?.settings),
+    markerFileStatus: markerFileStatus(value.dayZ?.status),
     battlePass: value.battlePass,
     treasures: value.treasures,
     positionDestination: { maps: value.playerPosition?.destination?.Maps, profiles: value.playerPosition?.destination?.Profiles },
@@ -1847,6 +2393,7 @@ function keepEditedState(previous, next) {
   return {
     ...previous,
     preview: next.preview,
+    markerImportBlockReason: next.markerImportBlockReason,
     dayZ: next.dayZ ? { ...previous.dayZ, status: next.dayZ.status } : previous.dayZ
   };
 }
@@ -1855,136 +2402,55 @@ function renderSidebar() {
   document.getElementById("nav").innerHTML = navigation.map(item => {
     if (item.tab) {
       const [id, label] = item.tab;
-      return `<button class="nav-main ${id === activeTab ? "active" : ""}" data-tab="${id}">${label}</button>`;
+      const current = id === activeTab;
+      return `<button class="nav-main ${current ? "active" : ""}" ${current ? 'aria-current="page"' : ""} data-tab="${id}">${icon(item.icon)}${label}</button>`;
     }
     const open = expandedNavGroups.has(item.id);
-    const children = item.tabs.map(([id, label]) => `<button class="${id === activeTab ? "active" : ""}" data-tab="${id}">${label}</button>`).join("");
-    return `<div class="nav-group"><button class="nav-group-toggle" data-nav-group="${item.id}">${item.label}<span>${open ? "▾" : "▸"}</span></button>${open ? `<div class="nav-children">${children}</div>` : ""}</div>`;
+    const current = item.tabs.some(([id]) => id === activeTab);
+    const children = item.tabs.map(([id, label]) => `<button ${id === activeTab ? 'class="active" aria-current="page"' : ""} data-tab="${id}">${label}</button>`).join("");
+    return `<div class="nav-group"><button class="nav-group-toggle ${current ? "current" : ""}" aria-expanded="${open}" data-nav-group="${item.id}">${icon(item.icon)}${item.label}<span aria-hidden="true">${open ? "▾" : "▸"}</span></button>${open ? `<div class="nav-children">${children}</div>` : ""}</div>`;
   }).join("");
 }
 
 function expandNavForTab(tab) {
+  expandedNavGroups.clear();
   const group = navigation.find(item => item.tabs?.some(([id]) => id === tab));
   if (group) expandedNavGroups.add(group.id);
 }
 
-function renderEditor() {
-  const p = profile();
-  const sections = {
-    general: renderGeneral(),
-    crosshair: renderCrosshair(),
-    image: renderImage(),
-    hotkeys: renderHotkeys(),
-    taskhotkeys: renderBattlePassHotkeys(),
-    monitor: renderMonitor(),
-    dayz: renderDayZ(),
-    "player-position": renderPlayerPosition(),
-    performance: renderPerformance(),
-    "performance-settings": renderPerformanceSettings(),
-    treasures: renderTreasures(),
-    tasks: renderBattlePass(),
-    profiles: renderProfiles(),
-    updates: renderUpdates()
-  };
-  const editor = document.getElementById("editor");
-  editor.dataset.page = activeTab;
-  editor.classList.toggle("updates-editor", activeTab === "updates" && !state.microsoftStore);
-  editor.innerHTML = `<div class="section active ${activeTab === "updates" && !state.microsoftStore ? "updates-section" : ""}">${sections[activeTab]}</div>`;
-  if (activeTab === "crosshair") {
-    organizeCrosshairSection();
-  }
-  syncPresetButtons();
-  bindEditorEvents();
+function selectEditorTab(tab) {
+  activeTab = tab === "performance-settings" ? "performance" : tab;
+  if (tab === "performance-settings") expandedSettings.add("performance-overlay");
+  expandNavForTab(activeTab);
 }
 
-function organizeCrosshairSection() {
-  const section = document.querySelector("#editor .section.active");
-  if (!section) return;
-
-  if (!section.querySelector("[data-slider='DotOpacity']")) {
-    section.insertAdjacentHTML("beforeend", slider("Прозрачность точки", "DotOpacity", 0, 255));
-  }
-  if (!section.querySelector("[data-color-role='crosshair']")) {
-    section.insertAdjacentHTML("beforeend", color("Цвет перекрестия", "Color"));
-    const colorInputs = section.querySelectorAll("[data-color='Color']");
-    colorInputs.item(colorInputs.length - 1).dataset.colorRole = "crosshair";
-  }
-  if (!section.querySelector("[data-color-role='dot']")) {
-    section.insertAdjacentHTML("beforeend", color("Цвет точки", "DotColor"));
-    section.querySelector("[data-color='DotColor']").dataset.colorRole = "dot";
-  }
-
-  const title = section.querySelector("h2");
-  const presets = section.querySelector(".actions");
-  const byPath = selector => section.querySelector(selector)?.closest(".field");
-  const move = (group, nodes) => {
-    nodes.filter(Boolean).forEach(node => group.appendChild(node));
+function renderEditor() {
+  closeSessionMarkerMenu();
+  const sections = {
+    overview: renderOverview,
+    general: renderGeneral,
+    crosshair: renderCrosshair,
+    image: renderImage,
+    hotkeys: renderHotkeys,
+    taskhotkeys: renderBattlePassHotkeys,
+    monitor: renderMonitor,
+    dayz: renderDayZ,
+    "player-position": renderPlayerPosition,
+    performance: renderPerformance,
+    treasures: renderTreasures,
+    tasks: renderBattlePass,
+    profiles: renderProfiles,
+    updates: renderUpdates
   };
-  const createGroup = name => {
-    const group = document.createElement("div");
-    group.className = "control-group";
-    const groupTitle = document.createElement("div");
-    groupTitle.className = "group-title";
-    groupTitle.textContent = name;
-    group.appendChild(groupTitle);
-    return group;
-  };
-
-  const presetGroup = createGroup("Пресеты");
-  const crosshairGroup = createGroup("Перекрестие");
-  const dotGroup = createGroup("Точка");
-  const outlineGroup = createGroup("Обводка");
-  dotGroup.classList.add("separated");
-  outlineGroup.classList.add("separated");
-  const crosshairOpacity = byPath("[data-slider='Color.A']");
-  const crosshairColor = byPath("[data-color-role='crosshair']");
-  const dotColor = byPath("[data-color-role='dot']");
-  const commonColor = Array.from(section.querySelectorAll("[data-color='Color']"))
-    .find(input => input.dataset.colorRole !== "crosshair")
-    ?.closest(".field");
-  const commonColorInput = commonColor?.querySelector("[data-color='Color']");
-  if (commonColorInput) {
-    commonColorInput.removeAttribute("data-color");
-    commonColorInput.dataset.colorAll = "true";
-  }
-  const crosshairOpacityLabel = crosshairOpacity?.querySelector("label");
-  if (crosshairOpacityLabel) {
-    crosshairOpacityLabel.textContent = "Прозрачность перекрестия";
-  }
-  const proceduralField = byPath("[data-check='ProceduralEnabled']");
-
-  if (!section.querySelector("[data-check='CrosshairEnabled']")) {
-    section.insertAdjacentHTML("beforeend", check(crosshairGroup.querySelector(".group-title").textContent, "CrosshairEnabled"));
-  }
-
-  move(presetGroup, [presets]);
-  move(crosshairGroup, [
-    byPath("[data-check='CrosshairEnabled']"),
-    byPath("[data-slider='Length']"),
-    byPath("[data-slider='Gap']"),
-    byPath("[data-slider='Thickness']"),
-    byPath("[data-slider='CrosshairRotation']"),
-    byPath("[data-select='CrosshairShape']"),
-    byPath("[data-check='TShape']"),
-    crosshairOpacity,
-    crosshairColor
-  ]);
-  move(dotGroup, [
-    byPath("[data-check='DotEnabled']"),
-    byPath("[data-slider='DotSize']"),
-    byPath("[data-slider='DotOpacity']"),
-    byPath("[data-select='DotShape']"),
-    dotColor
-  ]);
-  move(outlineGroup, [
-    byPath("[data-check='OutlineEnabled']"),
-    byPath("[data-slider='OutlineThickness']"),
-    byPath("[data-slider='OutlineColor.A']"),
-    byPath("[data-color='OutlineColor']"),
-    commonColor
-  ]);
-
-  section.replaceChildren(title, proceduralField, presetGroup, crosshairGroup, dotGroup, outlineGroup);
+  const editor = document.getElementById("editor");
+  const compact = activeTab !== "overview";
+  const scrollTop = compact && editor.dataset.page === activeTab ? editor.scrollTop : 0;
+  editor.dataset.page = activeTab;
+  const sectionClass = compact ? "compact-settings" : "session";
+  editor.innerHTML = `<div class="section active ${sectionClass}">${(sections[activeTab] || renderOverview)()}</div>`;
+  if (compact) editor.scrollTop = scrollTop;
+  syncPresetButtons();
+  bindEditorEvents();
 }
 
 function syncPresetButtons() {
@@ -1996,75 +2462,70 @@ function syncPresetButtons() {
 }
 
 function renderCrosshair() {
-  return `
-    <h2>Прицел</h2>
-    <div class="actions">
-      <button class="action primary" data-preset="classic">Классика</button>
-      <button class="action" data-preset="dot">Точка</button>
-      <button class="action" data-preset="compact">Компакт</button>
-      <button class="action" data-preset="thin">Тонкий</button>
-      <button class="action" data-preset="bold">Жирный</button>
-      <button class="action" data-preset="diamond">Ромб</button>
-      <button class="action" data-preset="crossdot">Крест-точка</button>
-      <button class="action" data-preset="t">T-форма</button>
-      <button class="action" data-preset="x">X</button>
-    </div>
-    ${field("Отображение прицела", {
-      value: `<input type="checkbox" data-check="ProceduralEnabled" ${profile().ProceduralEnabled ? "checked" : ""}>`,
-      input: `<label class="field-row"><span>Показывать только в DayZ</span><input type="checkbox" data-general-check="ShowOnlyInGame" ${state.config.ShowOnlyInGame ? "checked" : ""}></label>`
-    })}
-    ${slider("Длина", "Length", 1, 80)}
-    ${slider("Зазор", "Gap", 0, 50)}
-    ${slider("Толщина", "Thickness", 1, 20)}
-    ${slider("Поворот", "CrosshairRotation", 0, 359)}
-    ${select("Форма перекрестия", "CrosshairShape", [[0, "Классика"], [1, "Плотный плюс"], [2, "Сплошной плюс"], [3, "Уголки"], [4, "Рамка"], [5, "Кольцо"], [6, "Дуги"], [7, "Шеврон"], [8, "Скобки"], [9, "Точки по углам"], [10, "Снайперский"]])}
-    ${slider("Размер точки", "DotSize", 1, 30)}
-    ${check("Центральная точка", "DotEnabled")}
-    ${select("Форма точки", "DotShape", [[0, "Circle"], [1, "Square"], [2, "Diamond"], [3, "Triangle"], [4, "Heart"], [5, "Cross"], [6, "Star"], [7, "Hexagon"], [8, "Pentagon"], [9, "X"], [10, "Paw"]])}
-    ${check("T-форма", "TShape")}
-    ${check("Обводка", "OutlineEnabled")}
-    ${slider("Толщина обводки", "OutlineThickness", 1, 10)}
-    ${slider("Прозрачность", "Color.A", 0, 255)}
-    ${slider("Прозрачность обводки", "OutlineColor.A", 0, 255)}
-    ${color("Цвет", "Color")}
-    ${color("Цвет обводки", "OutlineColor")}
-  `;
+  const presets = [["classic", "Классика"], ["dot", "Точка"], ["compact", "Компакт"], ["thin", "Тонкий"],
+    ["bold", "Жирный"], ["diamond", "Ромб"], ["crossdot", "Крест-точка"], ["t", "Т-форма"], ["x", "X"]];
+  return `<h2>Прицел</h2>
+    <div class="field"><h3>Пресеты</h3><div class="actions">
+      ${presets.map(([id, label]) => `<button class="action" data-preset="${id}">${label}</button>`).join("")}
+    </div></div>
+    ${check("Отображение прицела", "ProceduralEnabled")}
+    ${settingRow("Показывать только в DayZ", `<input type="checkbox" data-general-check="ShowOnlyInGame" ${state.config.ShowOnlyInGame ? "checked" : ""}>`)}
+    ${color("Общий цвет прицела", "Color", true)}
+    ${settingsDetails("crosshair-lines", "Перекрестие", `
+      ${check("Перекрестие", "CrosshairEnabled")}
+      ${selectShape("Форма", "CrosshairShape", crosshairShapes)}
+      ${slider("Длина", "Length", 1, 80)}
+      ${slider("Зазор", "Gap", 0, 50)}
+      ${slider("Толщина", "Thickness", 1, 20)}
+      ${slider("Поворот", "CrosshairRotation", 0, 359)}
+      ${check("Т-форма", "TShape")}
+      ${slider("Прозрачность перекрестия", "Color.A", 0, 255)}
+      ${color("Цвет перекрестия", "Color")}`)}
+    ${settingsDetails("crosshair-dot", "Точка", `
+      ${check("Центральная точка", "DotEnabled")}
+      ${selectShape("Форма точки", "DotShape", dotShapes)}
+      ${slider("Размер точки", "DotSize", 1, 30)}
+      ${slider("Прозрачность точки", "DotOpacity", 0, 255)}
+      ${color("Цвет точки", "DotColor")}`)}
+    ${settingsDetails("crosshair-outline", "Обводка", `
+      ${check("Обводка", "OutlineEnabled")}
+      ${slider("Толщина обводки", "OutlineThickness", 1, 10)}
+      ${slider("Прозрачность обводки", "OutlineColor.A", 0, 255)}
+      ${color("Цвет обводки", "OutlineColor")}`)}`;
 }
 
 function renderGeneral() {
   const overlaySize = state.config.OverlayWindowSize;
-  return `
-    <h2>Общие</h2>
-    ${field("Запускать вместе с Windows", { value: `<input type="checkbox" ${state.config.StartWithWindows ? "checked" : ""} data-general-check="StartWithWindows">`, input: `` })}
-    ${field("Запускать свёрнутым в трей", { value: `<input type="checkbox" ${state.config.StartMinimizedToTray ? "checked" : ""} data-general-check="StartMinimizedToTray">`, input: `` })}
-    ${field("Размер окна прицела", { input: `<select data-overlay-size>
+  return `<h2>Общие</h2>
+    ${settingRow("Запускать вместе с Windows", `<input type="checkbox" ${state.config.StartWithWindows ? "checked" : ""} data-general-check="StartWithWindows">`)}
+    ${settingRow("Запускать свёрнутым в трей", `<input type="checkbox" ${state.config.StartMinimizedToTray ? "checked" : ""} data-general-check="StartMinimizedToTray">`)}
+    ${settingRow("Размер окна прицела", `<select data-overlay-size>
       <option value="Compact200" ${overlaySize === "Compact200" ? "selected" : ""}>200 × 200 (по умолчанию)</option>
       <option value="QuarterScreen" ${overlaySize === "QuarterScreen" ? "selected" : ""}>25% экрана</option>
       <option value="HalfScreen" ${overlaySize === "HalfScreen" ? "selected" : ""}>50% экрана</option>
       <option value="ThreeQuartersScreen" ${overlaySize === "ThreeQuartersScreen" ? "selected" : ""}>75% экрана</option>
       <option value="FullScreen" ${overlaySize === "FullScreen" ? "selected" : ""}>100% экрана</option>
-    </select>` })}
-  `;
+    </select>`)}
+    <div class="actions"><button class="action danger" data-command="exitApplication">Выйти из приложения</button></div>`;
 }
 
 function renderImage() {
   const layer = profile().ImageLayer;
-  return `
-    <h2>Изображение</h2>
-    ${check("Включить изображение", "ImageLayer.Enabled")}
-    ${slider("Масштаб", "ImageLayer.ScalePercent", 1, 400)}
-    ${slider("Прозрачность", "ImageLayer.Opacity", 0, 255)}
-    ${slider("Поворот", "ImageLayer.Rotation", 0, 359)}
-    ${slider("Смещение X", "ImageLayer.OffsetX", -500, 500)}
-    ${slider("Смещение Y", "ImageLayer.OffsetY", -500, 500)}
-    ${field("Файл", { input: `<div class="limit">${escapeHtml(layer.Path || "Не выбран")}</div>` })}
-    <div class="actions">
-      <button class="action primary" data-command="importImage">Импорт</button>
-      <button class="action" data-image="clear">Очистить</button>
-      <button class="action" data-image="center">Центр якоря</button>
-      <button class="action" data-image="reset">Сброс позиции</button>
+  return `<h2>Изображение</h2>
+    <div class="field">
+      <div class="compact-row compact-control"><h3>Файл изображения</h3><span class="compact-value">${escapeHtml(layer.Path || "Не выбран")}</span></div>
+      <div class="actions"><button class="action primary" data-command="importImage">Импортировать</button>
+        <button class="action" data-image="clear" ${layer.Path ? "" : "disabled"}>Очистить</button></div>
     </div>
-  `;
+    ${check("Включить изображение", "ImageLayer.Enabled")}
+    ${settingsDetails("image-display", "Отображение", `
+      ${slider("Масштаб", "ImageLayer.ScalePercent", 1, 400)}
+      ${slider("Прозрачность", "ImageLayer.Opacity", 0, 255)}
+      ${slider("Поворот", "ImageLayer.Rotation", 0, 359)}`)}
+    ${settingsDetails("image-placement", "Положение", `
+      ${slider("Смещение X", "ImageLayer.OffsetX", -500, 500)}
+      ${slider("Смещение Y", "ImageLayer.OffsetY", -500, 500)}
+      <div class="actions"><button class="action" data-image="center">Центр якоря</button><button class="action" data-image="reset">Сброс позиции</button></div>`)}`;
 }
 
 function renderOcrStatus(ocr = state.ocr) {
@@ -2074,72 +2535,98 @@ function renderOcrStatus(ocr = state.ocr) {
 }
 
 function renderPerformance() {
-  const settings = state.dayZ?.settings?.Performance || {};
-  return `<h2>Пинг и FPS</h2><div class="control-group">
-    <div class="field"><label><input type="checkbox" data-performance-check="Enabled" ${settings.Enabled ? "checked" : ""}> Измерять пинг и FPS DayZ</label></div>
-    <div class="limit" data-performance-value="HelperStatus"></div>
-    <div class="limit">FPS и пинг обновляются раз в секунду. Оформление и положение оверлея можно изменить в подпункте «Настройки».</div>
-    <div class="field"><div class="field-label">Текущий FPS</div><div class="update-status" data-performance-value="Fps">—</div><div class="limit" data-performance-value="FpsStatus"></div></div>
-    <div class="field"><div class="field-label">Пинг сервера</div><div class="update-status" data-performance-value="Ping">—</div><div class="limit" data-performance-value="PingStatus"></div></div>
-    ${settings.ShowFrameTime ? `<div class="field"><div class="field-label">Время кадра</div><div class="update-status" data-performance-value="FrameTime">—</div><div class="limit">Среднее время кадра за последнюю секунду.</div></div>` : ""}
-    ${settings.ShowOnePercentLow ? `<div class="field"><div class="field-label">1% low</div><div class="update-status" data-performance-value="OnePercentLow">—</div><div class="limit">За последние 30 секунд: 1000 / среднее время самых медленных 1% кадров. Появляется после первых 100 кадров.</div></div>` : ""}
-    ${settings.ShowJitter ? `<div class="field"><div class="field-label">Jitter пинга</div><div class="update-status" data-performance-value="Jitter">—</div><div class="limit">Средняя разница между соседними успешными замерами за 30 секунд. После ошибки история начинается заново.</div></div>` : ""}
-    ${settings.ShowFrameGraph ? `<div class="field"><div class="field-label">Просадки: пики времени кадра за 60 секунд</div><canvas data-performance-graph style="width:100%;height:110px"></canvas></div>` : ""}
-    <div class="field"><div class="field-label">Текущий сервер</div><div class="limit" data-performance-value="Server">—</div></div>
-    <div class="field"><div class="field-label">Сетевой адаптер</div><div class="limit" data-performance-value="Adapter">—</div></div>
-    <div class="field"><div class="field-label">Query-адрес</div><div class="limit" data-performance-value="Query">—</div></div>
-    <div class="field"><label>Query-порт: <input type="number" min="0" max="65535" step="1" data-performance-port value="${settings.QueryPort || 0}" style="width:110px"></label><button class="action" data-performance-save-port>Применить</button></div>
-    <div class="limit">0 — автоматический поиск через Steam и проверку типовых портов. Ручной порт нужен, только если автоматический поиск не сработал.</div>
-    <div class="limit">Пинг — время UDP-ответа A2S_INFO, оно может отличаться от внутреннего пинга DayZ. Запрос использует локальный адрес игрового трафика; VPN с правилами по приложениям может направить его другим маршрутом. При отсутствии ответа выводится «—», после повторных ошибок опрос замедляется.</div>
-    <div class="limit">Галочка включает и выключает измерения. В установленной версии Windows запросит разрешение только при первой настройке; при последующих запусках всё включится автоматически. Основное окно работает с обычными правами.</div>
+  const settings = { ...(state.performanceDefaults || {}), ...(state.dayZ?.settings?.Performance || {}) };
+  const port = settings.QueryPort || 0;
+  const manualPort = port > 0 || queryPortDraft !== null;
+  const metric = (label, key, status = "") => `<div class="field">
+    <span>${label}</span><strong class="compact-value" data-performance-value="${key}">—</strong>
+    ${status ? `<span class="limit" data-performance-value="${status}" data-performance-note></span>` : ""}
   </div>`;
+  return `<h2>Пинг и FPS</h2>
+    <div class="field">
+      <label class="compact-row">Измерять пинг и FPS DayZ <input type="checkbox" data-performance-check="Enabled" ${settings.Enabled ? "checked" : ""}></label>
+      ${settings.Enabled ? '<span class="limit" data-performance-value="HelperStatus" data-performance-note></span>' : ""}
+    </div>
+    <div class="compact-metrics">
+      ${metric("Текущий FPS", "Fps", "FpsStatus")}
+      ${metric("Пинг сервера", "Ping", "PingStatus")}
+      ${settings.ShowFrameTime ? metric("Время кадра", "FrameTime") : ""}
+      ${settings.ShowOnePercentLow ? metric("1% low", "OnePercentLow") : ""}
+      ${settings.ShowJitter ? metric("Колебания пинга", "Jitter") : ""}
+    </div>
+    ${settings.ShowFrameGraph ? `<div class="field"><h3>Время кадра за последнюю минуту</h3><canvas data-performance-graph style="width:100%;height:110px"></canvas></div>` : ""}
+    ${settingsDetails("performance-overlay", "Оверлей FPS", renderPerformanceOverlay(settings))}
+    ${settingsDetails("performance-connection", "Сервер и опрос", `
+      <div class="field">
+        <div class="compact-row"><span>Текущий сервер</span><span class="compact-value" data-performance-value="Server">—</span></div>
+        <div class="compact-row"><span>Сетевой адаптер</span><span class="compact-value" data-performance-value="Adapter">—</span></div>
+        <div class="compact-row"><span>Адрес опроса</span><span class="compact-value" data-performance-value="Query">—</span></div>
+      </div>
+      <div class="field">
+        <label class="compact-row">Порт опроса <select data-performance-port-mode>
+          <option value="auto" ${manualPort ? "" : "selected"}>Автопоиск</option>
+          <option value="manual" ${manualPort ? "selected" : ""}>Вручную</option>
+        </select></label>
+        <form class="compact-row" data-performance-port-form ${manualPort ? "" : "hidden"}>
+          <label class="compact-row">Порт <input type="number" min="1" max="65535" step="1" required data-performance-port value="${escapeHtml(queryPortDraft ?? (port || ""))}"></label>
+          <button class="action" type="submit">Применить</button>
+        </form>
+        <span class="limit">Пинг измеряется по UDP-ответам A2S и может отличаться от значения в игре.</span>
+      </div>`)}`;
 }
 
-function renderPerformanceSettings() {
-  const s = { ...(state.performanceDefaults || {}), ...(state.dayZ?.settings?.Performance || {}) };
-  const check = (label, key) => `<label><input type="checkbox" data-performance-check="${key}" ${s[key] ? "checked" : ""}> ${label}</label>`;
-  const number = (label, key, min, max) => `<div class="field"><label>${label}<br><input type="number" data-performance-number="${key}" min="${min}" max="${max}" step="1" value="${s[key]}"></label></div>`;
-  const opacity = (label, key) => `<div class="field"><label>${label}: <span data-performance-opacity-label="${key}">${s[key] ?? s.Opacity ?? 90}</span>%<br><input type="range" data-performance-number="${key}" min="0" max="100" step="1" value="${s[key] ?? s.Opacity ?? 90}"></label></div>`;
-  const color = (label, key) => `<div class="field performance-colors"><label>${label}</label><input type="color" data-performance-color="${key}" value="${s[key]}"></div>`;
+function renderPerformanceOverlay(s) {
+  const check = (label, key) => `<label class="compact-row">${label}<input type="checkbox" data-performance-check="${key}" ${s[key] ? "checked" : ""}></label>`;
+  const number = (label, key, min, max) => `<label class="field compact-row">${label}<input type="number" data-performance-number="${key}" min="${min}" max="${max}" step="1" value="${s[key]}"></label>`;
+  const opacity = (label, key) => {
+    const value = s[key] ?? s.Opacity ?? 90;
+    return `<label class="field"><span>${label} · <span data-performance-opacity-label="${key}">${value}</span>%</span><input type="range" data-performance-number="${key}" min="0" max="100" step="1" value="${value}"></label>`;
+  };
+  const color = (label, key) => `<label class="field compact-row">${label}<input type="color" data-performance-color="${key}" value="${s[key]}"></label>`;
   const monitors = (state.monitors || []).map(m => `<option value="${escapeHtml(m.DeviceName)}" ${m.DeviceName === s.MonitorDeviceName ? "selected" : ""}>${escapeHtml(m.DisplayName)}</option>`).join("");
-  return `<h2>Настройки оверлея</h2><div class="control-group">
-    <div class="field">${check("Показывать оверлей", "ShowOverlay")}</div>
-    <div class="field">${check("Показывать только в DayZ", "ShowOnlyInGame")}<div class="limit">Оверлей привязан к окну DayZ, следует за ним и перекрывается другими окнами вместе с игрой. При сворачивании или закрытии игры скрывается. Положение отсчитывается от окна игры. Снимите галочку, чтобы показывать оверлей поверх всех окон, включая закрытую игру.</div></div>
-    <div class="field">${check("Разрешить перемещение и изменение размера", "EditingEnabled")}</div>
-    <div class="limit">При включённом перемещении оверлей виден и вне игры для настройки: перетащите окно мышью, а за края — измените размер. После настройки выключите перемещение: клики будут проходить в игру. Положение сохраняется автоматически.</div>
-    <div class="field"><label>Монитор<br><select data-performance-select="MonitorDeviceName"><option value="" ${!s.MonitorDeviceName ? "selected" : ""}>Основной монитор</option>${monitors}</select></label></div>
-    <div class="performance-grid">
-      ${number("Ширина окна, px", "Width", 120, 1200)}${number("Высота окна, px", "Height", 32, 500)}
-      ${number("Отступ слева, px", "Left", 0, 100000)}${number("Отступ сверху, px", "Top", 0, 100000)}
+  return `<div class="field">
+      ${check("Показывать оверлей", "ShowOverlay")}
+      ${check("Показывать только в DayZ", "ShowOnlyInGame")}
     </div>
-    <h3>Оформление</h3>
-    <div class="performance-grid">
-      <div class="field performance-colors"><label>Цвет текста</label><input type="color" data-performance-color="TextColor" value="${s.TextColor}"></div>
-      <div class="field performance-colors"><label>Цвет фона</label><input type="color" data-performance-color="BackgroundColor" value="${s.BackgroundColor}"></div>
-    </div>
-    <div class="performance-grid">${opacity("Непрозрачность текста", "TextOpacity")}${opacity("Непрозрачность фона", "BackgroundOpacity")}</div>
-    <div class="field"><div>Шрифт: ${escapeHtml(s.FontFamily || "Segoe UI")}</div><button class="action" data-command="selectPerformanceFont">Выбрать шрифт…</button></div>
-    <div class="performance-grid">
-      ${number("Размер шрифта, pt", "FontSize", 8, 72)}
-      <div class="field">${check("Жирный", "Bold")}${check("Курсив", "Italic")}</div>
-    </div>
-    <div class="performance-grid">
-      <div class="field"><label>Расположение показателей<br><select data-performance-select="VerticalLayout"><option value="false" ${!s.VerticalLayout ? "selected" : ""}>В одну строку</option><option value="true" ${s.VerticalLayout ? "selected" : ""}>Друг под другом</option></select></label></div>
-      <div class="field"><label>Выравнивание текста<br><select data-performance-select="Alignment">${[["Left", "Слева"], ["Center", "По центру"], ["Right", "Справа"]].map(([value, label]) => `<option value="${value}" ${s.Alignment === value ? "selected" : ""}>${label}</option>`).join("")}</select></label></div>
-    </div>
-    <div class="performance-grid"><div class="field">${check("Показывать FPS", "ShowFps")}</div><div class="field">${check("Показывать пинг", "ShowPing")}</div></div>
-    <h3>Дополнительные показатели</h3>
-    <div class="performance-grid"><div class="field">${check("Время кадра", "ShowFrameTime")}</div><div class="field">${check("1% low", "ShowOnePercentLow")}</div>
-      <div class="field">${check("График просадок", "ShowFrameGraph")}</div><div class="field">${check("Jitter пинга", "ShowJitter")}</div></div>
-    <div class="limit">1% low и jitter считаются за последние 30 секунд. График показывает пиковое время кадра за каждую секунду последней минуты: высокий пик означает длинный кадр.</div>
-    <button class="action" data-command="fitPerformanceOverlay">Подогнать размер окна по содержимому</button>
-    <h3>Цвет по порогам</h3>
-    <div class="field">${check("Подсвечивать FPS, 1% low и пинг по порогам", "ColorByThresholds")}</div>
-    <div class="performance-grid">${number("FPS: предупреждение ниже", "FpsWarning", 1, 1000)}${number("FPS: критический ниже", "FpsCritical", 1, 1000)}
-      ${number("Пинг: предупреждение от, мс", "PingWarning", 1, 10000)}${number("Пинг: критический от, мс", "PingCritical", 1, 10000)}</div>
-    <div class="performance-grid">${color("Норма", "GoodColor")}${color("Предупреждение", "WarningColor")}${color("Критическое значение", "CriticalColor")}</div>
-    <button class="action" data-performance-reset>Сбросить настройки оверлея</button>
-  </div>`;
+    ${settingsDetails("overlay-metrics", "Показатели", `<div class="field">
+      ${check("Показывать FPS", "ShowFps")}
+      ${check("Показывать пинг", "ShowPing")}
+      ${check("Время кадра", "ShowFrameTime")}
+      ${check("1% low", "ShowOnePercentLow")}
+      ${check("График просадок", "ShowFrameGraph")}
+      ${check("Колебания пинга", "ShowJitter")}
+    </div>`)}
+    ${settingsDetails("overlay-placement", "Расположение и размер", `
+      <div class="field">
+        ${check("Разрешить перемещение и изменение размера", "EditingEnabled")}
+        ${s.EditingEnabled ? '<div class="limit">Перетащите оверлей или потяните за край. Выключите этот режим, чтобы клики снова проходили в игру.</div>' : ""}
+        <label class="compact-row">Монитор <select data-performance-select="MonitorDeviceName"><option value="" ${!s.MonitorDeviceName ? "selected" : ""}>Основной монитор</option>${monitors}</select></label>
+      </div>
+      <div class="performance-grid">
+        ${number("Ширина, px", "Width", 120, 1200)}${number("Высота, px", "Height", 32, 500)}
+        ${number("Отступ слева, px", "Left", 0, 100000)}${number("Отступ сверху, px", "Top", 0, 100000)}
+      </div>
+      <div class="actions"><button class="action" data-command="fitPerformanceOverlay">Подогнать размер по содержимому</button></div>`)}
+    ${settingsDetails("overlay-style", "Оформление", `
+      <div class="performance-grid">${color("Цвет текста", "TextColor")}${color("Цвет фона", "BackgroundColor")}</div>
+      <div class="performance-grid">${opacity("Непрозрачность текста", "TextOpacity")}${opacity("Непрозрачность фона", "BackgroundOpacity")}</div>
+      <div class="field compact-row"><span>Шрифт · ${escapeHtml(s.FontFamily || "Segoe UI")}</span><button class="action" data-command="selectPerformanceFont">Выбрать шрифт…</button></div>
+      <div class="performance-grid">
+        ${number("Размер шрифта, pt", "FontSize", 8, 72)}
+        <div class="field">${check("Жирный", "Bold")}${check("Курсив", "Italic")}</div>
+      </div>
+      <div class="field">
+        <label class="compact-row">Расположение показателей <select data-performance-select="VerticalLayout"><option value="false" ${!s.VerticalLayout ? "selected" : ""}>В одну строку</option><option value="true" ${s.VerticalLayout ? "selected" : ""}>Друг под другом</option></select></label>
+        <label class="compact-row">Выравнивание текста <select data-performance-select="Alignment">${[["Left", "Слева"], ["Center", "По центру"], ["Right", "Справа"]].map(([value, label]) => `<option value="${value}" ${s.Alignment === value ? "selected" : ""}>${label}</option>`).join("")}</select></label>
+      </div>`)}
+    ${settingsDetails("overlay-thresholds", "Цвет по порогам", `
+      <div class="field">${check("Подсвечивать FPS, 1% low и пинг по порогам", "ColorByThresholds")}</div>
+      <div class="performance-grid">
+        ${number("FPS: предупреждение ниже", "FpsWarning", 1, 1000)}${number("FPS: критический ниже", "FpsCritical", 1, 1000)}
+        ${number("Пинг: предупреждение от, мс", "PingWarning", 1, 10000)}${number("Пинг: критический от, мс", "PingCritical", 1, 10000)}
+      </div>
+      <div class="performance-grid">${color("Норма", "GoodColor")}${color("Предупреждение", "WarningColor")}${color("Критическое значение", "CriticalColor")}</div>`)}
+    <div class="actions"><button class="action" data-performance-reset>Сбросить настройки оверлея</button></div>`;
 }
 
 function refreshPerformanceStatus() {
@@ -2147,6 +2634,7 @@ function refreshPerformanceStatus() {
   document.querySelectorAll("[data-performance-value]").forEach(element => {
     const key = element.dataset.performanceValue;
     const value = data[key];
+    if (element.hasAttribute("data-performance-note")) element.hidden = !value;
     element.textContent = key === "Fps" || key === "OnePercentLow" ? (Number.isFinite(value) ? Math.round(value).toString() : "—")
       : key === "Ping" ? (Number.isFinite(value) ? `${Math.round(value)} мс` : "—")
       : key === "FrameTime" || key === "Jitter" ? (Number.isFinite(value) ? `${value.toFixed(1)} мс` : "—")
@@ -2160,9 +2648,165 @@ function refreshPerformanceStatus() {
     const values = data.FrameTimeHistory || [], finite = values.filter(Number.isFinite), max = Math.max(33.3, ...finite);
     ctx.strokeStyle = "#444"; ctx.beginPath(); ctx.moveTo(0, 20); ctx.lineTo(width, 20); ctx.moveTo(0, height - 4); ctx.lineTo(width, height - 4); ctx.stroke();
     ctx.fillStyle = "#aaa"; ctx.font = "11px Segoe UI"; ctx.fillText(`${Math.round(max)} мс`, 0, 12);
-    ctx.strokeStyle = state.dayZ?.settings?.Performance?.TextColor || "#eeb15b"; ctx.lineWidth = 1.5; ctx.beginPath(); let connected = false;
+    ctx.strokeStyle = state.dayZ?.settings?.Performance?.TextColor || "#00e2ed"; ctx.lineWidth = 1.5; ctx.beginPath(); let connected = false;
     values.forEach((value, i) => { if (!Number.isFinite(value)) { connected = false; return; } const x = i * width / Math.max(1, values.length - 1), y = height - 4 - value / max * (height - 24); if (connected) ctx.lineTo(x, y); else ctx.moveTo(x, y); connected = true; }); ctx.stroke();
   }
+}
+
+const sessionMaps = {
+  cherno: "Черноруссия",
+  deerisle: "Deer Isle",
+  deadfall: "Deadfall",
+  nasdara: "Nasdara"
+};
+let sessionMapObserver;
+let lastMapPlacement = "";
+
+function syncSessionMapPlacement() {
+  const map = document.querySelector("[data-session-map]");
+  const grid = map?.parentElement;
+  const viewport = grid?.getBoundingClientRect();
+  const bounds = map?.getBoundingClientRect();
+  const left = bounds ? Math.ceil(Math.max(bounds.left, viewport.left) + 1) : 0;
+  const top = bounds ? Math.ceil(Math.max(bounds.top, viewport.top) + 1) : 0;
+  const right = bounds ? Math.floor(Math.min(bounds.right, viewport.left + grid.clientWidth) - 1) : 0;
+  const bottom = bounds ? Math.floor(Math.min(bounds.bottom, viewport.top + grid.clientHeight) - 1) : 0;
+  const scale = window.devicePixelRatio;
+  const placement = { map: map?.dataset.map || "", left: Math.round(left * scale), top: Math.round(top * scale),
+    width: Math.round(Math.max(0, right - left) * scale), height: Math.round(Math.max(0, bottom - top) * scale) };
+  const signature = JSON.stringify(placement);
+  if (signature === lastMapPlacement) return;
+  lastMapPlacement = signature;
+  post({ type: "sessionMap", ...placement });
+}
+
+function renderOverview() {
+  return `<h1>Игровая сессия</h1>
+    <div class="session-bar">
+      <span>${icon("server")}<b data-session-server>Нет подключения к серверу</b></span>
+      <span>${icon("map")}<b data-session-world>—</b></span>
+    </div>
+    <div class="session-grid">
+      <div class="session-map" data-session-map aria-label="Интерактивная карта" role="region">
+        <p data-session-map-status>Загрузка карты…</p>
+        <button class="action" data-command="openSessionMap">Открыть карту в браузере ↗</button>
+      </div>
+      <div class="session-side">
+        <div class="session-card">
+          <h2>Позиция игрока</h2>
+          <div class="session-coordinates">
+            <div class="session-coordinate" title="Последняя распознанная координата X">X<b data-session-x>—</b></div>
+            <div class="session-coordinate" title="Последняя распознанная координата Z">Z<b data-session-z>—</b></div>
+          </div>
+          <button class="action session-visibility" data-tab="player-position" title="Настроить видимость позиции">${icon("eye")}<span data-session-visibility>Только мне</span>${icon("chevronDown")}</button>
+        </div>
+        <div class="session-card session-markers">
+          <h2>Метки</h2>
+          <div class="session-marker-list" data-session-markers></div>
+          ${renderSessionMarkerActions("session-marker-actions")}
+        </div>
+      </div>
+    </div>
+    <footer class="session-footer">
+      <button class="action" data-tab="performance">FPS <b data-performance-value="Fps">—</b></button>
+      <button class="action" data-tab="performance">Пинг <b data-performance-value="Ping">—</b></button>
+    </footer>`;
+}
+
+function renderSessionMarkerActions(className = "") {
+  return `<div class="actions ${className}">
+    <button class="action" data-command="exportSessionMarkers" title="Сохранить метки игры в JSON">Выгрузить из игры</button>
+    <button class="action primary" data-command="importSessionMarkers" title="Загрузить метки из JSON">Загрузить в игру</button>
+    <div class="limit session-marker-import-hint" data-session-marker-import-hint hidden></div>
+  </div>`;
+}
+
+function refreshOverview() {
+  refreshSessionMarkers();
+  const mapBody = document.querySelector("[data-session-map]");
+  if (!mapBody) return;
+  const performance = state.performance || {};
+  const settings = state.playerPosition?.settings || {};
+  const server = performance.Server || "";
+  const mapKey = (performance.MapName || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const activeMap = ["chernarus", "chernarusplus"].includes(mapKey) ? "cherno" : mapKey;
+  const mapId = server ? activeMap : "cherno";
+  const map = Object.hasOwn(sessionMaps, mapId) ? sessionMaps[mapId] : null;
+  const position = Number.isInteger(settings.LastX) && Number.isInteger(settings.LastZ)
+    ? { Name: "Последняя позиция игрока", X: settings.LastX, Z: settings.LastZ }
+    : null;
+  const setText = (key, value) => {
+    const element = document.querySelector(`[data-session-${key}]`);
+    if (element.textContent !== String(value)) element.textContent = value;
+    return element;
+  };
+  const serverLabel = performance.ServerName || server || "Нет подключения к серверу";
+  setText("server", serverLabel).title = serverLabel;
+  setText("world", server ? map || performance.MapName || "Карта определяется" : sessionMaps.cherno).title =
+    server ? performance.MapName || "Карта определяется" : "Обзорная карта";
+  setText("x", position?.X ?? "—");
+  setText("z", position?.Z ?? "—");
+  setText("visibility", settings.Visibility === "public" ? "Всем на сайте" : settings.Visibility === "profiles" ? "Выбранные профили" : "Только мне");
+  const page = map ? mapId : "";
+  if (mapBody.dataset.map !== page) {
+    mapBody.dataset.map = page;
+    setText("map-status", page ? "Загрузка карты…" : performance.MapName ? "Эта карта недоступна для встраивания." : "Определяем карту сервера…");
+    syncSessionMapPlacement();
+  }
+}
+
+function refreshSessionMarkers() {
+  const list = document.querySelector("[data-session-markers]");
+  if (!list) return;
+  const server = state.performance?.Server || "";
+  const status = state.dayZ?.status || {};
+  const markers = server && server === status.MarkerServer ? status.SessionMarkers || [] : [];
+  const markerMessage = !server ? "Список меток сервера появится после подключения." :
+    !status.PrivateMarkersPath ? "Укажите файл меток в настройках." :
+    status.MarkerServer !== server ? "Чтение меток…" : "У текущего сервера пока нет меток.";
+  const listSignature = JSON.stringify([markers, markerMessage]);
+  if (list.dataset.content !== listSignature) {
+    closeSessionMarkerMenu();
+    list.innerHTML = markers.length ? markers.map(({ Name, X, Z }, index) =>
+      `<div class="session-marker">${icon("marker")}<span title="${escapeHtml(Name)}">${escapeHtml(Name)}</span><span><em>X</em> ${Math.round(X)}</span><span><em>Z</em> ${Math.round(Z)}</span><button type="button" class="session-marker-menu" aria-label="Действия с меткой ${escapeHtml(Name)}" aria-haspopup="menu" aria-expanded="false" aria-controls="session-marker-popover" data-session-marker-menu="${index}">…</button></div>`).join("") :
+      `<p class="session-empty">${markerMessage}</p>`;
+    list.dataset.content = listSignature;
+  }
+  const importButton = document.querySelector('[data-command="importSessionMarkers"]');
+  const reason = state.markerImportBlockReason || (!status.FileWritable ? "Выберите доступный для записи файл меток." : "");
+  importButton.disabled = Boolean(reason);
+  const hint = document.querySelector("[data-session-marker-import-hint]");
+  hint.textContent = reason;
+  hint.hidden = !reason;
+}
+
+function closeSessionMarkerMenu(restoreFocus = false) {
+  if (!sessionMarkerSelection) return;
+  const { trigger } = sessionMarkerSelection;
+  sessionMarkerSelection = null;
+  trigger.setAttribute("aria-expanded", "false");
+  sessionMarkerPopover.hidePopover();
+  if (restoreFocus) trigger.focus({ preventScroll: true });
+}
+
+function toggleSessionMarkerMenu(trigger) {
+  if (sessionMarkerSelection?.trigger === trigger) {
+    closeSessionMarkerMenu(true);
+    return;
+  }
+  closeSessionMarkerMenu();
+  const marker = state.dayZ?.status?.SessionMarkers?.[Number(trigger.dataset.sessionMarkerMenu)];
+  if (!marker) return;
+  sessionMarkerSelection = { trigger, marker };
+  trigger.setAttribute("aria-expanded", "true");
+  sessionMarkerPopover.showPopover();
+  const bounds = trigger.getBoundingClientRect();
+  const height = sessionMarkerPopover.offsetHeight;
+  const below = bounds.bottom + 4;
+  const top = below + height <= window.innerHeight - 4 ? below : bounds.top - height - 4;
+  sessionMarkerPopover.style.left = `${Math.max(4, bounds.right - sessionMarkerPopover.offsetWidth)}px`;
+  sessionMarkerPopover.style.top = `${Math.max(top, document.getElementById("editor").getBoundingClientRect().top + 4)}px`;
+  sessionMarkerPopover.firstElementChild.focus({ preventScroll: true });
 }
 
 function renderPlayerPosition() {
@@ -2174,39 +2818,50 @@ function renderPlayerPosition() {
   const selectedProfiles = new Set(s.ProfileIds || []);
   const selectedShape = playerPositionShapes.find(item => item.id === s.IndicatorShape) || playerPositionShapes[0];
   const shapeOptions = playerPositionShapes.map(item => `<option value="${item.id}" ${item.id === selectedShape.id ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("");
-  const last = Number.isInteger(s.LastX) ? `X=${s.LastX}, Y=${s.LastY}, Z=${s.LastZ}` : "ещё не распознана";
-  const status = s.Enabled && !s.Paused ? "включено" : s.Paused ? "на паузе" : "выключено";
-  return `<h2>Позиция игрока</h2>${renderOcrStatus()}<div class="control-group">
-    <div class="limit">Захватывается только выделенная область видимого HUD; память игры, инъекции и игровой ввод не используются.</div>
-    <div class="field"><label><input type="checkbox" data-position-enabled ${s.Enabled ? "checked" : ""}> Отслеживание: ${status} (${s.Enabled ? "снимите галочку, чтобы отключить отслеживание" : "поставьте галочку, чтобы включить отслеживание"})</label></div>
-    <div class="field"><label><input type="checkbox" data-position-paused ${s.Paused ? "checked" : ""}> Пауза</label></div>
-    <div class="field"><label>Кому показывать позицию <select data-position-visibility>
+  const status = !s.Enabled ? "Выключено" : s.Paused ? "На паузе" : "Включено";
+  return `<h2>Позиция игрока</h2>
+    <div class="field">
+      <div class="compact-row"><h3>Отслеживание</h3><span class="compact-value">${status}</span></div>
+      <label class="compact-row">Отслеживать позицию <input type="checkbox" data-position-enabled ${s.Enabled ? "checked" : ""}></label>
+      ${s.Enabled || s.Paused ? `<label class="compact-row">Пауза <input type="checkbox" data-position-paused ${s.Paused ? "checked" : ""}></label>` : ""}
+      <div class="compact-row"><span>Последняя позиция</span><span class="compact-value" data-player-position-last>—</span></div>
+    </div>
+    <div class="field"><label class="compact-row">Кому показывать позицию <select data-position-visibility>
       <option value="private" ${!["public", "profiles"].includes(s.Visibility) ? "selected" : ""}>Только для меня</option>
       <option value="public" ${s.Visibility === "public" ? "selected" : ""}>Всем на сайте</option>
       <option value="profiles" ${s.Visibility === "profiles" ? "selected" : ""}>Выбранные профили</option>
     </select></label>
-      <div class="limit">${s.Visibility === "public" ? "Позицию увидят все посетители соответствующей карты. Для передачи войдите в аккаунт сайта." : s.Visibility === "profiles" ? "Позиция видна только внутри выбранных серверных профилей участникам с доступом к ним. В других активных профилях она скрыта." : "Позиция остаётся в вашем браузере и не отправляется другим пользователям."}</div>
-      ${s.Visibility === "profiles" ? `<div class="position-profile-choices">${profiles.map(item => `<label><input type="checkbox" data-position-profile value="${escapeHtml(item.Id)}" ${selectedProfiles.has(item.Id) ? "checked" : ""}> ${escapeHtml(item.Name)}</label>`).join("") || `<div class="limit">Нет доступных серверных профилей для этой карты. Войдите в аккаунт на сайте и создайте профиль или получите доступ к общему.</div>`}</div>` : ""}
+      <div class="limit">${s.Visibility === "public" ? "Позицию увидят все посетители карты. Для передачи войдите в аккаунт." : s.Visibility === "profiles" ? "Позицию увидят участники выбранных серверных профилей." : "Позиция видна только вам в браузере."}</div>
+      ${s.Visibility === "profiles" ? `<div class="position-profile-choices">${profiles.map(item => `<label><input type="checkbox" data-position-profile value="${escapeHtml(item.Id)}" ${selectedProfiles.has(item.Id) ? "checked" : ""}><span>${escapeHtml(item.Name)}</span></label>`).join("") || `<div class="limit">Нет доступных профилей для этой карты. Войдите на DayZ-Map, чтобы выбрать профиль.</div>`}</div>` : ""}
     </div>
+    <div class="field">
+      <div class="compact-row"><h3>Область координат</h3><span class="limit">${s.HasRegion ? "Настроена" : "Не выбрана"}</span></div>
+      <div class="actions"><button class="action primary" data-command="selectPlayerPositionRegion">Настроить область координат</button><button class="action" data-command="showPlayerPositionHint">Подсказка</button></div>
+      ${state.ocr?.Ready === false ? `<div class="compact-row"><span class="limit">Для распознавания координат нужен OCR.</span><button class="action" data-command="installOcr">Установить OCR</button></div>` : ""}
+      ${destination ? "" : `<div class="limit">Откройте DayZ-Map, чтобы подключить карту.</div>`}
+      <div class="limit" data-player-position-error hidden></div>
+    </div>
+    ${settingsDetails("position-display", "Отображение и обновление", `
     <div class="field" data-position-centering-block>
-      <label><input type="checkbox" data-position-center ${s.CenterOnPlayer ? "checked" : ""}> Центрировать карту на позиции игрока</label>
-      <label><input type="checkbox" data-position-keep-zoom ${s.KeepZoom !== false ? "checked" : ""} ${s.CenterOnPlayer ? "" : "disabled"}> Не изменять зум при центрировании</label>
-      <label>Зум центрирования <input class="number" data-position-zoom type="number" min="2" max="12" step="1" value="${s.CenteringZoom ?? 8}" ${s.CenterOnPlayer && s.KeepZoom === false ? "" : "disabled"}></label>
-      <div class="limit">Допустимый диапазон: 2–12.</div>
+      <label class="compact-row">Центрировать карту на позиции игрока <input type="checkbox" data-position-center ${s.CenterOnPlayer ? "checked" : ""}></label>
+      <label class="compact-row">Сохранять текущий зум <input type="checkbox" data-position-keep-zoom ${s.KeepZoom !== false ? "checked" : ""} ${s.CenterOnPlayer ? "" : "disabled"}></label>
+      <label class="compact-row">Зум центрирования <input class="number" data-position-zoom type="number" min="2" max="12" step="1" value="${s.CenteringZoom ?? 8}" ${s.CenterOnPlayer && s.KeepZoom === false ? "" : "disabled"}></label>
     </div>
     <div class="field" data-position-marker-block>
-      <label>Имя маркера <input data-position-name type="text" value="${escapeHtml(s.MarkerName || "")}" placeholder="Подпись маркера"></label>
-      <label>Цвет индикатора <input class="treasure-color-picker" data-position-color type="color" value="${escapeHtml(s.MarkerColor || "#3498db")}" title="Цвет индикатора"></label>
-      <label>Фигура индикатора <select data-position-shape>${shapeOptions}</select></label>
-      <label>Размер маркера, пикселей <input class="number" data-position-size type="number" min="16" max="48" step="1" value="${s.MarkerSize ?? 32}"></label>
-      <div class="limit">Допустимый диапазон размера: 16–48 пикселей.</div>
-      <div class="limit">Это временный индикатор позиции — он не добавляется в профиль, списки и экспорт карты.</div>
+      <label class="compact-row">Имя маркера <input data-position-name type="text" value="${escapeHtml(s.MarkerName || "")}" placeholder="Подпись маркера"></label>
+      <label class="compact-row">Цвет индикатора <input class="treasure-color-picker" data-position-color type="color" value="${escapeHtml(s.MarkerColor || "#3498db")}"></label>
+      <label class="compact-row">Фигура индикатора <select data-position-shape>${shapeOptions}</select></label>
+      <label class="compact-row">Размер маркера, пикселей <input class="number" data-position-size type="number" min="16" max="48" step="1" value="${s.MarkerSize ?? 32}"></label>
     </div>
-    <div class="field"><label>Интервал, секунд <input class="number" data-position-interval type="number" min="2" max="300" value="${s.IntervalSeconds || 5}"></label><div class="limit">Допустимый диапазон: 2–300 секунд.</div></div>
-    <div class="actions"><button class="action" data-command="selectPlayerPositionRegion">Настроить область координат</button><button class="action" data-command="showPlayerPositionHint">Подсказка</button><button class="action" data-command="testPlayerPosition">Тест распознавания</button><button class="action" data-command="openPlayerPositionDiagnostics" ${diagnostics ? "" : "disabled"}>Открыть диагностику OCR</button></div>
-    <div class="limit" data-player-position-status>Область: ${s.HasRegion ? "настроена" : "не выбрана"}. Последняя позиция: ${last}. Последняя отправка: ${s.LastSentAt ? new Date(s.LastSentAt).toLocaleString() : "—"}. Ошибок подряд: ${s.ConsecutiveErrors || 0}.</div>
-    <div class="limit ${s.LastError ? "hotkey-warning" : ""}" data-player-position-error>${escapeHtml(s.LastError || (s.Enabled ? data.feedback : "") || "")}</div>${diagnostics ? `<div class="limit">OCR ${diagnostics.Recognized ? "распознано" : "не распознано"}: ${escapeHtml((diagnostics.RawText || "").slice(0, 180))}</div>` : ""}${destination ? "" : `<div class="limit">Откройте DayZ-Map в браузере — Companion подключится автоматически.</div>`}
-  </div>`;
+    <div class="field"><label class="compact-row">Интервал обновления, секунд <input class="number" data-position-interval type="number" min="2" max="300" value="${s.IntervalSeconds || 5}"></label></div>`)}
+    ${settingsDetails("position-diagnostics", "Диагностика", `
+      ${renderOcrStatus()}
+      <div class="field">
+        <div class="compact-row"><span>Последняя отправка</span><span class="compact-value" data-player-position-sent>—</span></div>
+        <div class="compact-row"><span>Ошибок подряд</span><span class="compact-value" data-player-position-errors>0</span></div>
+        <div class="limit" data-player-position-ocr-result hidden></div>
+        <div class="actions"><button class="action" data-command="testPlayerPosition">Тест распознавания</button><button class="action" data-command="openPlayerPositionDiagnostics" ${diagnostics ? "" : "disabled"}>Открыть диагностику OCR</button></div>
+      </div>`)}`;
 }
 
 function renderTreasures() {
@@ -2214,12 +2869,24 @@ function renderTreasures() {
   const readyItems = items.filter(item => Number.isInteger(item.X) && Number.isInteger(item.Z));
   const duplicateKeys = new Set(readyItems.map(item => `${item.X}:${item.Z}`).filter((key, _, all) => all.filter(value => value === key).length > 1));
   const errors = items.filter(item => item.Status === "Ambiguous");
-  const cards = items.map(item => {
-    const duplicate = duplicateKeys.has(`${item.X}:${item.Z}`);
-    const result = item.SentAt || item.DeliveryResult ? `<div class="limit ${item.SentAt ? "" : "hotkey-warning"}">${escapeHtml(item.DeliveryResult || "Отправлено")}</div>` : duplicate ? `<div class="limit hotkey-warning">⚠ Дубликат координат в очереди.</div>` : "";
-    const retry = item.Status === "Ambiguous" ? `<button class="action" data-treasure="retry" data-id="${item.Id}">Повторить OCR</button>` : "";
-    return `<div class="field"><div class="field-label">${escapeHtml(new Date(item.CapturedAt).toLocaleString())}</div>${item.preview ? `<img class="treasure-preview" data-treasure-preview src="${item.preview}" alt="Скриншот уведомления">` : ""}<div class="actions"><input class="number" data-treasure-x="${item.Id}" value="${item.X ?? ""}" placeholder="X"><input class="number" data-treasure-z="${item.Id}" value="${item.Z ?? ""}" placeholder="Z">${retry}<button class="action" data-treasure="delete" data-id="${item.Id}">Удалить</button></div>${result}<div class="limit">${escapeHtml(item.RawText || "Ожидание OCR…")}</div></div>`;
-  }).join("") || `<div class="limit">Пока нет захватов.</div>`;
+  const selected = items.find(item => item.Id === selectedTreasureId) || items[0];
+  if ((selected?.Id ?? null) !== selectedTreasureId) {
+    selectedTreasureId = selected?.Id ?? null;
+    treasureCaptureExpanded = true;
+  }
+  const captureStatus = {
+    Queued: "В очереди", Recognizing: "Распознаётся", NeedsReview: "Нужно проверить",
+    Recognized: "Распознано", Ambiguous: "Ошибка OCR"
+  };
+  const captures = items.map(item => `<div class="treasure-entry">
+    <button type="button" class="action treasure-list-item"
+      data-treasure-select="${escapeHtml(item.Id)}" ${item === selected ? 'aria-controls="treasure-capture-detail"' : ""}>
+      <span>${escapeHtml(new Date(item.CapturedAt).toLocaleString())}</span>
+      <span class="limit">${item.SentAt ? "Отправлено" : escapeHtml(captureStatus[item.Status] || "—")}</span>
+      ${Number.isInteger(item.X) && Number.isInteger(item.Z) ? `<span class="compact-value">X ${item.X} · Z ${item.Z}</span>` : ""}
+    </button>
+    ${item === selected ? '<div class="treasure-inline"></div>' : ""}
+  </div>`).join("");
   const queue = state.treasures?.processing ? `<div class="limit">⏳ Распознаю координаты. В очереди: ${state.treasures.queued}.</div>` : "";
   const destination = state.treasures?.destination;
   const maps = destination?.Maps || [];
@@ -2242,14 +2909,77 @@ function renderTreasures() {
   const typeOptions = treasureMarkerTypes.map(item => `<button type="button" class="treasure-type-option ${item.id === selectedMarkerType.id ? "active" : ""}" data-treasure-type-option="${item.id}">${treasureMarkerIcon(item.id, item.color)}<span>${escapeHtml(item.name)}</span></button>`).join("");
   const choicePicker = (kind, items, value, isOpen, opensUp) => {
     const selected = items.find(item => item.Id === value);
-    return `<div class="treasure-choice-picker ${opensUp ? "open-up" : ""}"><button type="button" class="treasure-choice-trigger" data-treasure-choice-toggle="${kind}">${escapeHtml(selected?.Name || "Не выбрано")}</button><div class="treasure-choice-menu" ${isOpen ? "" : "hidden"}>${items.map(item => `<button type="button" class="treasure-choice-option ${item.Id === value ? "active" : ""}" data-treasure-choice-option data-treasure-choice-kind="${kind}" data-treasure-choice-value="${item.Id}">${escapeHtml(item.Name)}</button>`).join("")}</div></div>`;
+    return `<div class="treasure-choice-picker ${opensUp ? "open-up" : ""}"><button type="button" class="treasure-choice-trigger" data-treasure-choice-toggle="${kind}"><span>${escapeHtml(selected?.Name || "Не выбрано")}</span></button><div class="treasure-choice-menu" ${isOpen ? "" : "hidden"}>${items.map(item => `<button type="button" class="treasure-choice-option ${item.Id === value ? "active" : ""}" data-treasure-choice-option data-treasure-choice-kind="${kind}" data-treasure-choice-value="${escapeHtml(item.Id)}">${escapeHtml(item.Name)}</button>`).join("")}</div></div>`;
   };
   const mapPicker = choicePicker("map", maps, treasureMapId, treasureMapMenuOpen, treasureMapMenuUp);
   const profilePicker = choicePicker("profile", profiles, treasureProfileId, treasureProfileMenuOpen, treasureProfileMenuUp);
-  const destinationUi = !destination ? `<div class="field"><div class="field-label">Карта</div><div class="limit">Откройте DayZ-Map в браузере: Companion ожидает подключение карты.</div></div>` : `<div class="field"><div class="field-label">Отправка на карту</div><div class="treasure-destination-grid"><label>Карта${mapPicker}</label><label>Профиль${profilePicker}</label></div><div class="treasure-template-label">Настройки метки<div class="treasure-template-row"><input type="text" data-treasure-template-name value="${escapeHtml(selectedTemplate.name)}" placeholder="Название метки" maxlength="300"><div class="treasure-type-picker ${treasureTypeMenuUp ? "open-up" : ""}"><input type="hidden" data-treasure-template-type value="${selectedMarkerType.id}"><button type="button" class="treasure-type-trigger" data-treasure-type-toggle>${treasureMarkerIcon(selectedMarkerType.id, selectedMarkerType.color)}<span>${escapeHtml(selectedMarkerType.name)}</span></button><div class="treasure-type-menu" ${treasureTypeMenuOpen ? "" : "hidden"}>${typeOptions}</div></div><input class="treasure-color-picker" data-treasure-template-color type="color" value="${selectedColor}" title="Цвет метки"></div></div><div><button class="action primary" data-treasure-send ${!treasureProfileId ? "disabled" : ""}>Отправить координаты</button></div><div class="limit">Шаблон задаётся для этой отправки и не изменяет настройки профиля на карте.</div></div>`;
+  const destinationUi = !destination ? `<div class="field"><div class="field-label">Карта</div><div class="limit">Откройте DayZ-Map в браузере: Companion ожидает подключение карты.</div></div>` : `<div class="field"><div class="field-label">Отправка на карту</div><div class="treasure-destination-grid"><label>Карта${mapPicker}</label><label>Профиль${profilePicker}</label></div><div class="treasure-template-label">Настройки метки<div class="treasure-template-row"><input type="text" data-treasure-template-name value="${escapeHtml(selectedTemplate.name)}" placeholder="Название метки" maxlength="300"><div class="treasure-type-picker ${treasureTypeMenuUp ? "open-up" : ""}"><input type="hidden" data-treasure-template-type value="${selectedMarkerType.id}"><button type="button" class="treasure-type-trigger" data-treasure-type-toggle>${treasureMarkerIcon(selectedMarkerType.id, selectedMarkerType.color)}<span>${escapeHtml(selectedMarkerType.name)}</span></button><div class="treasure-type-menu" ${treasureTypeMenuOpen ? "" : "hidden"}>${typeOptions}</div></div><input class="treasure-color-picker" data-treasure-template-color type="color" value="${selectedColor}" title="Цвет метки"></div></div><div><button class="action primary" data-treasure-send ${!treasureProfileId ? "disabled" : ""}>Отправить координаты</button></div><div class="limit">Шаблон действует только для этой отправки.</div></div>`;
   const feedback = state.treasures?.feedback ? `<div class="limit">${escapeHtml(state.treasures.feedback)}</div>` : "";
-  const preview = treasurePreviewUri ? `<div class="treasure-image-modal" data-treasure-preview-close><img src="${treasurePreviewUri}" alt="Скриншот уведомления"></div>` : "";
-  return `<h2>Клады</h2>${renderOcrStatus()}<div class="control-group"><div class="field-row"><span>Горячая клавиша захвата</span><button class="action" data-hotkey="CaptureTreasure">${displayHotkey(state.config.Hotkeys.CaptureTreasure)}</button></div>${hotkeyRegistrationWarning("CaptureTreasure")}<div class="actions"><button class="action primary" data-command="captureTreasure" ${state.treasures?.selecting ? "disabled" : ""}>Выделить область уведомления</button><button class="action" data-command="openTreasureCapturesFolder">Открыть папку PNG</button><button class="action" data-treasure="clear" ${items.length ? "" : "disabled"}>Очистить все</button>${errors.length ? `<button class="action" data-treasure="clearErrors">Удалить ошибки OCR (${errors.length})</button>` : ""}</div>${queue}${feedback}${cards}${destinationUi}${preview}</div>`;
+  const preview = treasurePreviewUri ? `<div class="treasure-image-modal" data-treasure-preview-close><img src="${escapeHtml(treasurePreviewUri)}" alt="Скриншот уведомления"></div>` : "";
+  const controls = `<div class="compact-stack">
+    <div class="field">
+      <div class="actions"><button class="action primary" data-command="captureTreasure" ${state.treasures?.selecting ? "disabled" : ""}>Выделить область уведомления</button></div>
+      ${queue}${feedback}
+    </div>
+    <div class="field"><h3>Захваты</h3>
+      ${captures ? `<div class="treasure-list">${captures}</div>` : '<div class="limit">Пока нет захватов.</div>'}
+    </div>
+    ${destinationUi}
+    ${settingsDetails("treasure-diagnostics", "Горячая клавиша, OCR и файлы", `
+      ${renderOcrStatus()}
+      <div class="field"><div class="compact-row"><span>Горячая клавиша захвата</span><button class="action" data-hotkey="CaptureTreasure">${displayHotkey(state.config.Hotkeys.CaptureTreasure)}</button></div>${hotkeyRegistrationWarning("CaptureTreasure")}</div>
+      <div class="actions">
+        <button class="action" data-command="openTreasureCapturesFolder">Открыть папку PNG</button>
+        <button class="action danger" data-treasure="clear" ${items.length ? "" : "disabled"}>Очистить все</button>
+        ${errors.length ? `<button class="action" data-treasure="clearErrors">Удалить ошибки OCR (${errors.length})</button>` : ""}
+      </div>`)}
+  </div>`;
+  if (!selected) return `<h2>Клады</h2>${controls}`;
+
+  const draft = treasureCoordinateTimers.get(selected.Id);
+  const duplicate = duplicateKeys.has(`${selected.X}:${selected.Z}`);
+  const result = selected.SentAt || selected.DeliveryResult
+    ? `<div class="limit ${selected.SentAt ? "" : "hotkey-warning"}">${escapeHtml(selected.DeliveryResult || "Отправлено")}</div>`
+    : duplicate ? '<div class="limit hotkey-warning">В очереди есть захват с такими же координатами.</div>' : "";
+  const id = escapeHtml(selected.Id);
+  return `<h2>Клады</h2>
+    <div class="settings-workspace treasure-workspace">${controls}
+      <div class="settings-side treasure-capture-side">
+        <section class="field" id="treasure-capture-detail"><h3>Выбранный захват</h3>
+          <div class="compact-row treasure-coordinates">
+            <label class="compact-row">X <input type="number" step="1" data-treasure-x="${id}" value="${draft?.x ?? selected.X ?? ""}"></label>
+            <label class="compact-row">Z <input type="number" step="1" data-treasure-z="${id}" value="${draft?.z ?? selected.Z ?? ""}"></label>
+          </div>
+          ${selected.preview ? `<button class="treasure-preview-button" data-treasure-preview aria-label="Увеличить скриншот уведомления"><img class="treasure-preview" src="${escapeHtml(selected.preview)}" alt="Скриншот уведомления"></button>` : ""}
+          ${result}
+          <div class="actions">
+            ${selected.Status === "Ambiguous" ? `<button class="action" data-treasure="retry" data-id="${id}">Повторить OCR</button>` : ""}
+            <button class="action danger" data-treasure="delete" data-id="${id}">Удалить захват</button>
+          </div>
+          ${selected.RawText ? settingsDetails("treasure-raw-text", "Распознанный текст", `<div class="limit">${escapeHtml(selected.RawText)}</div>`) : ""}
+        </section>
+      </div>
+    </div>${preview}`;
+}
+
+function syncTreasureCaptureLayout() {
+  const workspace = document.querySelector(".treasure-workspace");
+  if (!workspace) return;
+  const wide = getComputedStyle(workspace).getPropertyValue("--treasure-side").trim() === "1";
+  const panel = document.getElementById("treasure-capture-detail");
+  const host = workspace.querySelector(wide ? ".treasure-capture-side" : ".treasure-inline");
+  panel.hidden = !wide && !treasureCaptureExpanded;
+  if (panel.parentElement !== host) {
+    const focused = panel.contains(document.activeElement) ? document.activeElement : null;
+    host.append(panel);
+    if (!panel.hidden) focused?.focus({ preventScroll: true });
+  }
+  workspace.querySelectorAll("[data-treasure-select]").forEach(button => {
+    const selected = button.dataset.treasureSelect === selectedTreasureId;
+    button.removeAttribute(wide ? "aria-expanded" : "aria-pressed");
+    button.setAttribute(wide ? "aria-pressed" : "aria-expanded", selected && (wide || treasureCaptureExpanded));
+    button.classList.toggle("active", selected && (wide || treasureCaptureExpanded));
+  });
 }
 
 function renderHotkeys() {
@@ -2262,20 +2992,23 @@ function renderHotkeys() {
     ["SizeUp", "Размер больше"],
     ["SizeDown", "Размер меньше"]
   ];
-  return `<h2>Горячие клавиши</h2>` + keys.map(([key, label]) => {
-    const binding = state.config.Hotkeys[key];
-    return field(label, {
-      input: `<div class="actions"><button class="action" data-hotkey="${key}">${displayHotkey(binding)}</button><button class="action" data-hotkey-clear="${key}">Очистить</button></div>${hotkeyRegistrationWarning(key)}`
-    });
-  }).join("");
+  return renderHotkeyRows("Горячие клавиши", keys);
+}
+
+function renderHotkeyRows(title, keys) {
+  return `<h2>${title}</h2>` + keys.map(([key, label]) =>
+    `<div class="field"><div class="compact-row"><span>${label}</span><div class="actions">
+      <button class="action" data-hotkey="${key}">${displayHotkey(state.config.Hotkeys[key])}</button>
+      <button class="action" data-hotkey-clear="${key}">Очистить</button>
+    </div></div>${hotkeyRegistrationWarning(key)}</div>`).join("");
 }
 
 function renderMonitor() {
   const value = state.config.TargetMonitorDeviceName || "";
-  const options = state.monitors.map(m => `<option value="${m.DeviceName}" ${m.DeviceName === value ? "selected" : ""}>${escapeHtml(m.DisplayName)}</option>`).join("");
+  const options = (state.monitors || []).map(m => `<option value="${escapeHtml(m.DeviceName)}" ${m.DeviceName === value ? "selected" : ""}>${escapeHtml(m.DisplayName)}</option>`).join("");
   return `
     <h2>Монитор</h2>
-    ${field("Целевой монитор", { input: `<select id="monitorSelect">${options}</select>` })}
+    ${settingRow("Целевой монитор", `<select id="monitorSelect">${options}</select>`)}
     <div class="actions">
       <button class="action" data-command="refreshMonitors">Обновить мониторы</button>
     </div>
@@ -2287,68 +3020,72 @@ const manualTaskDrafts = new Map();
 function renderManualTaskRow(task, isNew = false) {
   const key = isNew ? "new" : task.Id;
   const draft = manualTaskDrafts.get(key) || task;
-  return `<div class="field" data-manual-row="${escapeHtml(key)}"><div class="actions">
-    <input data-manual-field="Title" value="${escapeHtml(draft.Title || "")}" placeholder="Название личной задачи" aria-label="Название личной задачи">
-    <label>Текущее <input class="number" type="number" min="0" step="1" data-manual-field="Current" value="${draft.Current ?? 0}"></label>
-    <label>Цель <input class="number" type="number" min="1" step="1" data-manual-field="Target" value="${draft.Target || ""}"></label>
-    <button class="action primary" data-manual-save>${isNew ? "Добавить задачу" : "Сохранить"}</button>
-    ${isNew ? "" : `<button class="action danger" data-manual-delete>Удалить</button>`}
-  </div></div>`;
+  return `<div class="field" data-manual-row="${escapeHtml(key)}">
+    <input type="text" data-manual-field="Title" value="${escapeHtml(draft.Title || "")}" placeholder="Название личной задачи" aria-label="Название личной задачи">
+    <div class="manual-task-progress">
+      <label class="compact-row">Текущее <input type="number" min="0" step="1" data-manual-field="Current" value="${draft.Current ?? 0}"></label>
+      <label class="compact-row">Цель <input type="number" min="1" step="1" data-manual-field="Target" value="${draft.Target || ""}"></label>
+    </div>
+    <div class="actions">
+      <button class="action ${isNew ? "primary" : ""}" data-manual-save>${isNew ? "Добавить задачу" : "Сохранить"}</button>
+      ${isNew ? "" : `<button class="action danger" data-manual-delete>Удалить</button>`}
+    </div>
+  </div>`;
 }
 
 function renderBattlePass() {
   const bp = state.battlePass || { settings: {}, snapshot: { Tasks: [] } };
   const s = bp.settings;
-  const ocr = bp.ocr;
+  const ocr = bp.ocr ?? state.ocr;
   const tasks = bp.snapshot?.Tasks || [];
-  const monitors = [{ DeviceName: "", DisplayName: "Основной монитор" }, ...state.monitors];
-  const monitorOptions = monitors.map(m => `<option value="${m.DeviceName}" ${m.DeviceName === (s.MonitorDeviceName || "") ? "selected" : ""}>${escapeHtml(m.DisplayName)}</option>`).join("");
-  return `
-    <h2>Отслеживание заданий</h2>
-    ${renderOcrStatus(ocr)}
-    <div class="limit">Откройте нужную страницу Battle Pass в DayZ и нажмите соответствующую кнопку сканирования ниже. Для еженедельных заданий повторите для страниц 1 и 2.</div>
-    ${field("Монитор", { input: `<select data-bp-select="MonitorDeviceName">${monitorOptions}</select>` })}
-    <div class="settings-columns">
-    <div class="settings-card">
-    <h3>Отображение заданий</h3>
-    ${field("Оверлей", { input: `
-      <label><input type="checkbox" data-bp-check="OverlayVisible" ${s.OverlayVisible ? "checked" : ""}> Включить</label>
-      <label><input type="checkbox" data-bp-check="ShowOnlyInGame" ${s.ShowOnlyInGame ? "checked" : ""}> Показывать только в DayZ</label>
-      <label><input type="checkbox" data-bp-check="ShowCompleted" ${s.ShowCompleted ? "checked" : ""}> Выполненные</label>
-      <label><input type="checkbox" data-bp-check="ShowSeasonal" ${s.ShowSeasonal ? "checked" : ""}> Сезонные</label>
-      <label><input type="checkbox" data-bp-check="ShowTaskDescriptions" ${s.ShowTaskDescriptions ? "checked" : ""}> Показывать описания</label>
-      <label><input type="checkbox" data-bp-check="OverlayEditingEnabled" ${s.OverlayEditingEnabled ? "checked" : ""}> Перемещение и изменение размера</label>
-      <label><input type="checkbox" data-bp-check="SaveDebugScreenshot" ${s.SaveDebugScreenshot ? "checked" : ""}> Сохранять отладочный снимок</label>` })}
-    </div>
-    <div class="settings-card">
-    <h3>Размер и оформление</h3>
-    ${field("Размер", { input: `<label>Ширина <input type="number" min="220" max="900" value="${s.Width || 360}" data-bp-number="Width"></label> <label>Высота <input type="number" min="92" max="850" value="${s.Height || 470}" data-bp-number="Height"></label> <label>Шрифт <input type="number" min="9" max="28" value="${s.FontSize || 14}" data-bp-number="FontSize"></label> <label>Прозрачность <input type="number" min="40" max="255" value="${s.Opacity || 230}" data-bp-number="Opacity"></label>` })}
-    </div>
-    </div>
-    <div class="settings-card">
-    <h3>Сканирование и личные задачи</h3>
-    <div class="actions task-settings-actions">
-      <button class="action primary" data-command="scanBattlePassDaily">Сканировать ежедневные</button>
-      <button class="action primary" data-command="scanBattlePassSeasonal">Сканировать сезонные</button>
-      <button class="action primary" data-command="scanBattlePassWeeklyPage1">Сканировать еженедельные — стр. 1</button>
-      <button class="action primary" data-command="scanBattlePassWeeklyPage2">Сканировать еженедельные — стр. 2</button>
-    </div>
-    <h3>Список личных задач</h3>
-    ${(bp.manualTasks || []).map(task => renderManualTaskRow(task)).join("") || `<div class="limit">Личных задач пока нет.</div>`}
-    ${renderManualTaskRow({ Title: "", Current: 0, Target: "" }, true)}
-    </div>
-    <div class="settings-card">
-    <h3>Зоны и данные</h3>
-    <div class="limit">Для точной настройки используйте «Настроить зоны на экране»: зоны можно перетаскивать и менять их размер прямо поверх текущего изображения Battle Pass.</div>
-    <div class="actions task-settings-actions">
-      <button class="action primary" data-command="calibrateBattlePassZones">Настроить зоны на экране</button>
-      <button class="action" data-command="showBattlePassDebug">Открыть отладочный снимок</button>
-      <button class="action" data-command="resetBattlePassOverlayBounds">Сбросить положение и размер оверлея</button>
-      <button class="action danger" data-command="clearBattlePass">Очистить данные</button>
-    </div>
-    <div class="update-status">Последнее обновление: ${bp.snapshot?.UpdatedAt ? escapeHtml(new Date(bp.snapshot.UpdatedAt).toLocaleString()) : "ещё не выполнялось"}. Сохранено заданий: ${tasks.length}.</div>
-    </div>
-  `;
+  const updated = bp.snapshot?.UpdatedAt ? escapeHtml(new Date(bp.snapshot.UpdatedAt).toLocaleString()) : "";
+  const monitors = [{ DeviceName: "", DisplayName: "Основной монитор" }, ...(state.monitors || [])];
+  const monitorOptions = monitors.map(m => `<option value="${escapeHtml(m.DeviceName)}" ${m.DeviceName === (s.MonitorDeviceName || "") ? "selected" : ""}>${escapeHtml(m.DisplayName)}</option>`).join("");
+  const taskCheck = (label, key) => settingRow(label, `<input type="checkbox" data-bp-check="${key}" ${s[key] ? "checked" : ""}>`);
+  const taskNumber = (label, key, min, max, fallback) => settingRow(label, `<input type="number" min="${min}" max="${max}" value="${s[key] ?? fallback}" data-bp-number="${key}">`);
+  const taskResults = tasks.map(task => `<li class="compact-row"><span>${escapeHtml(task.Title)}</span><span class="compact-value">${escapeHtml(task.Completed ? "Готово" : task.ProgressText || "—")}</span></li>`).join("");
+  return `<h2>Отслеживание заданий</h2>
+    <div class="settings-workspace">
+      <div class="compact-stack">
+        <div class="field"><h3>Сканирование Battle Pass</h3>
+          <div class="limit">Откройте нужную страницу заданий в DayZ.</div>
+          <div class="actions task-settings-actions">
+            <button class="action primary" data-command="scanBattlePassDaily">Ежедневные</button>
+            <button class="action" data-command="scanBattlePassSeasonal">Сезонные</button>
+            <button class="action" data-command="scanBattlePassWeeklyPage1">Еженедельные · стр. 1</button>
+            <button class="action" data-command="scanBattlePassWeeklyPage2">Еженедельные · стр. 2</button>
+          </div>
+          ${updated ? `<div class="limit">Обновлено ${updated}</div>` : ""}
+          ${ocr?.Ready === false ? `<div class="compact-row"><span class="limit">Для сканирования нужен OCR.</span><button class="action" data-command="installOcr">Установить OCR</button></div>` : ""}
+        </div>
+        <div class="field"><h3>Распознанные задания</h3>${taskResults ? `<ul class="task-result-list">${taskResults}</ul>` : '<div class="limit">Пока нет распознанных заданий.</div>'}</div>
+        ${settingsDetails("tasks-overlay", "Оверлей заданий", `
+          ${taskCheck("Показывать оверлей", "OverlayVisible")}
+          ${taskCheck("Показывать только в DayZ", "ShowOnlyInGame")}
+          ${taskCheck("Показывать выполненные", "ShowCompleted")}
+          ${taskCheck("Показывать сезонные", "ShowSeasonal")}
+          ${taskCheck("Показывать описания", "ShowTaskDescriptions")}
+          ${taskCheck("Перемещение и изменение размера", "OverlayEditingEnabled")}
+          ${settingRow("Монитор", `<select data-bp-select="MonitorDeviceName">${monitorOptions}</select>`)}
+          ${taskNumber("Ширина, px", "Width", 220, 900, 360)}
+          ${taskNumber("Высота, px", "Height", 92, 850, 470)}
+          ${taskNumber("Размер шрифта", "FontSize", 9, 28, 14)}
+          ${taskNumber("Непрозрачность", "Opacity", 40, 255, 230)}
+          <div class="actions"><button class="action" data-command="resetBattlePassOverlayBounds">Сбросить положение и размер оверлея</button></div>`)}
+        ${settingsDetails("tasks-diagnostics", "Зоны захвата и диагностика", `
+          ${renderOcrStatus(ocr)}
+          ${taskCheck("Сохранять отладочный снимок", "SaveDebugScreenshot")}
+          <div class="actions">
+            <button class="action" data-command="calibrateBattlePassZones">Настроить зоны на экране</button>
+            <button class="action" data-command="showBattlePassDebug">Открыть отладочный снимок</button>
+            <button class="action danger" data-command="clearBattlePass">Очистить данные</button>
+          </div>`)}
+      </div>
+      <section class="field settings-side"><h3>Личные задачи</h3>
+        ${(bp.manualTasks || []).map(task => renderManualTaskRow(task)).join("") || '<div class="limit">Личных задач пока нет.</div>'}
+        ${renderManualTaskRow({ Title: "", Current: 0, Target: "" }, true)}
+      </section>
+    </div>`;
 }
 
 function renderBattlePassHotkeys() {
@@ -2357,24 +3094,21 @@ function renderBattlePassHotkeys() {
     ["ScanBattlePass", "Считать экран"],
     ["ToggleBattlePassDescriptions", "Свернуть/развернуть описания"]
   ];
-  return `<h2>Отслеживание заданий — горячие клавиши</h2>` + keys.map(([key, label]) => {
-    const binding = state.config.Hotkeys[key];
-    return field(label, { input: `<div class="actions"><button class="action" data-hotkey="${key}">${displayHotkey(binding)}</button><button class="action" data-hotkey-clear="${key}">Очистить</button></div>${hotkeyRegistrationWarning(key)}` });
-  }).join("");
+  return renderHotkeyRows("Горячие клавиши заданий", keys);
 }
 
 function renderProfiles() {
   const selected = selectedProfile();
-  const profileOptions = state.config.Profiles.map(profile => `<option value="${profile.Id}" ${profile.Id === state.config.ActiveProfileId ? "selected" : ""}>${escapeHtml(profile.Name)}</option>`).join("");
+  const profileOptions = state.config.Profiles.map(profile => `<option value="${escapeHtml(profile.Id)}" ${profile.Id === state.config.ActiveProfileId ? "selected" : ""}>${escapeHtml(profile.Name)}</option>`).join("");
   const list = state.config.Profiles.map(profile => `
-    <button type="button" class="${profile.Id === selected.Id ? "active" : ""}" data-profile-select="${profile.Id}">
+    <button type="button" class="${profile.Id === selected.Id ? "active" : ""}" aria-pressed="${profile.Id === selected.Id}" data-profile-select="${escapeHtml(profile.Id)}">
       ${escapeHtml(profile.Name)}
     </button>
   `).join("");
   return `
     <h2>Профили</h2>
-    ${field("Активный профиль", { input: `<select id="profileSelect" class="profile-select">${profileOptions}</select>` })}
-    ${field("Список профилей", { input: `<div class="profile-list">${list}</div>` })}
+    ${settingRow("Активный профиль", `<select id="profileSelect" class="profile-select">${profileOptions}</select>`)}
+    <div class="field"><h3>Профили для редактирования</h3><div class="profile-list">${list}</div></div>
     ${text("Название профиля", "profileName", selected.Name)}
     <div class="actions">
       <button class="action primary" data-profile="add">Добавить</button>
@@ -2391,7 +3125,7 @@ function renderDayZ() {
   const path = status.PrivateMarkersPath || settings.PrivateMarkersPath || "Не найден";
   const fileState = status.FileError
     ? `Ошибка: ${escapeHtml(status.FileError)}`
-    : status.FileWritable ? "Файл доступен для чтения и записи" : "Укажите путь к файлу DayZ";
+    : status.FileWritable ? "Доступен для чтения и записи" : "Укажите путь к файлу игры";
   const address = status.Port ? `http://127.0.0.1:${status.Port}` : "—";
   const backups = status.Backups || [];
   const backupList = backups.length
@@ -2399,63 +3133,65 @@ function renderDayZ() {
     : "Резервных копий пока нет.";
   const dayZWarning = status.DayZRunning
     ? (settings.BlockWritesWhenDayZRunning
-      ? "DayZ_x64.exe запущен: импорт будет запрещён настройкой."
-      : "DayZ_x64.exe запущен: безопаснее импортировать на экране выбора персонажа или после закрытия игры.")
+      ? "DayZ запущен. Запись меток заблокирована настройкой."
+      : "DayZ запущен. Загружайте метки на экране выбора персонажа или после закрытия игры.")
     : "DayZ не запущен.";
   const actionDisabled = dayZStatusPending ? "disabled" : "";
-  const actionFeedback = dayZActionFeedback || "Нажмите «Проверить», чтобы обновить статус файла и API.";
-  return `
-    <h2>Метки DayZ</h2>
-    <div class="settings-card">
-    <h3>Подключение и файл</h3>
-    ${field("Статус API", { input: `<div class="update-status">${escapeHtml(status.ServiceStatus)}<span>${escapeHtml(address)} · обновляется автоматически</span></div>` })}
-    ${field("Последняя операция", { input: `<div class="update-status">${escapeHtml(status.LastOperation || "Операций с метками пока не было.")}</div>` })}
-    ${field("Состояние DayZ", { input: `<div class="update-status">${escapeHtml(dayZWarning)}</div>` })}
-    ${field("PrivateMarkers.json", { input: `<div class="update-status"><span>${escapeHtml(path)}</span><span>${fileState}</span></div>` })}
-    ${field("Действие", { input: `<div class="update-status">${escapeHtml(actionFeedback)}</div>` })}
-    <div class="actions">
-      <button class="action primary" data-command="selectDayZMarkersFile">Выбрать файл</button>
-      <button class="action" data-command="clearDayZMarkersFile" ${actionDisabled}>Искать автоматически</button>
-      <button class="action" data-command="refreshDayZStatus" ${actionDisabled}>Проверить</button>
-      <button class="action" data-command="openDayZMarkersFolder">Открыть папку</button>
-      <button class="action" data-command="openRuntimeLog">Открыть журнал</button>
-    </div>
-    </div>
-    <div class="settings-columns">
-    <div class="settings-card">
-    <h3>Параметры API</h3>
-    ${field("Автоматически выбрать порт", { value: `<input type="checkbox" ${settings.AutoPort ? "checked" : ""} data-dayz-check="AutoPort">`, input: `` })}
-    ${field("Порт API", { input: `<input type="number" min="1" max="65535" value="${settings.Port}" ${settings.AutoPort ? "disabled" : ""} data-dayz-number="Port">` })}
-    ${field("Разрешить localhost:8000", { value: `<input type="checkbox" ${settings.AllowDevelopmentOrigin ? "checked" : ""} data-dayz-check="AllowDevelopmentOrigin">`, input: `` })}
-    ${field("Запрещать запись при запущенном DayZ", { value: `<input type="checkbox" ${settings.BlockWritesWhenDayZRunning ? "checked" : ""} data-dayz-check="BlockWritesWhenDayZRunning">`, input: `` })}
-    </div>
-    <div class="settings-card">
-    <h3>Резервные копии</h3>
-    ${field("Максимум резервных копий", { input: `<input type="number" min="1" max="100" value="${settings.BackupLimit}" data-dayz-number="BackupLimit">` })}
-    ${field("Хранить backup, дней", { input: `<input type="number" min="1" max="3650" value="${settings.BackupMaxAgeDays}" data-dayz-number="BackupMaxAgeDays">` })}
-    ${field("Последние backup", { input: `<div class="update-status">${backupList}</div>` })}
-    </div>
-    </div>
-    <div class="limit">DayZ-Map.ru Companion не аффилирован и не авторизован Bohemia Interactive a.s. DAYZ является товарным знаком Bohemia Interactive a.s.</div>
-  `;
+  return `<h2>Метки DayZ</h2>
+    <div class="settings-workspace">
+      <div class="compact-stack">
+        <div class="field">
+          <div class="compact-row compact-control"><h3>Файл меток</h3><span class="compact-value">${escapeHtml(path)}</span></div>
+          <div class="limit">${fileState}</div>
+          <div class="limit">${dayZWarning}</div>
+          ${dayZActionFeedback ? `<div class="limit" role="status">${escapeHtml(dayZActionFeedback)}</div>` : ""}
+          <div class="actions">
+            <button class="action primary" data-command="selectDayZMarkersFile">Выбрать файл</button>
+            <button class="action" data-command="clearDayZMarkersFile" ${actionDisabled}>Искать автоматически</button>
+            <button class="action" data-command="refreshDayZStatus" ${actionDisabled}>Проверить</button>
+            <button class="action" data-command="openDayZMarkersFolder">Открыть папку</button>
+          </div>
+        </div>
+        ${settingRow("Запрещать запись при запущенном DayZ", `<input type="checkbox" ${settings.BlockWritesWhenDayZRunning ? "checked" : ""} data-dayz-check="BlockWritesWhenDayZRunning">`)}
+        ${settingsDetails("markers-backups", "Резервные копии", `
+          ${settingRow("Максимум копий", `<input type="number" min="1" max="100" value="${settings.BackupLimit}" data-dayz-number="BackupLimit">`)}
+          ${settingRow("Хранить, дней", `<input type="number" min="1" max="3650" value="${settings.BackupMaxAgeDays}" data-dayz-number="BackupMaxAgeDays">`)}
+          <div class="field"><h3>Последние копии</h3><div class="update-status">${backupList}</div></div>`)}
+        ${settingsDetails("markers-api", "Подключение и API", `
+          <div class="field">
+            <div class="compact-row"><span>Статус API</span><span class="compact-value">${escapeHtml(status.ServiceStatus)}</span></div>
+            <div class="compact-row"><span>Адрес</span><span class="compact-value">${escapeHtml(address)}</span></div>
+            <div class="limit">${escapeHtml(status.LastOperation || "Операций с метками пока не было.")}</div>
+          </div>
+          ${settingRow("Автоматически выбирать порт", `<input type="checkbox" ${settings.AutoPort ? "checked" : ""} data-dayz-check="AutoPort">`)}
+          ${settings.AutoPort ? "" : settingRow("Порт API", `<input type="number" min="1" max="65535" value="${settings.Port}" data-dayz-number="Port">`)}
+          ${settingRow("Разрешить localhost:8000", `<input type="checkbox" ${settings.AllowDevelopmentOrigin ? "checked" : ""} data-dayz-check="AllowDevelopmentOrigin">`)}
+          <div class="actions"><button class="action" data-command="openRuntimeLog">Открыть журнал</button></div>
+          <div class="limit">DayZ-Map.ru Companion не аффилирован и не авторизован Bohemia Interactive a.s. DAYZ является товарным знаком Bohemia Interactive a.s.</div>`)}
+      </div>
+      <section class="field settings-side"><h3>Метки текущего сервера</h3>
+        <div class="session-marker-list" data-session-markers></div>
+        ${renderSessionMarkerActions()}
+      </section>
+    </div>`;
 }
 
 function renderUpdates() {
-  if (state.microsoftStore) return `<h2>Обновление</h2><div class="limit">Эта версия обновляется через Microsoft Store. Проверить обновления можно в библиотеке магазина.</div><div class="actions"><button class="action primary" data-command="checkUpdate">Открыть Microsoft Store</button></div>`;
+  if (state.microsoftStore) return `<h2>Обновление</h2>
+    <div class="field"><h3>Microsoft Store</h3><div class="limit">Обновления доступны в библиотеке магазина.</div>
+      <div class="actions"><button class="action primary" data-command="checkUpdate">Открыть Microsoft Store</button></div>
+    </div>`;
   const info = state.update;
   const operation = state.updateProgress || {};
   const busy = !!operation.IsBusy;
-  const progressHtml = operation.Message ? field("Обновление Companion", { input: `<div class="update-status" role="status" aria-live="polite">${escapeHtml(operation.Message)}</div>${busy ? `<progress style="width:100%;accent-color:#efb458" max="100" ${Number.isInteger(operation.Percent) ? `value="${operation.Percent}"` : ""}></progress>` : ""}${operation.CanCancel ? `<button class="action" data-command="cancelUpdate">Отменить скачивание</button>` : ""}` }) : "";
+  const progressHtml = operation.Message ? field("Обновление Companion", { input: `<div class="update-status" role="status" aria-live="polite">${escapeHtml(operation.Message)}</div>${busy ? `<progress style="width:100%;accent-color:var(--accent)" max="100" ${Number.isInteger(operation.Percent) ? `value="${operation.Percent}"` : ""}></progress>` : ""}${operation.CanCancel ? `<div class="actions"><button class="action" data-command="cancelUpdate">Отменить скачивание</button></div>` : ""}` }) : "";
   if (!info) {
-    return `
-      <h2>Обновление</h2>
+    return `<h2>Обновление</h2>
       ${progressHtml}
-      ${field("Статус", { input: `<div class="update-status">Проверка еще не выполнялась.</div>` })}
-      <div class="actions">
+      <div class="field"><div class="limit">Проверка ещё не выполнялась.</div><div class="actions">
         <button class="action primary" data-command="checkUpdate">Проверить</button>
         <button class="action" data-command="openCompanionReleases">Открыть релизы</button>
-      </div>
-    `;
+      </div></div>`;
   }
 
   const status = info.ErrorMessage
@@ -2464,25 +3200,55 @@ function renderUpdates() {
       ? `<strong>Доступна новая версия ${escapeHtml(info.LatestVersion)}</strong>`
       : "Установлена актуальная версия.";
   const published = info.PublishedAt ? new Date(info.PublishedAt).toLocaleDateString() : "";
-  const notes = (info.ReleaseNotes || "Описание версии не указано.").trim();
+  const notes = (info.ReleaseNotes || "").trim() || "Описание версии не указано.";
   const downloadDisabled = !info.InstallerUrl && !info.ReleaseUrl ? "disabled" : "";
-
-  return `<div class="updates-layout">
-      <h2>Обновление</h2>
+  return `<h2>Обновление</h2>
+    <div class="compact-stack">
       ${progressHtml}
-      ${field("Статус", { input: `<div class="update-status">${status}<span>Текущая версия: ${escapeHtml(info.CurrentVersion)}</span><span>Последняя версия: ${escapeHtml(info.LatestVersion || "-")}${published ? " от " + escapeHtml(published) : ""}</span></div>` })}
-      <div class="update-notes-slot">${field("Описание версии", { input: `<div class="release-notes">${renderMarkdown(notes)}</div>` })}</div>
+      <div class="field">
+        <div class="update-status" role="status">${status}</div>
+        <div class="compact-row"><span>Текущая версия</span><span class="compact-value">${escapeHtml(info.CurrentVersion)}</span></div>
+        <div class="compact-row"><span>Последняя версия</span><span class="compact-value">${escapeHtml(info.LatestVersion || "—")}${published ? " · " + escapeHtml(published) : ""}</span></div>
+      </div>
+      <section class="field update-notes-slot"><h3>Описание версии</h3><div class="release-notes">${renderMarkdown(notes)}</div></section>
       <div class="actions">
         <button class="action primary" data-command="installUpdate" ${info.CanInstall && !busy ? "" : "disabled"}>Обновить и перезапустить</button>
         <button class="action" data-command="checkUpdate" ${busy ? "disabled" : ""}>Проверить снова</button>
         <button class="action" data-command="downloadUpdate" ${busy ? "disabled" : downloadDisabled}>Скачать установщик</button>
         <button class="action" data-command="openCompanionReleases">Открыть релизы</button>
       </div>
-      <div class="limit">Обновление загрузится в Companion. Для установки приложение закроется и запустится снова. Windows запросит разрешение на установку.${info.IsUpdateAvailable && !info.CanInstall ? " Для этого релиза встроенное обновление недоступно — используйте кнопку «Скачать установщик»." : ""}</div>
-  </div>`;
+      ${info.IsUpdateAvailable ? `<div class="limit">${info.CanInstall ? "Windows запросит разрешение на установку." : "Для этой версии доступно обновление через установщик."}</div>` : ""}
+    </div>`;
+}
+
+function saveTreasureCoordinates(id) {
+  const draft = treasureCoordinateTimers.get(id);
+  if (!draft) return;
+  clearTimeout(draft.timer);
+  treasureCoordinateTimers.delete(id);
+  post({ type: "treasure", action: "edit", id, x: draft.x, z: draft.z });
 }
 
 function bindEditorEvents() {
+  document.querySelectorAll("[data-settings-disclosure]").forEach(details => {
+    details.addEventListener("toggle", () => {
+      if (!details.isConnected) return;
+      const key = details.dataset.settingsDisclosure;
+      if (details.open) expandedSettings.add(key);
+      else expandedSettings.delete(key);
+    });
+  });
+  refreshPlayerPositionStatus();
+  refreshOverview();
+  sessionMapObserver?.disconnect();
+  const map = document.querySelector("[data-session-map]");
+  if (map) {
+    sessionMapObserver ||= new ResizeObserver(syncSessionMapPlacement);
+    sessionMapObserver.observe(map);
+    sessionMapObserver.observe(map.parentElement);
+    map.parentElement.addEventListener("scroll", syncSessionMapPlacement);
+  }
+  syncSessionMapPlacement();
   refreshPerformanceStatus();
   document.querySelectorAll("[data-performance-check]").forEach(input => input.addEventListener("change", () => updateDayZ(settings => {
     settings.Performance ||= {};
@@ -2511,13 +3277,28 @@ function bindEditorEvents() {
     const { Enabled, QueryPort, ShowOverlay, ShowOnlyInGame } = settings.Performance;
     settings.Performance = { ...clone(state.performanceDefaults), Enabled, QueryPort, ShowOverlay, ShowOnlyInGame };
   }));
-  document.querySelector("[data-performance-save-port]")?.addEventListener("click", () => {
-    const input = document.querySelector("[data-performance-port]");
-    if (!input.reportValidity() || input.value.trim() === "") return;
-    const value = Number(input.value);
-    if (!Number.isInteger(value) || value < 0 || value > 65535) return;
-    updateDayZ(settings => { settings.Performance ||= {}; settings.Performance.QueryPort = value; });
-  });
+  const portForm = document.querySelector("[data-performance-port-form]");
+  if (portForm) {
+    const input = portForm.querySelector("[data-performance-port]");
+    const mode = document.querySelector("[data-performance-port-mode]");
+    mode.addEventListener("change", () => {
+      const manual = mode.value === "manual";
+      portForm.hidden = !manual;
+      queryPortDraft = manual ? input.value : null;
+      if (manual) input.focus();
+      else if (state.dayZ.settings.Performance.QueryPort) updateDayZ(settings => { settings.Performance.QueryPort = 0; });
+      else input.value = "";
+    });
+    input.addEventListener("input", () => { queryPortDraft = input.value; });
+    portForm.addEventListener("submit", event => {
+      event.preventDefault();
+      if (mode.value !== "manual" || !input.reportValidity()) return;
+      const value = Number(input.value);
+      if (!Number.isInteger(value) || value < 1 || value > 65535) return;
+      queryPortDraft = null;
+      updateDayZ(settings => { settings.Performance.QueryPort = value; });
+    });
+  }
   document.querySelectorAll("[data-slider]").forEach(input => {
     const isImageSlider = input.dataset.slider.startsWith("ImageLayer.");
     input.addEventListener("input", () => {
@@ -2699,25 +3480,50 @@ function bindEditorEvents() {
   document.querySelector("[data-position-color]")?.addEventListener("input", debouncePlayerPositionSettings);
   document.querySelector("[data-position-shape]")?.addEventListener("change", () => savePlayerPositionSettings());
   document.querySelectorAll("[data-position-visibility], [data-position-profile]").forEach(input => input.addEventListener("change", () => savePlayerPositionSettings(true)));
+  syncTreasureCaptureLayout();
+  document.querySelectorAll("[data-treasure-select]").forEach(button => button.addEventListener("click", () => {
+    const id = button.dataset.treasureSelect;
+    if (selectedTreasureId === id) {
+      if (button.hasAttribute("aria-expanded")) {
+        treasureCaptureExpanded = !treasureCaptureExpanded;
+        syncTreasureCaptureLayout();
+      }
+      return;
+    }
+    selectedTreasureId = id;
+    treasureCaptureExpanded = true;
+    render();
+    const selected = document.querySelector('[aria-controls="treasure-capture-detail"]');
+    selected?.focus({ preventScroll: true });
+    selected?.scrollIntoView({ block: "nearest" });
+  }));
   document.querySelectorAll("[data-treasure]").forEach(button => {
     button.addEventListener("click", () => {
       const id = button.dataset.id;
       const action = button.dataset.treasure;
-      const x = document.querySelector(`[data-treasure-x="${id}"]`)?.value;
-      const z = document.querySelector(`[data-treasure-z="${id}"]`)?.value;
-      post({ type: "treasure", action, id, x: Number(x), z: Number(z) });
+      const cleared = action === "clear" ? [...treasureCoordinateTimers.keys()]
+        : action === "clearErrors" ? state.treasures.captures.filter(item => item.Status === "Ambiguous").map(item => item.Id)
+        : [id];
+      for (const key of cleared) {
+        clearTimeout(treasureCoordinateTimers.get(key)?.timer);
+        treasureCoordinateTimers.delete(key);
+      }
+      post({ type: "treasure", action, id });
     });
   });
   document.querySelectorAll("[data-treasure-x], [data-treasure-z]").forEach(input => input.addEventListener("input", () => {
     const id = input.dataset.treasureX || input.dataset.treasureZ;
-    clearTimeout(treasureCoordinateTimers.get(id));
-    treasureCoordinateTimers.set(id, setTimeout(() => {
-      const x = Number(document.querySelector(`[data-treasure-x="${id}"]`)?.value);
-      const z = Number(document.querySelector(`[data-treasure-z="${id}"]`)?.value);
-      if (Number.isInteger(x) && Number.isInteger(z)) post({ type: "treasure", action: "edit", id, x, z });
-    }, 350));
+    clearTimeout(treasureCoordinateTimers.get(id)?.timer);
+    treasureCoordinateTimers.delete(id);
+    const x = document.querySelector("[data-treasure-x]").valueAsNumber;
+    const z = document.querySelector("[data-treasure-z]").valueAsNumber;
+    if (!Number.isInteger(x) || !Number.isInteger(z)) return;
+    treasureCoordinateTimers.set(id, { x, z, timer: setTimeout(() => saveTreasureCoordinates(id), 350) });
   }));
-  document.querySelectorAll("[data-treasure-preview]").forEach(image => image.addEventListener("click", () => { treasurePreviewUri = image.src; render(); }));
+  document.querySelector("[data-treasure-preview]")?.addEventListener("click", event => {
+    treasurePreviewUri = event.currentTarget.querySelector("img").src;
+    render();
+  });
   document.querySelector("[data-treasure-preview-close]")?.addEventListener("click", () => { treasurePreviewUri = null; render(); });
   document.querySelectorAll("[data-treasure-choice-toggle]").forEach(button => button.addEventListener("click", () => {
     const kind = button.dataset.treasureChoiceToggle;
@@ -2802,6 +3608,7 @@ function bindEditorEvents() {
     treasureSend.textContent = `Отправить координаты (${ready.length})`;
     treasureSend.disabled = treasureSend.disabled || !ready.length || hasDuplicates;
     treasureSend.addEventListener("click", () => {
+    treasureCoordinateTimers.forEach((_, id) => saveTreasureCoordinates(id));
     saveTreasureTemplateDraft();
     const template = treasureTemplateDrafts.get(`${treasureMapId || ""}:${treasureProfileId || ""}`);
     post({
@@ -2925,7 +3732,8 @@ function hotkeyRegistrationWarning(key) {
 }
 
 function currentPreset(p) {
-  if (p.CrosshairShape !== 0) {
+  const dotShape = shapeIndex(p.DotShape, dotShapes);
+  if (shapeIndex(p.CrosshairShape, crosshairShapes) !== 0) {
     return "";
   }
   if (p.TShape && p.Length === 24 && p.Gap === 8 && p.Thickness === 3 && p.DotEnabled && p.DotSize === 3) {
@@ -2934,19 +3742,19 @@ function currentPreset(p) {
   if (!p.DotEnabled && !p.TShape && p.CrosshairRotation === 45 && p.Length === 20 && p.Gap === 6 && p.Thickness === 3) {
     return "x";
   }
-  if (p.DotEnabled && !p.TShape && p.CrosshairRotation === 0 && p.Length === 10 && p.Gap === 4 && p.Thickness === 2 && p.DotSize === 2 && p.DotShape === 0) {
+  if (p.DotEnabled && !p.TShape && p.CrosshairRotation === 0 && p.Length === 10 && p.Gap === 4 && p.Thickness === 2 && p.DotSize === 2 && dotShape === 0) {
     return "compact";
   }
-  if (p.DotEnabled && !p.TShape && p.CrosshairRotation === 0 && p.Length === 26 && p.Gap === 9 && p.Thickness === 1 && p.DotSize === 2 && p.DotShape === 0) {
+  if (p.DotEnabled && !p.TShape && p.CrosshairRotation === 0 && p.Length === 26 && p.Gap === 9 && p.Thickness === 1 && p.DotSize === 2 && dotShape === 0) {
     return "thin";
   }
-  if (p.DotEnabled && !p.TShape && p.CrosshairRotation === 0 && p.Length === 16 && p.Gap === 5 && p.Thickness === 6 && p.DotSize === 4 && p.DotShape === 0) {
+  if (p.DotEnabled && !p.TShape && p.CrosshairRotation === 0 && p.Length === 16 && p.Gap === 5 && p.Thickness === 6 && p.DotSize === 4 && dotShape === 0) {
     return "bold";
   }
-  if (p.DotEnabled && !p.TShape && p.CrosshairRotation === 0 && p.Length === 22 && p.Gap === 8 && p.Thickness === 2 && p.DotSize === 8 && p.DotShape === 2) {
+  if (p.DotEnabled && !p.TShape && p.CrosshairRotation === 0 && p.Length === 22 && p.Gap === 8 && p.Thickness === 2 && p.DotSize === 8 && dotShape === 2) {
     return "diamond";
   }
-  if (p.DotEnabled && !p.TShape && p.CrosshairRotation === 0 && p.Length === 18 && p.Gap === 8 && p.Thickness === 2 && p.DotSize === 8 && p.DotShape === 5) {
+  if (p.DotEnabled && !p.TShape && p.CrosshairRotation === 0 && p.Length === 18 && p.Gap === 8 && p.Thickness === 2 && p.DotSize === 8 && dotShape === 5) {
     return "crossdot";
   }
   if (p.DotEnabled && !p.TShape && p.Length === 1 && p.Gap === 0 && p.Thickness === 1 && p.DotSize === 7) {
@@ -2984,18 +3792,24 @@ document.addEventListener("keydown", event => {
 });
 
 document.addEventListener("click", event => {
+  const markerMenu = event.target.closest("[data-session-marker-menu]");
+  if (markerMenu) {
+    toggleSessionMarkerMenu(markerMenu);
+    return;
+  }
+  closeSessionMarkerMenu();
   const navGroup = event.target.closest("[data-nav-group]");
   if (navGroup) {
     const id = navGroup.dataset.navGroup;
-    if (expandedNavGroups.has(id)) expandedNavGroups.delete(id);
-    else expandedNavGroups.add(id);
-    render();
+    const wasOpen = expandedNavGroups.has(id);
+    expandedNavGroups.clear();
+    if (!wasOpen) expandedNavGroups.add(id);
+    renderSidebar();
     return;
   }
   const tab = event.target.closest("[data-tab]");
   if (tab) {
-    activeTab = tab.dataset.tab;
-    expandNavForTab(activeTab);
+    selectEditorTab(tab.dataset.tab);
     render();
     if (activeTab === "updates" && !state.update) {
       post({ type: "command", name: "checkUpdate" });
@@ -3003,8 +3817,6 @@ document.addEventListener("click", event => {
     return;
   }
 });
-
-document.getElementById("exitApplication").addEventListener("click", () => post({ type: "command", name: "exitApplication" }));
 
 document.addEventListener("click", event => {
   const profileButton = event.target.closest("[data-profile-select]");
@@ -3070,23 +3882,78 @@ document.addEventListener("click", event => {
 });
 
 function refreshPlayerPositionStatus() {
-  const settings = state?.playerPosition?.settings;
-  if (!settings) return;
-  const status = document.querySelector("[data-player-position-status]");
-  if (status) {
-    const last = Number.isInteger(settings.LastX) ? `X=${settings.LastX}, Y=${settings.LastY}, Z=${settings.LastZ}` : "ещё не распознана";
-    const sent = settings.LastSentAt ? new Date(settings.LastSentAt).toLocaleString() : "—";
-    status.textContent = `Область: ${settings.HasRegion ? "настроена" : "не выбрана"}. Последняя позиция: ${last}. Последняя отправка: ${sent}. Ошибок подряд: ${settings.ConsecutiveErrors || 0}.`;
-  }
+  const last = document.querySelector("[data-player-position-last]");
+  if (!last) return;
+  const data = state.playerPosition || {};
+  const settings = data.settings || {};
+  last.textContent = Number.isInteger(settings.LastX) ? `X ${settings.LastX} · Y ${settings.LastY} · Z ${settings.LastZ}` : "—";
+  document.querySelector("[data-player-position-sent]").textContent = settings.LastSentAt ? new Date(settings.LastSentAt).toLocaleString() : "—";
+  document.querySelector("[data-player-position-errors]").textContent = settings.ConsecutiveErrors || 0;
   const error = document.querySelector("[data-player-position-error]");
-  if (error) {
-    const message = settings.LastError || (settings.Enabled ? state.playerPosition?.feedback : "") || "";
-    error.textContent = message;
-    error.classList.toggle("hotkey-warning", Boolean(settings.LastError));
+  const message = settings.LastError || (settings.Enabled ? data.feedback : "") || "";
+  error.textContent = message;
+  error.hidden = !message;
+  error.classList.toggle("hotkey-warning", Boolean(settings.LastError));
+  const result = document.querySelector("[data-player-position-ocr-result]");
+  result.hidden = !data.diagnostics;
+  if (data.diagnostics) {
+    const { Recognized, RawText } = data.diagnostics;
+    result.textContent = `${Recognized ? "Распознано" : "Не распознано"}: ${(RawText || "").slice(0, 180)}`;
   }
+  document.querySelector('[data-command="openPlayerPositionDiagnostics"]').disabled = !data.diagnostics;
 }
 
+sessionMarkerPopover.addEventListener("click", event => {
+  const action = event.target.closest("[data-copy-session-marker]")?.dataset.copySessionMarker;
+  if (!action || !sessionMarkerSelection) return;
+  const { marker } = sessionMarkerSelection;
+  closeSessionMarkerMenu(true);
+  post({ type: "copySessionMarker", action, marker });
+});
+sessionMarkerPopover.addEventListener("keydown", event => {
+  const first = sessionMarkerPopover.firstElementChild;
+  const last = sessionMarkerPopover.lastElementChild;
+  const next = event.key === "Home" ? first : event.key === "End" ? last
+    : ["ArrowUp", "ArrowDown"].includes(event.key) ? (event.target === first ? last : first) : null;
+  if (!next) return;
+  event.preventDefault();
+  next.focus({ preventScroll: true });
+});
+sessionMarkerPopover.addEventListener("focusout", event => {
+  if (event.relatedTarget && !sessionMarkerPopover.contains(event.relatedTarget)
+    && event.relatedTarget !== sessionMarkerSelection?.trigger) closeSessionMarkerMenu();
+});
+document.addEventListener("pointerdown", event => {
+  if (!event.target.closest("#session-marker-popover, [data-session-marker-menu]")) closeSessionMarkerMenu();
+});
+document.addEventListener("scroll", () => closeSessionMarkerMenu(), true);
+window.addEventListener("blur", () => closeSessionMarkerMenu());
+window.addEventListener("resize", () => {
+  closeSessionMarkerMenu();
+  syncSessionMapPlacement();
+});
+document.querySelectorAll("[data-window-command]").forEach(button => {
+  button.addEventListener("click", () => post({ type: "window", name: button.dataset.windowCommand }));
+});
+document.querySelector(".window-top-resize").addEventListener("pointerdown", event => {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  post({ type: "window", name: "resize-top" });
+});
+
 window.DayZMapCompanion = {
+  setWindowMaximized(maximized) {
+    document.body.classList.toggle("window-maximized", maximized);
+    const button = document.querySelector('[data-window-command="maximize"]');
+    const label = maximized ? "Восстановить" : "Развернуть";
+    button.setAttribute("aria-pressed", String(maximized));
+    button.setAttribute("aria-label", label);
+    button.title = label;
+  },
+  sessionMapFailed() {
+    const status = document.querySelector("[data-session-map-status]");
+    if (status) status.textContent = "Не удалось загрузить карту. Проверьте подключение.";
+  },
   receivePerformancePlacement(placement) {
     if (!state?.dayZ?.settings?.Performance) return;
     Object.assign(state.dayZ.settings.Performance, placement);
@@ -3095,14 +3962,16 @@ window.DayZMapCompanion = {
       if (Object.hasOwn(placement, key)) input.value = placement[key];
     });
   },
-  receivePerformance(value) {
+  receivePerformance(value, markerImportBlockReason) {
     if (!state) return;
     state.performance = value;
+    if (markerImportBlockReason !== undefined) state.markerImportBlockReason = markerImportBlockReason;
+    refreshOverview();
     refreshPerformanceStatus();
   },
   receivePreview(preview) {
     if (state) state.preview = preview;
-    document.getElementById("preview").src = preview;
+    setCrosshairPreview(preview);
   },
   receiveState(next) {
     const previous = state;
@@ -3114,24 +3983,26 @@ window.DayZMapCompanion = {
         ? `Готово: файл ${status.FileWritable ? "проверен и доступен для записи" : "найден, но требует внимания"}.`
         : "Поиск завершён: PrivateMarkers.json не найден.";
     }
-    if (previous && isEditingValueControl()) {
+    if (previous && !next.openTab && isEditingValueControl()) {
       state = keepEditedState(previous, next);
-      document.getElementById("preview").src = state.preview || "";
+      refreshSessionMarkers();
+      setCrosshairPreview(state.preview);
       document.getElementById("activeProfileName").textContent = profile()?.Name || "";
       return;
     }
     const needsRender = renderDataChanged(previous, next) || wasDayZStatusPending || !!next.openTab;
     state = next;
     if (next.openTab) {
-      activeTab = next.openTab;
-      expandNavForTab(activeTab);
+      selectEditorTab(next.openTab);
     }
-    if (needsRender) render();
-    else refreshPlayerPositionStatus();
+    if (needsRender && (activeTab !== "overview" || !previous || next.openTab)) render();
+    else {
+      refreshOverview();
+      refreshPlayerPositionStatus();
+    }
   },
   openTab(tab) {
-    activeTab = tab;
-    expandNavForTab(activeTab);
+    selectEditorTab(tab);
     render();
     if (activeTab === "updates" && !state.update) {
       post({ type: "command", name: "checkUpdate" });
@@ -3162,6 +4033,7 @@ function schedulePreviewResize() {
   }, 120);
 }
 new ResizeObserver(schedulePreviewResize).observe(document.getElementById("preview"));
+new ResizeObserver(syncTreasureCaptureLayout).observe(document.getElementById("editor"));
 window.addEventListener("resize", schedulePreviewResize);
 post({ type: "ready" });
 </script>

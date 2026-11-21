@@ -7,14 +7,15 @@ const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../src/EditorForm.cs'), 'utf8');
 new vm.Script(source.split('<script>')[1].split('</script>')[0]);
 const renderer = source.slice(source.indexOf('function renderPlayerPosition()'), source.indexOf('function renderTreasures()'));
-const bindings = source.slice(source.indexOf('  const positionSetting = () =>'), source.indexOf('  document.querySelectorAll("[data-treasure]")'));
+const bindings = source.slice(source.indexOf('  const positionSetting = () =>'), source.indexOf('  syncTreasureCaptureLayout();'));
+const settingsDetails = (key, title, content) => `<details data-settings-disclosure="${key}"><summary>${title}</summary>${content}</details>`;
 for (const center of [false, true]) for (const keepZoom of [false, true]) for (const showLabel of [false, true]) for (const labelContent of ['name', 'position', 'both']) {
     const fields = new Map();
     const messages = [];
     const context = vm.createContext({
         state: { playerPosition: { settings: { CenterOnPlayer: center, KeepZoom: keepZoom, CenteringZoom: 10, MarkerSize: 40, ShowLabel: showLabel, LabelContent: labelContent } } },
         playerPositionShapes: [{ id: 'triangle', name: 'Треугольник' }],
-        renderOcrStatus: () => '', escapeHtml: value => value,
+        renderOcrStatus: () => '', escapeHtml: value => value, settingsDetails,
         playerPositionSettingsTimer: null, clearTimeout() {}, setTimeout() {},
         post: message => messages.push(message),
         document: {
@@ -67,13 +68,15 @@ const sharingContext = vm.createContext({
         Profiles: [{ Id: 'a', MapId: 'cherno', Name: 'A' }, { Id: 'b', MapId: 'cherno', Name: 'B' }, { Id: 'hidden', MapId: 'deadfall', Name: 'Wrong map' }]
     } } },
     document: { querySelector: selector => sharingFields.get(selector), querySelectorAll: selector => selector === '[data-position-profile]' ? selectedProfiles : [] },
-    playerPositionShapes: [{ id: 'triangle', name: 'Треугольник' }], escapeHtml: String, renderOcrStatus: () => ''
+    playerPositionShapes: [{ id: 'triangle', name: 'Треугольник' }], escapeHtml: String, renderOcrStatus: () => '', settingsDetails
 });
 vm.runInContext(renderer, sharingContext);
 const sharingHtml = vm.runInContext('renderPlayerPosition()', sharingContext);
 assert.match(sharingHtml, /Только для меня/);
 assert.match(sharingHtml, /Всем на сайте/);
 assert.match(sharingHtml, /Выбранные профили/);
+assert.match(sharingHtml, /data-command="selectPlayerPositionRegion"[\s\S]*data-settings-disclosure="position-display"/);
+assert.match(sharingHtml, /data-settings-disclosure="position-diagnostics"[\s\S]*data-command="testPlayerPosition"/);
 assert.match(sharingHtml, /data-position-profile value="a" checked/);
 assert.match(sharingHtml, /data-position-profile value="b" checked/);
 assert.doesNotMatch(sharingHtml, /Wrong map/);

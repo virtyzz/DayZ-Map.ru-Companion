@@ -1,5 +1,4 @@
 using System.Drawing;
-using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace CrosshairMarker;
@@ -86,12 +85,7 @@ internal sealed class PlayerPositionSelectionHintForm : Form
     {
         base.OnHandleCreated(e);
 
-        // WinForms does not opt a dialog's non-client area into Windows dark
-        // mode automatically. Use both attribute values because 19 was used
-        // by older Windows 10 builds and 20 is the current value.
-        var enabled = 1;
-        if (DwmSetWindowAttribute(Handle, DwmwaUseImmersiveDarkMode, ref enabled, sizeof(int)) != 0)
-            _ = DwmSetWindowAttribute(Handle, DwmwaUseImmersiveDarkModeBefore20H1, ref enabled, sizeof(int));
+        WindowAppearance.ApplyDarkCaption(Handle);
     }
 
     protected override void Dispose(bool disposing)
@@ -112,9 +106,4 @@ internal sealed class PlayerPositionSelectionHintForm : Form
         return new Bitmap(source);
     }
 
-    private const int DwmwaUseImmersiveDarkModeBefore20H1 = 19;
-    private const int DwmwaUseImmersiveDarkMode = 20;
-
-    [DllImport("dwmapi.dll")]
-    private static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int valueSize);
 }

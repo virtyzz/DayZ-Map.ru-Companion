@@ -34,6 +34,7 @@ if (args.Length == 2 && args[0] == "--preview-performance")
 var tests = new (string Name, Action Run)[]
 {
     ("Editor renders all tabs with and without a connected map", EditorRenderingTests.AllTabsRender),
+    ("Editor maximization fits the monitor working area", EditorRenderingTests.MaximizedWindowFitsWorkingArea),
     ("Window capture region follows movement, resize and legacy migration", WindowCaptureTests.RegionGeometryAndMigration),
     ("Window capture rejects stale frames and respects cancellation", WindowCaptureTests.FreshnessAndCancellation),
     ("Window capture reads covered content and recovers after restore", WindowCaptureTests.CapturesCoveredWindowAndRecovers),
@@ -71,6 +72,8 @@ var tests = new (string Name, Action Run)[]
     ("числовой uid принимается без преобразования", NumericUidIsAccepted),
     ("кириллица сохраняется в UTF-8 без unicode-экранирования", CyrillicIsWrittenAsUtf8),
     ("параллельные импорты не теряют метки", ConcurrentImportsPreserveMarkers),
+    ("офлайн-выгрузка включает все серверы, а пакетная загрузка объединяет их", OfflineMarkerTransferPreservesServerBlocks),
+    ("локальная загрузка блокируется при подключении или неизвестном состоянии", OfflineMarkerImportRequiresDisconnectedGame),
     ("некорректный ручной порт отклоняется", InvalidManualPortIsRejected),
     ("положение окна нормализуется для доступного экрана", WindowBoundsAreNormalized),
     ("CORS разрешает только точные Origin", CorsPolicyUsesExactOrigins),
@@ -205,7 +208,7 @@ static void BackupCleanupAppliesBothPolicies()
 static void FileStatusChecksReadAndWrite()
 {
     using var fixture = new MarkersFixture("[]");
-    var status = fixture.Service.GetFileStatus();
+    var status = fixture.Service.GetFileStatus(out _);
     Equal(fixture.Path, status.Path, "проверка вернула другой файл");
     True(status.Writable, "доступный тестовый файл не отмечен доступным для записи");
     True(status.Error is null, "для доступного файла вернулась ошибка");
@@ -253,6 +256,59 @@ static void ConcurrentImportsPreserveMarkers()
     });
     var markers = fixture.Service.ReadBlocks().Single().GetProperty("param2").EnumerateArray().ToList();
     Equal(12, markers.Count, "часть параллельных импортов потеряна");
+}
+
+static void OfflineMarkerTransferPreservesServerBlocks()
+{
+    using var source = new MarkersFixture("""
+        [
+          {"param1":"one.example:2302","param2":[{"uid":"same","name":"Новая метка"}]},
+          {"param1":"two.example:2302","param2":[{"uid":"same","name":"Другой сервер"}]},
+          {"param1":"empty.example:2302","param2":[]}
+        ]
+        """);
+    using var target = new MarkersFixture("""
+        [
+          {"param1":"one.example:2302","param2":[{"uid":"same","name":"Old"},{"uid":"keep"}]},
+          {"param1":"untouched.example:2302","param2":[{"uid":"other"}]}
+        ]
+        """);
+    using var connected = JsonDocument.Parse(source.Service.BuildExport("two.example:2302"));
+    Equal(1, connected.RootElement.GetArrayLength(), "выгрузка подключённого сервера включает другие серверы");
+
+    var exportPath = System.IO.Path.Combine(source.DirectoryPath, "DayZ-Markers.json");
+    File.WriteAllText(exportPath, source.Service.BuildExport(null));
+    var requests = DayZMarkersService.ReadImportRequests(exportPath);
+    Equal(2, requests.Count, "пакет включает пустые серверы или теряет метки");
+
+    var before = File.ReadAllText(target.Path);
+    _ = Throws<DayZCompanionException>(() =>
+        target.Service.ImportBatch(requests, () => throw new DayZCompanionException("Подключение восстановлено.")));
+    Equal(before, File.ReadAllText(target.Path), "блокировка перед записью оставила частичный импорт");
+    Equal(0, target.Service.GetBackups().Count, "отменённая загрузка оставила резервную копию");
+
+    var result = target.Service.ImportBatch(requests);
+    Equal(2, result.Imported, "пакет загрузил не все метки");
+    Equal(1, result.Updated, "совпадающий UID не обновлён");
+    Equal(1, target.Service.GetBackups().Count, "создано больше одной резервной копии");
+    var blocks = target.Service.ReadBlocks();
+    Equal(3, blocks.Count, "серверы потерялись или добавился пустой сервер");
+    var first = DayZMarkersService.GetMarkers(blocks.Single(block => DayZMarkersService.IsServerBlock(block, "one.example:2302")));
+    Equal(2, first.Count, "исчезла метка, которой не было в импорте");
+    Equal("Новая метка", first[0].GetProperty("name").GetString(), "метка с совпадающим UID не заменена");
+}
+
+static void OfflineMarkerImportRequiresDisconnectedGame()
+{
+    var now = DateTimeOffset.UtcNow;
+    var disconnected = new PerformanceSnapshot(Running: true, ConnectionMeasuredAt: now.AddSeconds(-1));
+    var connected = disconnected with { Server = "one.example:2302" };
+    True(DayZMarkersService.GetOfflineImportBlockReason(true, false, connected, now) is not null, "разрешена запись на сервере");
+    True(DayZMarkersService.GetOfflineImportBlockReason(true, false, disconnected, now) is null, "запись в меню заблокирована");
+    True(DayZMarkersService.GetOfflineImportBlockReason(true, true, disconnected, now) is not null, "проигнорирован запрет при запущенной игре");
+    True(DayZMarkersService.GetOfflineImportBlockReason(true, false, new(), now) is not null, "нет измерений, но запись доступна");
+    True(DayZMarkersService.GetOfflineImportBlockReason(true, false, disconnected with { ConnectionMeasuredAt = now.AddSeconds(-20) }, now) is not null, "устаревшая проверка разрешила запись");
+    True(DayZMarkersService.GetOfflineImportBlockReason(false, true, connected, now) is null, "закрытая игра не позволяет загрузить метки");
 }
 
 static void InvalidManualPortIsRejected()

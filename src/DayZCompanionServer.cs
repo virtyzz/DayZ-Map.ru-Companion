@@ -4,7 +4,6 @@ using System.Reflection;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
-using System.Diagnostics;
 
 namespace CrosshairMarker;
 
@@ -35,10 +34,16 @@ internal sealed class DayZCompanionServer : IDisposable
     public string Status { get; private set; } = "Не запущен";
     public string LastOperation { get; private set; } = "Операций с метками пока не было.";
 
-    public DayZCompanionStatus GetStatus()
+    public DayZCompanionStatus GetStatus(string markerServer)
     {
-        var file = markers.GetFileStatus();
-        return new DayZCompanionStatus(Status, Port, file.Path, file.Writable, file.Error, markers.GetBackups(), LastOperation, Process.GetProcessesByName("DayZ_x64").Length > 0);
+        var file = markers.GetFileStatus(out var blocks);
+        var sessionMarkers = string.IsNullOrEmpty(markerServer) ? [] : blocks
+            .Where(block => DayZMarkersService.IsServerBlock(block, markerServer))
+            .SelectMany(DayZMarkersService.GetMarkers)
+            .Select(DayZSessionMarker.FromJson)
+            .OfType<DayZSessionMarker>()
+            .ToList();
+        return new DayZCompanionStatus(Status, Port, file.Path, file.Writable, file.Error, markers.GetBackups(), LastOperation, DayZMarkersService.IsDayZRunning(), markerServer, sessionMarkers);
     }
 
     public void Start()
@@ -289,4 +294,17 @@ internal sealed class DayZCompanionServer : IDisposable
     }
 }
 
-internal sealed record DayZCompanionStatus(string ServiceStatus, int? Port, string? PrivateMarkersPath, bool FileWritable, string? FileError, List<DayZBackupInfo> Backups, string LastOperation, bool DayZRunning);
+internal sealed record DayZCompanionStatus(string ServiceStatus, int? Port, string? PrivateMarkersPath, bool FileWritable, string? FileError, List<DayZBackupInfo> Backups, string LastOperation, bool DayZRunning, string MarkerServer, List<DayZSessionMarker> SessionMarkers);
+
+internal sealed record DayZSessionMarker(string Name, double X, double Z)
+{
+    public static DayZSessionMarker? FromJson(JsonElement marker)
+    {
+        if (marker.ValueKind != JsonValueKind.Object || !marker.TryGetProperty("position", out var position)
+            || position.ValueKind != JsonValueKind.Array || position.GetArrayLength() < 3
+            || position[0].ValueKind != JsonValueKind.Number || !position[0].TryGetDouble(out var x) || !double.IsFinite(x)
+            || position[2].ValueKind != JsonValueKind.Number || !position[2].TryGetDouble(out var z) || !double.IsFinite(z)) return null;
+        var name = marker.TryGetProperty("name", out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+        return new(string.IsNullOrWhiteSpace(name) ? "Без названия" : name, x, z);
+    }
+}

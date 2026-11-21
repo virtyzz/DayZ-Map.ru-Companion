@@ -33,9 +33,10 @@ internal sealed class DayZMarkersService
         return candidates.OrderByDescending(File.GetLastWriteTimeUtc).FirstOrDefault();
     }
 
-    public List<JsonElement> ReadBlocks()
+    public List<JsonElement> ReadBlocks() => ReadBlocks(RequireMarkersFile());
+
+    internal static List<JsonElement> ReadBlocks(string path)
     {
-        var path = RequireMarkersFile();
         try
         {
             using var document = JsonDocument.Parse(File.ReadAllText(path, Encoding.UTF8));
@@ -61,13 +62,14 @@ internal sealed class DayZMarkersService
         }
     }
 
-    public DayZMarkersFileStatus GetFileStatus()
+    public DayZMarkersFileStatus GetFileStatus(out List<JsonElement> blocks)
     {
+        blocks = [];
         var path = ResolvePrivateMarkersPath();
         if (path is null) return new DayZMarkersFileStatus(null, false, "Файл PrivateMarkers.json не найден.");
         try
         {
-            _ = ReadBlocks();
+            blocks = ReadBlocks(path);
             var probe = DayZFileAccessProbe.Probe(Path.GetDirectoryName(path)!);
             return new DayZMarkersFileStatus(path, probe.Writable, probe.Error);
         }
@@ -90,59 +92,117 @@ internal sealed class DayZMarkersService
             .ToList();
     }
 
-    public ImportResult Import(ImportRequest request)
+    internal string BuildExport(string? currentServer)
     {
-        ValidateRequest(request);
+        var blocks = ReadBlocks();
+        if (!string.IsNullOrWhiteSpace(currentServer))
+        {
+            var current = blocks.Where(block => IsServerBlock(block, currentServer)).ToList();
+            if (current.Any(block => GetMarkers(block).Count > 0)) blocks = current;
+        }
+
+        if (!blocks.Any(block => GetMarkers(block).Count > 0))
+            throw new DayZCompanionException("В файле игры пока нет меток.");
+        return JsonSerializer.Serialize(blocks, JsonOptions);
+    }
+
+    internal static List<ImportRequest> ReadImportRequests(string path)
+    {
+        var grouped = new Dictionary<string, List<JsonElement>>(StringComparer.Ordinal);
+        foreach (var block in ReadBlocks(path))
+        {
+            if (block.ValueKind != JsonValueKind.Object || !block.TryGetProperty("param2", out var entries)
+                || entries.ValueKind != JsonValueKind.Array)
+                throw new DayZCompanionException("В файле меток обнаружен некорректный серверный блок.");
+            if (entries.GetArrayLength() == 0) continue;
+            if (!block.TryGetProperty("param1", out var address) || address.ValueKind != JsonValueKind.String
+                || address.GetString() is not { } server || !ServerAddress.TryParse(server, out _))
+                throw new DayZCompanionException("У одного из блоков меток отсутствует корректный адрес сервера.");
+
+            if (!grouped.TryGetValue(server, out var markers))
+                grouped[server] = markers = [];
+            markers.AddRange(entries.EnumerateArray());
+        }
+
+        var requests = grouped.Select(item => new ImportRequest(item.Key, "merge", item.Value)).ToList();
+        ValidateImportRequests(requests);
+        return requests;
+    }
+
+    public ImportResult Import(ImportRequest request) => ImportBatch([request]);
+
+    internal ImportResult ImportBatch(IReadOnlyList<ImportRequest> requests, Action? beforeWrite = null)
+    {
+        ValidateImportRequests(requests);
         lock (WriteSync)
         {
             if (settings.BlockWritesWhenDayZRunning && IsDayZRunning())
                 throw new DayZCompanionException("DayZ_x64.exe запущен: запись меток запрещена настройкой Companion.");
-
             var path = RequireMarkersFile();
-            var blocks = ReadBlocks();
-            var matching = blocks.Where(block => IsServerBlock(block, request.Server)).ToList();
-            JsonElement target;
-            if (matching.Count == 0)
-            {
-                target = CreateBlock(request.Server, []);
-                blocks.Add(target);
-            }
-            else
-            {
-                target = matching[0];
-                foreach (var duplicate in matching.Skip(1)) blocks.Remove(duplicate);
-            }
-
-            var existing = GetMarkers(target);
-            List<JsonElement> finalMarkers;
+            var blocks = ReadBlocks(path);
             var updated = 0;
-            if (request.Mode == "replace")
-            {
-                finalMarkers = request.Markers;
-                updated = existing.Count(marker => request.Markers.Any(input => Uid(input) == Uid(marker)));
-            }
-            else
-            {
-                var incomingByUid = request.Markers.ToDictionary(Uid, StringComparer.Ordinal);
-                var seen = new HashSet<string>(StringComparer.Ordinal);
-                finalMarkers = [];
-                foreach (var marker in existing)
-                {
-                    var uid = Uid(marker);
-                    if (!seen.Add(uid)) continue;
-                    if (incomingByUid.Remove(uid, out var replacement)) { finalMarkers.Add(replacement); updated++; }
-                    else finalMarkers.Add(marker);
-                }
-                finalMarkers.AddRange(incomingByUid.Values);
-            }
+            foreach (var request in requests) updated += ApplyImport(blocks, request);
 
-            var replacementBlock = ReplaceParam2(target, request.Server, finalMarkers);
-            var index = blocks.FindIndex(block => IsServerBlock(block, request.Server));
-            blocks[index] = replacementBlock;
+            beforeWrite?.Invoke();
             var backup = BackupAndWrite(path, blocks);
-            AppRuntimeLog.Info($"DayZ markers imported: server={request.Server}, imported={request.Markers.Count}, updated={updated}.");
-            return new ImportResult(request.Markers.Count, updated, backup);
+            var imported = requests.Sum(request => request.Markers.Count);
+            var target = requests.Count == 1 ? $"server={requests[0].Server}" : $"servers={requests.Count}";
+            AppRuntimeLog.Info($"DayZ markers imported: {target}, imported={imported}, updated={updated}.");
+            return new ImportResult(imported, updated, backup);
         }
+    }
+
+    private static void ValidateImportRequests(IReadOnlyList<ImportRequest> requests)
+    {
+        if (requests.Count == 0) throw new DayZCompanionException("В выбранном файле нет меток.");
+        foreach (var request in requests) ValidateRequest(request);
+    }
+
+    private static int ApplyImport(List<JsonElement> blocks, ImportRequest request)
+    {
+        var matching = blocks.Where(block => IsServerBlock(block, request.Server)).ToList();
+        var target = matching.Count == 0 ? CreateBlock(request.Server, []) : matching[0];
+        if (matching.Count == 0) blocks.Add(target);
+        foreach (var duplicate in matching.Skip(1)) blocks.Remove(duplicate);
+
+        var existing = GetMarkers(target);
+        List<JsonElement> finalMarkers;
+        var updated = 0;
+        if (request.Mode == "replace")
+        {
+            finalMarkers = request.Markers;
+            updated = existing.Count(marker => request.Markers.Any(input => Uid(input) == Uid(marker)));
+        }
+        else
+        {
+            var incomingByUid = request.Markers.ToDictionary(Uid, StringComparer.Ordinal);
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            finalMarkers = [];
+            foreach (var marker in existing)
+            {
+                var uid = Uid(marker);
+                if (!seen.Add(uid)) continue;
+                if (incomingByUid.Remove(uid, out var replacement)) { finalMarkers.Add(replacement); updated++; }
+                else finalMarkers.Add(marker);
+            }
+            finalMarkers.AddRange(incomingByUid.Values);
+        }
+
+        var index = blocks.FindIndex(block => IsServerBlock(block, request.Server));
+        blocks[index] = ReplaceParam2(target, request.Server, finalMarkers);
+        return updated;
+    }
+
+    internal static string? GetOfflineImportBlockReason(bool gameRunning, bool blockWhileRunning, PerformanceSnapshot snapshot, DateTimeOffset now)
+    {
+        if (!gameRunning) return null;
+        if (!string.IsNullOrWhiteSpace(snapshot.Server)) return "Выйдите с сервера DayZ, чтобы загрузить метки.";
+        if (blockWhileRunning) return "Закройте DayZ. Запись при запущенной игре запрещена в настройках.";
+        if (!snapshot.Running && !snapshot.HelperStarting)
+            return "Закройте DayZ или включите измерения в «Пинг и FPS», чтобы проверить подключение.";
+        if (snapshot.ConnectionMeasuredAt is not { } measured || now - measured > TimeSpan.FromSeconds(12))
+            return "Companion пока не может подтвердить выход с сервера. Дождитесь проверки подключения или закройте DayZ.";
+        return null;
     }
 
     private string RequireMarkersFile()
@@ -192,9 +252,14 @@ internal sealed class DayZMarkersService
     }
 
     private static bool IsMarkersFile(string? path) => !string.IsNullOrWhiteSpace(path) && File.Exists(path) && string.Equals(Path.GetFileName(path), "PrivateMarkers.json", StringComparison.OrdinalIgnoreCase);
-    private static bool IsDayZRunning() => Process.GetProcessesByName("DayZ_x64").Length > 0;
-    private static bool IsServerBlock(JsonElement block, string server) => block.ValueKind == JsonValueKind.Object && block.TryGetProperty("param1", out var value) && value.ValueKind == JsonValueKind.String && value.GetString() == server;
-    private static List<JsonElement> GetMarkers(JsonElement block) => block.TryGetProperty("param2", out var markers) && markers.ValueKind == JsonValueKind.Array ? markers.EnumerateArray().Select(marker => marker.Clone()).ToList() : [];
+    internal static bool IsDayZRunning()
+    {
+        var processes = Process.GetProcessesByName("DayZ_x64");
+        foreach (var process in processes) process.Dispose();
+        return processes.Length > 0;
+    }
+    internal static bool IsServerBlock(JsonElement block, string server) => block.ValueKind == JsonValueKind.Object && block.TryGetProperty("param1", out var value) && value.ValueKind == JsonValueKind.String && value.GetString() == server;
+    internal static List<JsonElement> GetMarkers(JsonElement block) => block.TryGetProperty("param2", out var markers) && markers.ValueKind == JsonValueKind.Array ? markers.EnumerateArray().Select(marker => marker.Clone()).ToList() : [];
     private static string Uid(JsonElement marker) => marker.GetProperty("uid").GetRawText();
     private static JsonElement CreateBlock(string server, List<JsonElement> markers) => JsonSerializer.SerializeToElement(new { param1 = server, param2 = markers }, JsonOptions);
     private static JsonElement ReplaceParam2(JsonElement source, string server, List<JsonElement> markers)
