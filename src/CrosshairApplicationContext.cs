@@ -24,6 +24,8 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
     private readonly PlayerPositionMapBridge playerPositionMapBridge;
     private readonly PlayerPositionCaptureService playerPositionCaptureService;
     private readonly PlayerPositionTrackingController playerPositionTracker;
+    private readonly CompanionAccount account;
+    private readonly CompanionPositionSync positionSync;
     private readonly PerformanceHelperClient performanceMonitor;
     private readonly PerformanceOverlayForm performanceOverlay;
     private readonly object playerPositionSettingsSync = new();
@@ -55,7 +57,8 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         treasureStore = new TreasureCaptureStore();
         treasureCaptureService = new TreasureCaptureService(treasureStore);
         treasureMapBridge = new TreasureMapBridge();
-        playerPositionMapBridge = new PlayerPositionMapBridge();
+        account = new CompanionAccount();
+        playerPositionMapBridge = new PlayerPositionMapBridge(() => account.GetDestinations("companion-local-position", includeOfflineMaps: true));
         playerPositionCaptureService = new PlayerPositionCaptureService();
         battlePassStore = new BattlePassStore();
         battlePassSettings = battlePassStore.LoadSettings();
@@ -118,7 +121,10 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
                 dayZSettingsStore.Save(dayZSettings);
             }
         };
-        playerPositionTracker = new PlayerPositionTrackingController(playerPositionCaptureService, playerPositionMapBridge, () => dayZSettings.PlayerPositionTracking.Clone(), settings =>
+        playerPositionTracker = new PlayerPositionTrackingController(playerPositionCaptureService, playerPositionMapBridge, () =>
+        {
+            lock (playerPositionSettingsSync) return dayZSettings.PlayerPositionTracking.Clone();
+        }, settings =>
         {
             lock (playerPositionSettingsSync)
             {
@@ -128,7 +134,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
                 if (current.LastSentAt > settings.LastSentAt) settings.LastSentAt = current.LastSentAt;
                 // Keep configuration edited during capture; merge only runtime
                 // results and the automatically resolved destination map.
-                current.MapId = settings.MapId;
+                current.SelectMap(settings.MapId);
                 if (!current.RegionRelativeToWindow && settings.RegionRelativeToWindow) current.CopyRegionFrom(settings);
                 current.LastX = settings.LastX;
                 current.LastY = settings.LastY;
@@ -144,7 +150,8 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         {
             dayZSettingsStore.Save(dayZSettings);
         }
-        dayZCompanion = new DayZCompanionServer(dayZSettings, treasureMapBridge, playerPositionMapBridge);
+        positionSync = new CompanionPositionSync(account, playerPositionMapBridge, () => performanceMonitor.Snapshot);
+        dayZCompanion = new DayZCompanionServer(dayZSettings);
         dayZCompanion.Start();
         playerPositionTracker.Refresh();
         updateTimer.Tick += async (_, _) => await CheckForUpdateAsync();
@@ -370,7 +377,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             return;
         }
 
-        editor = new EditorForm(config, updateService, dayZSettings, dayZCompanion.GetStatus(performanceMonitor.Snapshot.Server), battlePassSettings, battlePassStore.LoadSnapshot(), treasureStore, treasureCaptureService, treasureMapBridge, playerPositionMapBridge, playerPositionCaptureService, tab);
+        editor = new EditorForm(config, updateService, dayZSettings, dayZCompanion.GetStatus(performanceMonitor.Snapshot.Server), battlePassSettings, battlePassStore.LoadSnapshot(), treasureStore, treasureCaptureService, treasureMapBridge, playerPositionMapBridge, playerPositionCaptureService, tab, account, positionSync);
         editor.ConfigChanged += nextConfig =>
         {
             var startupChanged = config.StartWithWindows != nextConfig.StartWithWindows;
@@ -399,16 +406,36 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             config.EditorWindowBounds = bounds;
             store.SaveAtomic(config);
         };
-        editor.DayZSettingsChanged += nextSettings =>
+        editor.DayZSettingsChanged += nextSettings => ApplyEditorDayZSettings(nextSettings);
+        editor.PlayerPositionSettingsChanged += (position, selectionChanged) => ApplyEditorDayZSettings(dayZSettings, position, selectionChanged);
+
+        void ApplyEditorDayZSettings(DayZCompanionSettings nextSettings, PlayerPositionTrackingSettings? position = null,
+            bool selectionChanged = false)
         {
-            nextSettings.Normalize();
-            var requestPerformanceElevation = !dayZSettings.Performance.Enabled && nextSettings.Performance.Enabled;
+            bool requestPerformanceElevation;
             bool restartHttp;
             lock (playerPositionSettingsSync)
             {
+                nextSettings.Normalize();
+                requestPerformanceElevation = !dayZSettings.Performance.Enabled && nextSettings.Performance.Enabled;
                 var runtime = dayZSettings.PlayerPositionTracking.Clone();
                 restartHttp = dayZSettings.RequiresHttpRestart(nextSettings);
                 dayZSettings.CopyFrom(nextSettings);
+                if (position is not null)
+                {
+                    if (selectionChanged) runtime.SaveMapProfiles(position.MapId, position.ProfileIds ?? []);
+                    position.CopyRegionFrom(runtime);
+                    position.MapId = runtime.MapId;
+                    position.ProfileIds = runtime.ProfileIds;
+                    position.ProfileIdsByMap = runtime.ProfileIdsByMap;
+                    dayZSettings.PlayerPositionTracking = position;
+                }
+                else
+                {
+                    dayZSettings.PlayerPositionTracking.MapId = runtime.MapId;
+                    dayZSettings.PlayerPositionTracking.ProfileIds = runtime.ProfileIds;
+                    dayZSettings.PlayerPositionTracking.ProfileIdsByMap = runtime.ProfileIdsByMap;
+                }
                 // The editor changes configuration, not telemetry reported by
                 // the OCR worker or map acknowledgement.
                 dayZSettings.PlayerPositionTracking.LastX = runtime.LastX;
@@ -424,14 +451,14 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
             if (restartHttp)
             {
                 dayZCompanion.Dispose();
-                dayZCompanion = new DayZCompanionServer(dayZSettings, treasureMapBridge, playerPositionMapBridge);
+                dayZCompanion = new DayZCompanionServer(dayZSettings);
                 dayZCompanion.Start();
             }
             playerPositionTracker.Refresh();
             ApplyMeasurementSettings(requestPerformanceElevation);
             performanceOverlay.Apply(dayZSettings.Performance, performanceMonitor.Snapshot);
             editor?.ApplyDayZState(dayZSettings, dayZCompanion.GetStatus(performanceMonitor.Snapshot.Server));
-        };
+        }
         editor.DayZStatusRequested += () => editor?.ApplyDayZState(dayZSettings, dayZCompanion.GetStatus(performanceMonitor.Snapshot.Server));
         editor.ApplyPerformanceState(performanceMonitor.Snapshot);
         editor.PlayerPositionRegionRequested += () => editor?.SelectPlayerPositionRegionAsync() ?? Task.CompletedTask;
@@ -644,6 +671,7 @@ internal sealed class CrosshairApplicationContext : ApplicationContext
         try
         {
             ShutdownStep("player position tracker", () => playerPositionTracker.Dispose());
+            ShutdownStep("Companion account synchronization", () => positionSync.Dispose());
             ShutdownStep("player position capture", () => playerPositionCaptureService.Dispose());
             ShutdownStep("performance monitor", () => performanceMonitor.Dispose());
             ShutdownStep("performance overlay", () => performanceOverlay.Dispose());

@@ -100,4 +100,55 @@ internal static class PlayerPositionSharingTests
     }
 
     private static void Check(bool condition, string message) { if (!condition) throw new Exception(message); }
+
+    public static void PrivateSamplesAreNotReusedWhenSwitchingToPublic()
+    {
+        var destination = new TreasureDestinationSession(new string('n', 32), DateTimeOffset.MaxValue,
+            [new("cherno", "Chernarus", 15360, 15360)], []);
+        var bridge = new PlayerPositionMapBridge(() => destination);
+        var settings = new PlayerPositionTrackingSettings { MapId = "cherno" };
+        var measured = new PlayerPosition(4150, 12, 6110, DateTimeOffset.UtcNow);
+        bridge.SetTrackingEnabled(true);
+        bridge.Queue(settings, measured);
+        Check(bridge.GetSession() == destination, "Offline tracking needs a map catalog");
+        Check(bridge.GetLatestPosition()?.Visibility == "private", "The measurement lost its private visibility");
+        Check(bridge.GetPending(destination.SessionId) is null, "The browser bridge can read a private measurement");
+
+        settings.Visibility = "public";
+        bridge.UpdateSettings(settings);
+        Check(bridge.GetLatestPosition() is null, "A private sample was reused after switching to public");
+        bridge.Queue(settings, measured with { MeasuredAt = measured.MeasuredAt.AddSeconds(1) });
+        Check(bridge.GetLatestPosition()?.Visibility == "public", "A fresh public sample is missing");
+        Check(bridge.GetPending(destination.SessionId) is null, "Native publication is exposed on the browser bridge");
+
+        settings.Visibility = "private";
+        bridge.UpdateSettings(settings);
+        Check(bridge.GetLatestPosition()?.Visibility == "private", "Switching to private left a public sample available");
+        bridge.SetTrackingEnabled(false);
+        Check(bridge.GetLatestPosition() is null, "Pausing left a measurement available");
+    }
+
+    public static void SharedProfileSelectionsFollowTheMap()
+    {
+        var settings = System.Text.Json.JsonSerializer.Deserialize<PlayerPositionTrackingSettings>(
+            """{"MapId":"cherno","ProfileIds":["north"]}""")!;
+        settings.Normalize();
+        settings.SelectMap("deerisle");
+        Check(settings.ProfileIds.Count == 0, "Profiles from a different map were selected");
+        settings.SaveMapProfiles("deerisle", ["island"]);
+        settings.SelectMap("cherno");
+        Check(settings.ProfileIds.SequenceEqual(["north"]), "Legacy profile choice was lost on return");
+        settings.SaveMapProfiles("cherno", []);
+        settings.SelectMap("deerisle");
+        var restored = System.Text.Json.JsonSerializer.Deserialize<PlayerPositionTrackingSettings>(
+            System.Text.Json.JsonSerializer.Serialize(settings))!;
+        restored.Normalize();
+        Check(restored.ProfileIds.SequenceEqual(["island"]), "The selected island profile did not survive a restart");
+        restored.SelectMap("cherno");
+        Check(restored.ProfileIds.Count == 0, "An explicitly cleared map selection was lost");
+        var copy = restored.Clone();
+        copy.SaveMapProfiles("deerisle", ["new-island"]);
+        restored.SelectMap("deerisle");
+        Check(restored.ProfileIds.SequenceEqual(["island"]), "Editing a settings snapshot changed the live map choices");
+    }
 }

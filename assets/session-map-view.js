@@ -2,6 +2,42 @@
   if (window !== window.top || location.origin !== "https://dayz-map.ru") return;
   if (!/^\/(chernarus|deer-isle|deadfall|nasdara)\/?$/.test(location.pathname)) return;
 
+  const mapId = { chernarus: "cherno", "deer-isle": "deerisle", deadfall: "deadfall", nasdara: "nasdara" }[location.pathname.split("/")[1]];
+  let overviewMap;
+  let overviewPosition;
+  let positionMarker;
+
+  function updateOverviewPosition() {
+    if (!overviewMap) return;
+    const update = overviewPosition;
+    if (!update || update.MapId !== mapId || ![update.X, update.Y, update.Z].every(Number.isFinite)) {
+      positionMarker?.clearPlayerPositionMarker();
+      return;
+    }
+
+    const map = overviewMap.map;
+    const position = overviewMap.gameToLeafletCoords(update.X, update.Z);
+    // Keep the embedded indicator independent of the website's browser bridge.
+    if (!positionMarker) {
+      positionMarker = Object.create(overviewMap);
+      positionMarker.playerPositionMarker = null;
+      positionMarker.playerPositionOwner = overviewMap;
+    }
+    const { Name, Color, Type } = update.Template;
+    positionMarker.showPlayerPositionMarker(position, update.X, update.Z, update.Y, Name, Color, Type,
+      { markerSize: update.MarkerSize });
+    if (update.CenterOnPlayer) {
+      const zoom = update.KeepZoom || !Number.isFinite(update.CenteringZoom) ? map.getZoom()
+        : Math.max(map.getMinZoom(), Math.min(map.getMaxZoom(), update.CenteringZoom));
+      map.setView(position, zoom, { animate: false });
+    }
+  }
+
+  window.DayZCompanionOverviewPosition = position => {
+    overviewPosition = position;
+    updateOverviewPosition();
+  };
+
   const css = `
     html.companion-map, .companion-map body {
       width: 100%;
@@ -124,16 +160,16 @@
       };
       controller.updateNamesVisibility();
     }
-    if (!location.pathname.startsWith("/chernarus")) return;
-
-    // Fill the preview with the southeast coast on first open, then leave
-    // panning and position updates to the site's existing map and bridge.
-    const area = window.L.latLngBounds(
-      controller.gameToLeafletCoords(7300, 2800),
-      controller.gameToLeafletCoords(13800, 9300)
-    );
-    map.setMaxBounds([[0, 0], [32, 32]]);
-    map.setView(area.getCenter(), map.getBoundsZoom(area, true), { animate: false });
+    if (mapId === "cherno") {
+      const area = window.L.latLngBounds(
+        controller.gameToLeafletCoords(7300, 2800),
+        controller.gameToLeafletCoords(13800, 9300)
+      );
+      map.setMaxBounds([[0, 0], [32, 32]]);
+      map.setView(area.getCenter(), map.getBoundsZoom(area, true), { animate: false });
+    }
+    overviewMap = controller;
+    updateOverviewPosition();
   }
 
   document.addEventListener("DOMContentLoaded", () => prepareOverviewMap(), { once: true });

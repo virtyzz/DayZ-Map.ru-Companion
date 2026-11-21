@@ -45,24 +45,30 @@ internal sealed class TreasureMapBridge
         {
             ExpireUnsafe();
             if (session is null) throw new DayZCompanionException("Откройте DayZ-Map и подключите Companion.");
-            var map = session.Maps.SingleOrDefault(item => item.Id == mapId);
-            if (map is null) throw new DayZCompanionException("Выбранная карта недоступна.");
-            var profile = session.Profiles.SingleOrDefault(item => item.MapId == mapId && item.Id == profileId);
-            if (profile is null || !profile.Writable) throw new DayZCompanionException("Выбранный профиль недоступен для записи.");
-            var coordinates = captures.Where(item => item.HasCoordinates)
-                .Select(item => new TreasureCoordinate(item.Id, item.X!.Value, item.Z!.Value)).ToList();
-            if (coordinates.Count == 0) throw new DayZCompanionException("Нет координат для отправки.");
-            if (map.Width > 0 && map.Height > 0 && coordinates.Any(item => item.X < 0 || item.X > map.Width || item.Z < 0 || item.Z > map.Height))
-                throw new DayZCompanionException($"Координаты должны быть в пределах карты: X 0–{map.Width}, Z 0–{map.Height}.");
-            if (coordinates.GroupBy(item => (item.X, item.Z)).Any(group => group.Count() > 1)) throw new DayZCompanionException("В очереди есть дублирующиеся координаты. Удалите или исправьте их перед отправкой.");
-            var normalizedColor = markerColor ?? "";
-            var template = new TreasureMarkerTemplate(
-                markerName.Trim().Length > 300 ? markerName.Trim()[..300] : markerName.Trim(),
-                string.IsNullOrWhiteSpace(markerType) ? profile.MarkerType : markerType.Trim(),
-                System.Text.RegularExpressions.Regex.IsMatch(normalizedColor, "^#[0-9a-fA-F]{6}$") ? normalizedColor : profile.MarkerColor);
-            pending = new TreasureMapBatch(session.SessionId, mapId, profileId, template, coordinates, CreateDayZMarkers(coordinates, template));
+            pending = BuildBatch(session, mapId, profileId, markerName, markerType, markerColor, captures, includeDayZMarkers: true);
             deliveryFeedback = "Пакет ожидает приёма картой.";
         }
+    }
+
+    public static TreasureMapBatch BuildBatch(TreasureDestinationSession session, string mapId, string profileId,
+        string markerName, string markerType, string markerColor, IEnumerable<TreasureCapture> captures, bool includeDayZMarkers = false)
+    {
+        var map = session.Maps.SingleOrDefault(item => item.Id == mapId);
+        if (map is null) throw new DayZCompanionException("Выбранная карта недоступна.");
+        var profile = session.Profiles.SingleOrDefault(item => item.MapId == mapId && item.Id == profileId);
+        if (profile is null || !profile.Writable) throw new DayZCompanionException("Выбранный профиль недоступен для записи.");
+        var coordinates = captures.Where(item => item.HasCoordinates)
+            .Select(item => new TreasureCoordinate(item.Id, item.X!.Value, item.Z!.Value)).ToList();
+        if (coordinates.Count == 0) throw new DayZCompanionException("Нет координат для отправки.");
+        if (map.Width > 0 && map.Height > 0 && coordinates.Any(item => item.X < 0 || item.X > map.Width || item.Z < 0 || item.Z > map.Height))
+            throw new DayZCompanionException($"Координаты должны быть в пределах карты: X 0–{map.Width}, Z 0–{map.Height}.");
+        if (coordinates.GroupBy(item => (item.X, item.Z)).Any(group => group.Count() > 1))
+            throw new DayZCompanionException("В очереди есть дублирующиеся координаты. Удалите или исправьте их перед отправкой.");
+        var name = markerName.Trim();
+        var template = new TreasureMarkerTemplate(name.Length > 300 ? name[..300] : name,
+            string.IsNullOrWhiteSpace(markerType) ? profile.MarkerType : markerType.Trim(),
+            System.Text.RegularExpressions.Regex.IsMatch(markerColor ?? "", "^#[0-9a-fA-F]{6}$") ? markerColor! : profile.MarkerColor);
+        return new(session.SessionId, mapId, profileId, template, coordinates, includeDayZMarkers ? CreateDayZMarkers(coordinates, template) : []);
     }
 
     public TreasureMapBatch? GetPending(string sessionId)

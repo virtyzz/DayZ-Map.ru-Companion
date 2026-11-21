@@ -6,6 +6,20 @@ const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, '../src/EditorForm.cs'), 'utf8');
 new vm.Script(source.split('<script>')[1].split('</script>')[0]);
+const accountSource = source.slice(source.indexOf('let accountEmail ='), source.indexOf('function renderPlayerPosition()'));
+const accountContext = vm.createContext({ state: { account: {} }, escapeHtml: String });
+vm.runInContext(accountSource, accountContext);
+const accountHtml = () => vm.runInContext('renderAccount()', accountContext);
+assert.match(accountHtml(), /Получить код/);
+assert.match(accountHtml(), /data-account-action="discord"/);
+accountContext.state.account.emailCodeRequested = true;
+assert.match(accountHtml(), /autocomplete="one-time-code"/);
+accountContext.state.account.busy = 'discord';
+assert.match(accountHtml(), /data-account-action="cancel"/);
+accountContext.state.account = { user: { DisplayName: 'Игрок', Email: 'player@example.com' } };
+assert.match(accountHtml(), /Вход выполнен/);
+assert.match(accountHtml(), /data-account-action="logout"/);
+assert.doesNotMatch(accountHtml(), /data-account-action="discord"/);
 const renderer = source.slice(source.indexOf('function renderPlayerPosition()'), source.indexOf('function renderTreasures()'));
 const bindings = source.slice(source.indexOf('  const positionSetting = () =>'), source.indexOf('  syncTreasureCaptureLayout();'));
 const settingsDetails = (key, title, content) => `<details data-settings-disclosure="${key}"><summary>${title}</summary>${content}</details>`;
@@ -80,6 +94,11 @@ assert.match(sharingHtml, /data-settings-disclosure="position-diagnostics"[\s\S]
 assert.match(sharingHtml, /data-position-profile value="a" checked/);
 assert.match(sharingHtml, /data-position-profile value="b" checked/);
 assert.doesNotMatch(sharingHtml, /Wrong map/);
+sharingContext.state.account = {};
+const signedOutHtml = vm.runInContext('renderPlayerPosition()', sharingContext);
+assert.match(signedOutHtml, /data-tab="account"/);
+assert.match(signedOutHtml, /data-position-centering-block/);
+assert.doesNotMatch(signedOutHtml, /Откройте DayZ-Map/);
 vm.runInContext(bindings.slice(0, bindings.indexOf('  const savePlayerPositionSettings')), sharingContext);
 const chosen = vm.runInContext('positionSetting()', sharingContext);
 assert.deepEqual(Array.from(chosen.ProfileIds), ['a', 'b']);
@@ -87,4 +106,48 @@ assert.equal(chosen.Visibility, 'profiles');
 assert.equal(chosen.AutoSelectMap, true);
 assert.equal(chosen.ShowLabel, true);
 assert.equal(chosen.LabelContent, 'name');
+
+const views = [];
+const markers = [];
+const nodes = () => ({
+    classList: { add() {} }, append() {}, setAttribute() {}, after() {}, replaceChildren() {}, querySelector() { return null; }
+});
+const listeners = {};
+const overviewWindow = {
+    dayzMap: {
+        map: {
+            getZoom: () => 7, getMinZoom: () => 3, getMaxZoom: () => 10, getContainer: nodes,
+            setView(position, zoom) { views.push({ position, zoom }); }
+        },
+        gameToLeafletCoords: (x, z) => [z, x],
+        showPlayerPositionMarker(position) { markers.push(position); },
+        clearPlayerPositionMarker() { markers.push(null); }
+    }
+};
+overviewWindow.top = overviewWindow;
+const embeddedMap = fs.readFileSync(path.join(__dirname, '../assets/session-map-view.js'), 'utf8');
+vm.runInNewContext(embeddedMap, {
+    window: overviewWindow,
+    location: { origin: 'https://dayz-map.ru', pathname: '/deer-isle/' },
+    document: { documentElement: nodes(), createElement: nodes, addEventListener(name, action) { listeners[name] = action; } },
+    MutationObserver: class { observe() {} disconnect() {} }
+});
+const sample = {
+    MapId: 'deerisle', X: 4000, Y: 20, Z: 6500, Template: { Name: 'Я', Color: '#3498db', Type: 'triangle' },
+    MarkerSize: 32, CenterOnPlayer: true, KeepZoom: true, CenteringZoom: 12
+};
+overviewWindow.DayZCompanionOverviewPosition(sample);
+assert.equal(views.length, 0);
+listeners.DOMContentLoaded();
+assert.deepEqual(views[0], { position: [6500, 4000], zoom: 7 });
+overviewWindow.DayZCompanionOverviewPosition({ ...sample, KeepZoom: false });
+assert.deepEqual(views[1], { position: [6500, 4000], zoom: 10 });
+overviewWindow.DayZCompanionOverviewPosition({ ...sample, X: 4100, CenterOnPlayer: false });
+assert.deepEqual(markers.at(-1), [6500, 4100]);
+assert.equal(views.length, 2);
+overviewWindow.DayZCompanionOverviewPosition({ ...sample, MapId: 'cherno' });
+assert.equal(markers.at(-1), null);
+overviewWindow.DayZCompanionOverviewPosition(sample);
+overviewWindow.DayZCompanionOverviewPosition(null);
+assert.equal(markers.at(-1), null);
 console.log('PASS player-position UI: dependencies, privacy modes, multi-profile, map filtering and JavaScript syntax');

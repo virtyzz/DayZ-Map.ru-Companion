@@ -1,6 +1,6 @@
 namespace CrosshairMarker;
 
-internal sealed class PlayerPositionMapBridge
+internal sealed class PlayerPositionMapBridge(Func<TreasureDestinationSession>? localDestination = null)
 {
     private readonly object sync = new();
     private TreasureDestinationSession? session;
@@ -38,8 +38,28 @@ internal sealed class PlayerPositionMapBridge
         }
         SessionChanged?.Invoke(current);
     }
-    public TreasureDestinationSession? GetSession() { lock (sync) { ExpireUnsafe(); return session; } }
+    public TreasureDestinationSession? GetSession() { lock (sync) { ExpireUnsafe(); return localDestination?.Invoke() ?? session; } }
     public PlayerPositionUpdate? GetPending(string sessionId) { lock (sync) { ExpireUnsafe(); return session?.SessionId == sessionId ? pending : null; } }
+    public PlayerPositionUpdate? GetLatestPosition()
+    {
+        lock (sync)
+        {
+            ExpireUnsafe();
+            return trackingEnabled ? latest : null;
+        }
+    }
+
+    public void ReportCloudPosition(PlayerPositionUpdate update, bool sent, string message)
+    {
+        lock (sync)
+        {
+            if (!ReferenceEquals(latest, update)) return;
+            if (feedback == message && (!sent || pending is null)) return;
+            feedback = message;
+            if (sent) pending = null;
+        }
+        if (sent) Delivered?.Invoke(update);
+    }
     public bool IsActiveSession(string sessionId) { lock (sync) { ExpireUnsafe(); return session?.SessionId == sessionId; } }
     public bool IsTrackingEnabled { get { lock (sync) return trackingEnabled; } }
     public PlayerPositionPublication GetPublication() { lock (sync) return publication; }
@@ -70,14 +90,16 @@ internal sealed class PlayerPositionMapBridge
         {
             ExpireUnsafe();
             publication = new(settings.MapId, settings.Visibility, settings.ProfileIds.ToArray());
-            if (session is null) throw new DayZCompanionException("Откройте DayZ-Map в браузере — Companion подключится автоматически.");
-            var map = session.Maps.SingleOrDefault(item => item.Id == settings.MapId) ?? throw new DayZCompanionException("Выбранная карта недоступна.");
+            var destination = localDestination?.Invoke() ?? session
+                ?? throw new DayZCompanionException("Откройте DayZ-Map в браузере — Companion подключится автоматически.");
+            var map = destination.Maps.SingleOrDefault(item => item.Id == settings.MapId) ?? throw new DayZCompanionException("Выбранная карта недоступна.");
             if (map.Width > 0 && map.Height > 0 && (position.X < 0 || position.X > map.Width || position.Z < 0 || position.Z > map.Height)) throw new DayZCompanionException("Координаты вне выбранной карты.");
-            pending = new PlayerPositionUpdate(session.SessionId, settings.MapId, "", settings.TrackingId, settings.MarkerUid, new TreasureMarkerTemplate(settings.MarkerName, settings.IndicatorShape, settings.MarkerColor), position.X, position.Y, position.Z, position.MeasuredAt,
+            pending = new PlayerPositionUpdate(destination.SessionId, settings.MapId, "", settings.TrackingId, settings.MarkerUid, new TreasureMarkerTemplate(settings.MarkerName, settings.IndicatorShape, settings.MarkerColor), position.X, position.Y, position.Z, position.MeasuredAt,
                 settings.CenterOnPlayer, settings.KeepZoom, settings.CenteringZoom, settings.ShowLabel, settings.MarkerSize, settings.LabelContent,
-                settings.Visibility, settings.ProfileIds.ToArray(), settings.IntervalSeconds, settings.AutoSelectMap, GetServerInfo(server));
+                settings.Visibility, settings.ProfileIds.ToArray(), settings.IntervalSeconds, settings.AutoSelectMap, GetServerInfo(server), server?.ConnectionId);
             latest = pending;
-            feedback = "Обновление позиции ожидает карту.";
+            feedback = localDestination is null ? "Обновление позиции ожидает карту."
+                : settings.Visibility == "private" ? "Позиция обновлена на этом ПК." : "Позиция ожидает отправки.";
         }
     }
     private static PlayerPositionServerInfo? GetServerInfo(PerformanceSnapshot? snapshot)
@@ -94,7 +116,9 @@ internal sealed class PlayerPositionMapBridge
             ExpireUnsafe();
             publication = new(settings.MapId, settings.Visibility, settings.ProfileIds.ToArray());
             if (latest is not null && latest.MapId != settings.MapId) { latest = null; pending = null; }
-            if (!trackingEnabled || latest is null || session?.SessionId != latest.SessionId || latest.MapId != settings.MapId) return;
+            if (localDestination is not null && latest?.Visibility == "private" && settings.Visibility != "private")
+            { latest = null; pending = null; feedback = null; }
+            if (!trackingEnabled || latest is null || (localDestination is null && session?.SessionId != latest.SessionId) || latest.MapId != settings.MapId) return;
             var updated = latest with
             {
                 Template = new TreasureMarkerTemplate(settings.MarkerName, settings.IndicatorShape, settings.MarkerColor),
@@ -106,6 +130,8 @@ internal sealed class PlayerPositionMapBridge
             };
             if (updated == latest) return;
             latest = pending = updated;
+            if (localDestination is not null && updated.Visibility == "private")
+                feedback = "Позиция обновлена на этом ПК.";
         }
     }
     public void Acknowledge(string sessionId, string trackingId, bool success, string message)

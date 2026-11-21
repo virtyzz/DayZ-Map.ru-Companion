@@ -24,6 +24,15 @@ internal sealed class EditorForm : Form
     private readonly TreasureCaptureService treasureCaptureService;
     private readonly TreasureMapBridge treasureMapBridge;
     private readonly PlayerPositionMapBridge playerPositionMapBridge;
+    private readonly CompanionAccount? account;
+    private readonly CompanionPositionSync? positionSync;
+    private readonly CancellationTokenSource editorLifetime = new();
+    private CancellationTokenSource? accountAction;
+    private string? accountActionName;
+    private string? emailChallenge;
+    private string? accountFeedback;
+    private bool treasureSending;
+    private bool treasureProfileCreating;
     private readonly PlayerPositionCaptureService playerPositionCaptureService;
     private readonly WebView2 webView = new();
     private bool integratedCaption;
@@ -33,6 +42,7 @@ internal sealed class EditorForm : Form
     private string? sessionMapAddress;
     private string? requestedSessionMap;
     private bool sessionMapLoaded;
+    private PlayerPositionUpdate? displayedSessionPosition;
     private readonly System.Windows.Forms.Timer dayZStatusTimer = new() { Interval = 2500 };
     private AppConfig config;
     private DayZCompanionSettings dayZSettings;
@@ -60,6 +70,7 @@ internal sealed class EditorForm : Form
     public event Action? UpdateRequested;
     public event Action? UpdateCancelRequested;
     public event Action<DayZCompanionSettings>? DayZSettingsChanged;
+    public event Action<PlayerPositionTrackingSettings, bool>? PlayerPositionSettingsChanged;
     public event Func<Task>? PlayerPositionRegionRequested;
     private bool selectingPlayerPositionRegion;
     public event Action? DayZStatusRequested;
@@ -67,7 +78,7 @@ internal sealed class EditorForm : Form
     public event Action<string>? BattlePassCommandRequested;
     public event Action<string, ManualTask>? ManualTaskCommandRequested;
 
-    public EditorForm(AppConfig source, UpdateService updateService, DayZCompanionSettings dayZSettings, DayZCompanionStatus dayZStatus, BattlePassSettings battlePassSettings, BattlePassSnapshot battlePassSnapshot, TreasureCaptureStore treasureStore, TreasureCaptureService treasureCaptureService, TreasureMapBridge treasureMapBridge, PlayerPositionMapBridge playerPositionMapBridge, PlayerPositionCaptureService playerPositionCaptureService, string? initialTab = null)
+    public EditorForm(AppConfig source, UpdateService updateService, DayZCompanionSettings dayZSettings, DayZCompanionStatus dayZStatus, BattlePassSettings battlePassSettings, BattlePassSnapshot battlePassSnapshot, TreasureCaptureStore treasureStore, TreasureCaptureService treasureCaptureService, TreasureMapBridge treasureMapBridge, PlayerPositionMapBridge playerPositionMapBridge, PlayerPositionCaptureService playerPositionCaptureService, string? initialTab = null, CompanionAccount? account = null, CompanionPositionSync? positionSync = null)
     {
         this.updateService = updateService;
         updateService.ProgressChanged += OnUpdateProgressChanged;
@@ -75,6 +86,9 @@ internal sealed class EditorForm : Form
         this.treasureCaptureService = treasureCaptureService;
         this.treasureMapBridge = treasureMapBridge;
         this.playerPositionMapBridge = playerPositionMapBridge;
+        this.account = account;
+        this.positionSync = positionSync;
+        if (account is not null) account.Changed += OnAccountChanged;
         this.playerPositionCaptureService = playerPositionCaptureService;
         foreach (var capture in treasureStore.Load().Where(item => item.Status is TreasureRecognitionStatus.Queued or TreasureRecognitionStatus.Recognizing)) treasureOcrQueue.Enqueue(capture.Id);
         _ = ProcessTreasureQueueAsync();
@@ -114,6 +128,9 @@ internal sealed class EditorForm : Form
         };
         FormClosed += (_, _) =>
         {
+            if (account is not null) account.Changed -= OnAccountChanged;
+            editorLifetime.Cancel();
+            editorLifetime.Dispose();
             updateService.ProgressChanged -= OnUpdateProgressChanged;
             dayZStatusTimer.Stop();
             dayZStatusTimer.Dispose();
@@ -402,11 +419,15 @@ internal sealed class EditorForm : Form
                     ManualTaskCommandRequested?.Invoke(action, manualTask);
                     break;
                 case "updatePlayerPositionSettings":
-                    await ApplyPlayerPositionSettingsFromWebAsync(root.GetProperty("settings"));
+                    await ApplyPlayerPositionSettingsFromWebAsync(root.GetProperty("settings"),
+                        root.TryGetProperty("selectionChanged", out var selection) && selection.ValueKind == JsonValueKind.True);
                     break;
                 case "treasure":
-                    HandleTreasureFromWeb(root);
+                    await HandleTreasureFromWebAsync(root);
                     await SendStateAsync();
+                    break;
+                case "account":
+                    await HandleAccountActionAsync(root);
                     break;
                 case "window":
                     HandleWindowCommand(root.GetProperty("name").GetString());
@@ -469,6 +490,7 @@ internal sealed class EditorForm : Form
         else if (sessionMapLoaded)
         {
             view.Visible = true;
+            await UpdateSessionMapPositionAsync();
         }
     }
 
@@ -502,6 +524,7 @@ internal sealed class EditorForm : Form
             {
                 currentNavigation = e.NavigationId;
                 sessionMapLoaded = false;
+                displayedSessionPosition = null;
             }
         };
         core.ContentLoading += (_, e) =>
@@ -520,7 +543,44 @@ internal sealed class EditorForm : Form
                 sessionMapAddress = null;
                 await ReportSessionMapFailureAsync();
             }
+            else if (view.Visible)
+            {
+                displayedSessionPosition = null;
+                await UpdateSessionMapPositionAsync();
+            }
         };
+    }
+
+    private async Task UpdateSessionMapPositionAsync()
+    {
+        if (IsDisposed || !sessionMapLoaded || requestedSessionMap is null || requestedSessionMap != sessionMapAddress ||
+            sessionMapView?.CoreWebView2 is not { } core || core.Source != sessionMapAddress) return;
+
+        var position = playerPositionMapBridge.GetLatestPosition();
+        var server = performanceSnapshot;
+        if (position is not null &&
+            (!server.Running || position.ConnectionId != server.ConnectionId || position.Server?.Address != server.Server ||
+             SessionMapAddress(position.MapId) != sessionMapAddress ||
+             DateTimeOffset.UtcNow - position.MeasuredAt >= TimeSpan.FromSeconds(Math.Max(20, position.IntervalSeconds * 3 + 10))))
+            position = null;
+        if (ReferenceEquals(displayedSessionPosition, position)) return;
+
+        var payload = position is null ? null : new
+        {
+            position.MapId, position.X, position.Y, position.Z, position.Template,
+            position.MarkerSize, position.CenterOnPlayer, position.KeepZoom, position.CenteringZoom
+        };
+        var json = JsonSerializer.Serialize(payload, JsonOptions);
+        displayedSessionPosition = position;
+        try
+        {
+            await core.ExecuteScriptAsync($"window.DayZCompanionOverviewPosition?.({json});");
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or System.Runtime.InteropServices.COMException)
+        {
+            if (ReferenceEquals(displayedSessionPosition, position)) displayedSessionPosition = null;
+            if (!IsDisposed) AppRuntimeLog.Error("Could not update the position on the overview map", ex);
+        }
     }
 
     private async Task ReportSessionMapFailureAsync()
@@ -739,16 +799,12 @@ internal sealed class EditorForm : Form
         new DayZMarkersService(dayZSettings).ImportBatch(requests, EnsureSessionMarkerImportAllowed);
     }
 
-    private async Task ApplyPlayerPositionSettingsFromWebAsync(JsonElement settingsElement)
+    private async Task ApplyPlayerPositionSettingsFromWebAsync(JsonElement settingsElement, bool selectionChanged)
     {
         var next = settingsElement.Deserialize<PlayerPositionTrackingSettings>(JsonOptions);
         if (next is null) return;
-        // The web form edits display options; only the native selector can change the OCR region.
-        next.CopyRegionFrom(dayZSettings.PlayerPositionTracking);
-        next.Normalize();
+        PlayerPositionSettingsChanged?.Invoke(next, selectionChanged);
         if (next.Enabled && !next.Paused) await WindowGraphicsCapture.GetBorderlessAccessAsync();
-        dayZSettings.PlayerPositionTracking = next;
-        DayZSettingsChanged?.Invoke(dayZSettings);
     }
 
     public async Task SelectPlayerPositionRegionAsync()
@@ -780,13 +836,92 @@ internal sealed class EditorForm : Form
         DayZSettingsChanged?.Invoke(dayZSettings);
     }
 
-    private void HandleTreasureFromWeb(JsonElement root)
+    private void OnAccountChanged()
+    {
+        if (!IsHandleCreated || IsDisposed || Disposing) return;
+        try { BeginInvoke(new Action(() => _ = SendStateAsync())); }
+        catch (InvalidOperationException) when (IsDisposed || Disposing || !IsHandleCreated) { }
+    }
+
+    private async Task HandleAccountActionAsync(JsonElement root)
+    {
+        if (account is null) return;
+        var action = GetString(root, "action");
+        if (action == "cancel")
+        {
+            accountAction?.Cancel();
+            return;
+        }
+        if (accountAction is not null) return;
+        using var operation = CancellationTokenSource.CreateLinkedTokenSource(editorLifetime.Token);
+        accountAction = operation;
+        accountActionName = action;
+        accountFeedback = null;
+        try
+        {
+            await SendStateAsync();
+            switch (action)
+            {
+                case "request-email" when account.Session is null:
+                    emailChallenge = null;
+                    var challenge = await account.RequestEmailCodeAsync(GetString(root, "email").Trim(), operation.Token);
+                    emailChallenge = challenge.Challenge;
+                    accountFeedback = "Код отправлен. Проверьте почту.";
+                    break;
+                case "verify-email" when account.Session is null && emailChallenge is not null:
+                    await account.SignInWithEmailAsync(emailChallenge, GetString(root, "code").Trim(), operation.Token);
+                    emailChallenge = null;
+                    break;
+                case "change-email":
+                    emailChallenge = null;
+                    break;
+                case "discord" when account.Session is null:
+                    await account.SignInWithDiscordAsync(operation.Token);
+                    emailChallenge = null;
+                    break;
+                case "refresh":
+                    await account.RefreshAsync(operation.Token, recordUse: true);
+                    break;
+                case "logout" when positionSync is not null:
+                    await positionSync.SignOutAsync(operation.Token);
+                    emailChallenge = null;
+                    break;
+            }
+        }
+        catch (OperationCanceledException) when (operation.IsCancellationRequested) { }
+        catch (Exception ex) { accountFeedback = ex.Message; }
+        finally
+        {
+            accountAction = null;
+            accountActionName = null;
+            await SendStateAsync();
+        }
+    }
+
+    private async Task HandleTreasureFromWebAsync(JsonElement root)
     {
         var id = GetString(root, "id");
         var captures = treasureStore.Load();
         var capture = captures.SingleOrDefault(item => item.Id == id);
         switch (GetString(root, "action"))
         {
+            case "create-profile" when account is not null:
+                if (treasureProfileCreating) return;
+                treasureProfileCreating = true;
+                treasureFeedback = null;
+                var token = editorLifetime.Token;
+                try
+                {
+                    await SendStateAsync();
+                    var profileId = await account.CreateProfileAsync(GetString(root, "mapId"), GetString(root, "name").Trim(), token);
+                    await webView.CoreWebView2.ExecuteScriptAsync(
+                        $"window.DayZMapCompanion.selectTreasureProfile({JsonSerializer.Serialize(profileId, JsonOptions)});");
+                    treasureFeedback = "Облачный профиль создан.";
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+                catch (Exception ex) { treasureFeedback = ex.Message; }
+                finally { treasureProfileCreating = false; }
+                return;
             case "delete":
                 if (capture is not null) captures.Remove(capture);
                 break;
@@ -814,6 +949,11 @@ internal sealed class EditorForm : Form
                 }
                 break;
             case "send":
+                if (account is not null)
+                {
+                    await SendCloudTreasuresAsync(root, captures);
+                    return;
+                }
                 treasureMapBridge.Queue(
                     GetString(root, "mapId"),
                     GetString(root, "profileId"),
@@ -825,6 +965,45 @@ internal sealed class EditorForm : Form
                 break;
         }
         treasureStore.Save(captures);
+    }
+
+    private async Task SendCloudTreasuresAsync(JsonElement root, List<TreasureCapture> captures)
+    {
+        if (treasureSending || account is null) return;
+        if (account.Session is not { } owner) throw new DayZCompanionException("Войдите в аккаунт, чтобы отправить клады.");
+        var batch = TreasureMapBridge.BuildBatch(account.GetDestinations(owner.User.Id, includeOfflineMaps: false),
+            GetString(root, "mapId"), GetString(root, "profileId"), GetString(root, "markerName"), GetString(root, "markerType"),
+            GetString(root, "markerColor"), captures);
+        treasureSending = true;
+        treasureFeedback = "Отправляю координаты в профиль…";
+        var token = editorLifetime.Token;
+        var imported = 0;
+        var duplicates = 0;
+        try
+        {
+            await SendStateAsync();
+            foreach (var coordinates in batch.Coordinates.Chunk(200))
+            {
+                var outcomes = await account.SendTreasuresAsync(owner, batch, coordinates, token);
+                var delivered = outcomes.ToDictionary(item => item.CaptureId, StringComparer.Ordinal);
+                var sent = coordinates.ToDictionary(item => item.CaptureId, StringComparer.Ordinal);
+                var current = treasureStore.Load();
+                foreach (var capture in current)
+                {
+                    if (!sent.TryGetValue(capture.Id, out var coordinate) || capture.X != coordinate.X || capture.Z != coordinate.Z ||
+                        !delivered.TryGetValue(capture.Id, out var outcome)) continue;
+                    capture.DeliveryResult = outcome.Message;
+                    if (outcome.Result is "imported" or "duplicate") capture.SentAt = DateTimeOffset.Now;
+                }
+                treasureStore.Save(current);
+                imported += outcomes.Count(item => item.Result == "imported");
+                duplicates += outcomes.Count(item => item.Result == "duplicate");
+            }
+            treasureFeedback = $"Добавлено: {imported}. Уже в профиле или ранее удалено: {duplicates}.";
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        catch (Exception ex) { treasureFeedback = $"Отправка остановлена. Добавлено: {imported}. {ex.Message}"; }
+        finally { treasureSending = false; }
     }
 
     private static string GetString(JsonElement root, string name) => root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() ?? "" : "";
@@ -978,7 +1157,7 @@ internal sealed class EditorForm : Form
 
     private async Task SendStateAsync()
     {
-        if (!webReady || webView.CoreWebView2 is null)
+        if (!webReady || IsDisposed || Disposing || webView.CoreWebView2 is null)
         {
             return;
         }
@@ -999,7 +1178,8 @@ internal sealed class EditorForm : Form
             performanceDefaults = new PerformanceSettings(),
             ocr = ocrStatus ??= TesseractOcr.Detect(),
             battlePass = new { settings = battlePassSettings, snapshot = battlePassSnapshot, manualTasks = battlePassStore.LoadManualTasks(), ocr = ocrStatus },
-            treasures = new { captures = PrepareTreasureCapturesForView(), destination = treasureMapBridge.GetSession(), selecting = treasureCaptureInProgress, processing = treasureOcrWorkerRunning, queued = treasureOcrQueue.Count, feedback = treasureMapBridge.GetDeliveryFeedback() ?? treasureFeedback },
+            account = new { user = account?.User, busy = accountActionName, emailCodeRequested = emailChallenge is not null, feedback = accountFeedback ?? account?.ConnectionError, connectionError = account?.ConnectionError },
+            treasures = new { captures = PrepareTreasureCapturesForView(), destination = account is null ? treasureMapBridge.GetSession() : account.Session is { } signedIn ? account.GetDestinations(signedIn.User.Id, includeOfflineMaps: true) : null, selecting = treasureCaptureInProgress, processing = treasureOcrWorkerRunning, sending = treasureSending, creatingProfile = treasureProfileCreating, queued = treasureOcrQueue.Count, feedback = account is null ? treasureMapBridge.GetDeliveryFeedback() ?? treasureFeedback : treasureFeedback },
             playerPosition = new { settings = dayZSettings.PlayerPositionTracking, destination = playerPositionMapBridge.GetSession(), feedback = playerPositionMapBridge.GetFeedback(), diagnostics = playerPositionCaptureService.GetDiagnostics() },
             hotkeyErrors = config.HotkeyRegistrationErrors,
             monitors = MonitorInfo.GetAll().Select(monitor => new
@@ -1011,7 +1191,8 @@ internal sealed class EditorForm : Form
             preview = RenderPreviewDataUri(profile)
         };
         var json = JsonSerializer.Serialize(payload, JsonOptions);
-            await webView.CoreWebView2.ExecuteScriptAsync($"window.DayZMapCompanion.receiveState({json});");
+        await webView.CoreWebView2.ExecuteScriptAsync($"window.DayZMapCompanion.receiveState({json});");
+        await UpdateSessionMapPositionAsync();
     }
 
     private async Task RefreshOcrAfterInstallAsync()
@@ -2057,6 +2238,7 @@ const defaultHotkeys = {
 };
 
 const iconPaths = {
+  account: '<circle cx="12" cy="8" r="4"/><path d="M4 21v-2a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v2"/>',
   chevronDown: '<path d="m4 8 8 8 8-8"/>',
   overview: '<path d="m3 11 9-8 9 8M5 10v11h5v-6h4v6h5V10"/>',
   position: '<circle cx="12" cy="12" r="8"/><path d="M12 2v4m0 12v4M2 12h4m12 0h4"/>',
@@ -2078,6 +2260,7 @@ const navigation = [
   { icon: "position", tab: ["player-position", "Позиция"] },
   { icon: "markers", tab: ["dayz", "Метки"] },
   { icon: "treasures", tab: ["treasures", "Клады"] },
+  { icon: "account", tab: ["account", "Аккаунт"] },
   { id: "crosshair", icon: "crosshair", label: "Прицел", tabs: [
     ["crosshair", "Настройка прицела"],
     ["image", "Изображение"],
@@ -2380,6 +2563,7 @@ function renderDataChanged(previous, next) {
     dayZSettings: settingsWithoutPositionTelemetry(value.dayZ?.settings),
     markerFileStatus: markerFileStatus(value.dayZ?.status),
     battlePass: value.battlePass,
+    account: value.account,
     treasures: value.treasures,
     positionDestination: { maps: value.playerPosition?.destination?.Maps, profiles: value.playerPosition?.destination?.Profiles },
     hotkeyErrors: value.hotkeyErrors,
@@ -2438,6 +2622,7 @@ function renderEditor() {
     "player-position": renderPlayerPosition,
     performance: renderPerformance,
     treasures: renderTreasures,
+    account: renderAccount,
     tasks: renderBattlePass,
     profiles: renderProfiles,
     updates: renderUpdates
@@ -2809,6 +2994,37 @@ function toggleSessionMarkerMenu(trigger) {
   sessionMarkerPopover.firstElementChild.focus({ preventScroll: true });
 }
 
+let accountEmail = "";
+
+function renderAccount() {
+  const account = state.account || {};
+  const disabled = account.busy ? "disabled" : "";
+  const message = account.busy === "discord" ? "Подтвердите вход в Discord и вернитесь в Companion." :
+    account.busy ? "Выполняется запрос…" : account.feedback;
+  const status = message ? `<div class="limit" role="status">${escapeHtml(message)}</div>` : "";
+  if (account.user) {
+    return `<h2>Аккаунт</h2><div class="field">
+      <div class="compact-row"><h3>${escapeHtml(account.user.DisplayName)}</h3><span class="compact-value">Вход выполнен</span></div>
+      ${account.user.Email ? `<div class="limit">${escapeHtml(account.user.Email)}</div>` : ""}
+      <div class="actions"><button class="action" data-account-action="refresh" ${disabled}>Обновить профили</button>
+      <button class="action" data-account-action="logout" ${disabled}>Выйти</button></div>${status}
+    </div>`;
+  }
+  return `<h2>Вход в DayZ-Map</h2>
+    <form class="field" data-account-email>
+      <h3>По почте</h3>
+      <label class="compact-row">Email <input name="email" type="email" required maxlength="254" autocomplete="email" value="${escapeHtml(accountEmail)}" ${account.emailCodeRequested ? "readonly" : ""} ${disabled}></label>
+      ${account.emailCodeRequested ? `<label class="compact-row">Код из письма <input name="code" type="text" required inputmode="numeric" pattern="[0-9]{8}" maxlength="8" autocomplete="one-time-code" ${disabled}></label>` : ""}
+      <div class="actions"><button class="action primary" type="submit" ${disabled}>${account.emailCodeRequested ? "Войти" : "Получить код"}</button>
+      ${account.emailCodeRequested ? `<button class="action" type="button" data-account-action="request-email" ${disabled}>Отправить новый код</button>
+        <button class="action" type="button" data-account-action="change-email" ${disabled}>Изменить адрес</button>` : ""}</div>
+    </form>
+    <div class="field"><h3>Через Discord</h3><div class="actions">
+      ${account.busy === "discord" ? `<button class="action" data-account-action="cancel">Отменить вход</button>` :
+        `<button class="action" data-account-action="discord" ${disabled}>Войти через Discord</button>`}
+    </div></div>${status}`;
+}
+
 function renderPlayerPosition() {
   const data = state.playerPosition || {};
   const s = data.settings || {};
@@ -2831,14 +3047,14 @@ function renderPlayerPosition() {
       <option value="public" ${s.Visibility === "public" ? "selected" : ""}>Всем на сайте</option>
       <option value="profiles" ${s.Visibility === "profiles" ? "selected" : ""}>Выбранные профили</option>
     </select></label>
-      <div class="limit">${s.Visibility === "public" ? "Позицию увидят все посетители карты. Для передачи войдите в аккаунт." : s.Visibility === "profiles" ? "Позицию увидят участники выбранных серверных профилей." : "Позиция видна только вам в браузере."}</div>
-      ${s.Visibility === "profiles" ? `<div class="position-profile-choices">${profiles.map(item => `<label><input type="checkbox" data-position-profile value="${escapeHtml(item.Id)}" ${selectedProfiles.has(item.Id) ? "checked" : ""}><span>${escapeHtml(item.Name)}</span></label>`).join("") || `<div class="limit">Нет доступных профилей для этой карты. Войдите на DayZ-Map, чтобы выбрать профиль.</div>`}</div>` : ""}
+      <div class="limit">${s.Visibility === "public" ? "Позицию увидят все посетители карты." : s.Visibility === "profiles" ? "Позицию увидят участники выбранных серверных профилей." : "На сайте позицию увидите только вы на любом профиле этой карты. Войдите в тот же аккаунт в Companion и на сайте."}</div>
+      ${state.account && !state.account.user ? `<button class="action" data-tab="account">Войти в аккаунт</button>` : ""}
+      ${s.Visibility === "profiles" ? `<div class="position-profile-choices">${profiles.map(item => `<label><input type="checkbox" data-position-profile value="${escapeHtml(item.Id)}" ${selectedProfiles.has(item.Id) ? "checked" : ""}><span>${escapeHtml(item.Name)}</span></label>`).join("") || `<div class="limit">Нет доступных профилей для этой карты.</div>`}</div>` : ""}
     </div>
     <div class="field">
       <div class="compact-row"><h3>Область координат</h3><span class="limit">${s.HasRegion ? "Настроена" : "Не выбрана"}</span></div>
       <div class="actions"><button class="action primary" data-command="selectPlayerPositionRegion">Настроить область координат</button><button class="action" data-command="showPlayerPositionHint">Подсказка</button></div>
       ${state.ocr?.Ready === false ? `<div class="compact-row"><span class="limit">Для распознавания координат нужен OCR.</span><button class="action" data-command="installOcr">Установить OCR</button></div>` : ""}
-      ${destination ? "" : `<div class="limit">Откройте DayZ-Map, чтобы подключить карту.</div>`}
       <div class="limit" data-player-position-error hidden></div>
     </div>
     ${settingsDetails("position-display", "Отображение и обновление", `
@@ -2846,6 +3062,7 @@ function renderPlayerPosition() {
       <label class="compact-row">Центрировать карту на позиции игрока <input type="checkbox" data-position-center ${s.CenterOnPlayer ? "checked" : ""}></label>
       <label class="compact-row">Сохранять текущий зум <input type="checkbox" data-position-keep-zoom ${s.KeepZoom !== false ? "checked" : ""} ${s.CenterOnPlayer ? "" : "disabled"}></label>
       <label class="compact-row">Зум центрирования <input class="number" data-position-zoom type="number" min="2" max="12" step="1" value="${s.CenteringZoom ?? 8}" ${s.CenterOnPlayer && s.KeepZoom === false ? "" : "disabled"}></label>
+      <div class="limit">Действует в «Обзоре» и на сайте для вашей позиции.</div>
     </div>
     <div class="field" data-position-marker-block>
       <label class="compact-row">Имя маркера <input data-position-name type="text" value="${escapeHtml(s.MarkerName || "")}" placeholder="Подпись маркера"></label>
@@ -2913,7 +3130,12 @@ function renderTreasures() {
   };
   const mapPicker = choicePicker("map", maps, treasureMapId, treasureMapMenuOpen, treasureMapMenuUp);
   const profilePicker = choicePicker("profile", profiles, treasureProfileId, treasureProfileMenuOpen, treasureProfileMenuUp);
-  const destinationUi = !destination ? `<div class="field"><div class="field-label">Карта</div><div class="limit">Откройте DayZ-Map в браузере: Companion ожидает подключение карты.</div></div>` : `<div class="field"><div class="field-label">Отправка на карту</div><div class="treasure-destination-grid"><label>Карта${mapPicker}</label><label>Профиль${profilePicker}</label></div><div class="treasure-template-label">Настройки метки<div class="treasure-template-row"><input type="text" data-treasure-template-name value="${escapeHtml(selectedTemplate.name)}" placeholder="Название метки" maxlength="300"><div class="treasure-type-picker ${treasureTypeMenuUp ? "open-up" : ""}"><input type="hidden" data-treasure-template-type value="${selectedMarkerType.id}"><button type="button" class="treasure-type-trigger" data-treasure-type-toggle>${treasureMarkerIcon(selectedMarkerType.id, selectedMarkerType.color)}<span>${escapeHtml(selectedMarkerType.name)}</span></button><div class="treasure-type-menu" ${treasureTypeMenuOpen ? "" : "hidden"}>${typeOptions}</div></div><input class="treasure-color-picker" data-treasure-template-color type="color" value="${selectedColor}" title="Цвет метки"></div></div><div><button class="action primary" data-treasure-send ${!treasureProfileId ? "disabled" : ""}>Отправить координаты</button></div><div class="limit">Шаблон действует только для этой отправки.</div></div>`;
+  const createProfile = state.account?.user && treasureMapId ? settingsDetails("treasure-cloud-profile", "Создать облачный профиль", `
+    <form class="field" data-treasure-profile-form>
+      <label class="compact-row">Название <input name="profileName" type="text" required maxlength="80"></label>
+      <div class="actions"><button type="submit" class="action" ${state.treasures?.creatingProfile ? "disabled" : ""}>Создать для ${escapeHtml(maps.find(item => item.Id === treasureMapId)?.Name || "")}</button></div>
+    </form>`) : "";
+  const destinationUi = !destination ? `<div class="field"><div class="field-label">Карта</div><div class="limit">Войдите в аккаунт, чтобы отправить клады в облачный профиль.</div><div class="actions"><button class="action" data-tab="account">Войти в аккаунт</button></div></div>` : `<div class="field"><div class="field-label">Отправка на карту</div><div class="treasure-destination-grid"><label>Карта${mapPicker}</label><label>Профиль${profilePicker}</label></div><div class="treasure-template-label">Настройки метки<div class="treasure-template-row"><input type="text" data-treasure-template-name value="${escapeHtml(selectedTemplate.name)}" placeholder="Название метки" maxlength="300"><div class="treasure-type-picker ${treasureTypeMenuUp ? "open-up" : ""}"><input type="hidden" data-treasure-template-type value="${selectedMarkerType.id}"><button type="button" class="treasure-type-trigger" data-treasure-type-toggle>${treasureMarkerIcon(selectedMarkerType.id, selectedMarkerType.color)}<span>${escapeHtml(selectedMarkerType.name)}</span></button><div class="treasure-type-menu" ${treasureTypeMenuOpen ? "" : "hidden"}>${typeOptions}</div></div><input class="treasure-color-picker" data-treasure-template-color type="color" value="${selectedColor}" title="Цвет метки"></div></div><div><button class="action primary" data-treasure-send ${!treasureProfileId || state.treasures?.sending ? "disabled" : ""}>Отправить координаты</button></div><div class="limit">${!treasureProfileId ? escapeHtml(state.account?.connectionError || "Для этой карты нужен облачный профиль с правом записи.") : "Шаблон действует только для этой отправки."}</div></div>`;
   const feedback = state.treasures?.feedback ? `<div class="limit">${escapeHtml(state.treasures.feedback)}</div>` : "";
   const preview = treasurePreviewUri ? `<div class="treasure-image-modal" data-treasure-preview-close><img src="${escapeHtml(treasurePreviewUri)}" alt="Скриншот уведомления"></div>` : "";
   const controls = `<div class="compact-stack">
@@ -2925,6 +3147,7 @@ function renderTreasures() {
       ${captures ? `<div class="treasure-list">${captures}</div>` : '<div class="limit">Пока нет захватов.</div>'}
     </div>
     ${destinationUi}
+    ${createProfile}
     ${settingsDetails("treasure-diagnostics", "Горячая клавиша, OCR и файлы", `
       ${renderOcrStatus()}
       <div class="field"><div class="compact-row"><span>Горячая клавиша захвата</span><button class="action" data-hotkey="CaptureTreasure">${displayHotkey(state.config.Hotkeys.CaptureTreasure)}</button></div>${hotkeyRegistrationWarning("CaptureTreasure")}</div>
@@ -3230,6 +3453,26 @@ function saveTreasureCoordinates(id) {
 }
 
 function bindEditorEvents() {
+  const accountForm = document.querySelector("[data-account-email]");
+  accountForm?.elements.email.addEventListener("input", event => { accountEmail = event.target.value; });
+  accountForm?.addEventListener("submit", event => {
+    event.preventDefault();
+    accountEmail = accountForm.elements.email.value;
+    const code = accountForm.elements.code?.value;
+    document.activeElement?.blur();
+    post({ type: "account", action: code === undefined ? "request-email" : "verify-email", email: accountEmail, code });
+  });
+  document.querySelectorAll("[data-account-action]").forEach(button => button.addEventListener("click", () => {
+    document.activeElement?.blur();
+    post({ type: "account", action: button.dataset.accountAction, email: accountEmail });
+  }));
+  document.querySelector("[data-treasure-profile-form]")?.addEventListener("submit", event => {
+    event.preventDefault();
+    const name = event.currentTarget.elements.profileName.value.trim();
+    if (!name || !treasureMapId) return;
+    document.activeElement?.blur();
+    post({ type: "treasure", action: "create-profile", mapId: treasureMapId, name });
+  });
   document.querySelectorAll("[data-settings-disclosure]").forEach(details => {
     details.addEventListener("toggle", () => {
       if (!details.isConnected) return;
@@ -3438,7 +3681,9 @@ function bindEditorEvents() {
       button.textContent = "Нажмите сочетание...";
     });
   });
-  const positionSetting = () => ({
+  const positionSetting = () => {
+    const profileOptions = Array.from(document.querySelectorAll("[data-position-profile]"));
+    return ({
     ...(state.playerPosition?.settings || {}),
     Enabled: document.querySelector("[data-position-enabled]")?.checked || false,
     Paused: document.querySelector("[data-position-paused]")?.checked || false,
@@ -3446,29 +3691,30 @@ function bindEditorEvents() {
     MapId: state.playerPosition?.settings?.MapId || "",
     ProfileId: "",
     Visibility: document.querySelector("[data-position-visibility]")?.value || state.playerPosition?.settings?.Visibility || "private",
-    ProfileIds: (document.querySelector("[data-position-visibility]")?.value || state.playerPosition?.settings?.Visibility) === "profiles"
-      ? Array.from(document.querySelectorAll("[data-position-profile]")).filter(input => input.checked).map(input => input.value)
+    ProfileIds: profileOptions.length
+      ? profileOptions.filter(input => input.checked).map(input => input.value)
       : (state.playerPosition?.settings?.ProfileIds || []),
     MarkerName: document.querySelector("[data-position-name]")?.value || "",
     MarkerType: "player",
     IndicatorShape: document.querySelector("[data-position-shape]")?.value || "triangle",
     MarkerColor: document.querySelector("[data-position-color]")?.value || "#3498db",
-    CenterOnPlayer: document.querySelector("[data-position-center]")?.checked || false,
-    KeepZoom: document.querySelector("[data-position-keep-zoom]")?.checked ?? true,
-    CenteringZoom: Math.max(2, Math.min(12, Math.round(Number(document.querySelector("[data-position-zoom]")?.value || 8)))),
+    CenterOnPlayer: document.querySelector("[data-position-center]")?.checked ?? state.playerPosition?.settings?.CenterOnPlayer ?? false,
+    KeepZoom: document.querySelector("[data-position-keep-zoom]")?.checked ?? state.playerPosition?.settings?.KeepZoom ?? true,
+    CenteringZoom: Math.max(2, Math.min(12, Math.round(Number(document.querySelector("[data-position-zoom]")?.value ?? state.playerPosition?.settings?.CenteringZoom ?? 8)))),
     ShowLabel: true,
     LabelContent: "name",
     MarkerSize: Math.max(16, Math.min(48, Math.round(Number(document.querySelector("[data-position-size]")?.value || 32)))),
     IntervalSeconds: Number(document.querySelector("[data-position-interval]")?.value || 5)
-  });
-  const savePlayerPositionSettings = (refreshEditor = false) => {
+    });
+  };
+  const savePlayerPositionSettings = (refreshEditor = false, selectionChanged = false) => {
     clearTimeout(playerPositionSettingsTimer);
     const next = positionSetting();
     state.playerPosition = { ...(state.playerPosition || {}), settings: next };
     // Checkbox state is also reflected in the surrounding label. Update the
     // local view immediately instead of waiting for the native state push.
     if (refreshEditor) render();
-    post({ type: "updatePlayerPositionSettings", settings: next });
+    post({ type: "updatePlayerPositionSettings", settings: next, selectionChanged });
   };
   const debouncePlayerPositionSettings = () => {
     clearTimeout(playerPositionSettingsTimer);
@@ -3479,7 +3725,8 @@ function bindEditorEvents() {
   document.querySelector("[data-position-name]")?.addEventListener("input", debouncePlayerPositionSettings);
   document.querySelector("[data-position-color]")?.addEventListener("input", debouncePlayerPositionSettings);
   document.querySelector("[data-position-shape]")?.addEventListener("change", () => savePlayerPositionSettings());
-  document.querySelectorAll("[data-position-visibility], [data-position-profile]").forEach(input => input.addEventListener("change", () => savePlayerPositionSettings(true)));
+  document.querySelector("[data-position-visibility]")?.addEventListener("change", () => savePlayerPositionSettings(true));
+  document.querySelectorAll("[data-position-profile]").forEach(input => input.addEventListener("change", () => savePlayerPositionSettings(true, true)));
   syncTreasureCaptureLayout();
   document.querySelectorAll("[data-treasure-select]").forEach(button => button.addEventListener("click", () => {
     const id = button.dataset.treasureSelect;
@@ -4007,6 +4254,9 @@ window.DayZMapCompanion = {
     if (activeTab === "updates" && !state.update) {
       post({ type: "command", name: "checkUpdate" });
     }
+  },
+  selectTreasureProfile(id) {
+    treasureProfileId = id;
   },
   showError(message) {
     const toast = document.getElementById("toast");

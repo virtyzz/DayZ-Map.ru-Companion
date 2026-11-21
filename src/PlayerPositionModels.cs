@@ -9,6 +9,7 @@ internal sealed class PlayerPositionTrackingSettings
     public string MapId { get; set; } = "";
     public string ProfileId { get; set; } = "";
     public List<string> ProfileIds { get; set; } = [];
+    public Dictionary<string, List<string>> ProfileIdsByMap { get; set; } = new(StringComparer.Ordinal);
     public string Visibility { get; set; } = "private";
     public bool AutoSelectMap { get; set; } = true;
     public string MarkerName { get; set; } = "Я";
@@ -43,7 +44,15 @@ internal sealed class PlayerPositionTrackingSettings
     public void Normalize()
     {
         Visibility = Visibility is "public" or "profiles" ? Visibility : "private";
-        ProfileIds = (ProfileIds ?? []).Where(id => !string.IsNullOrWhiteSpace(id)).Select(id => id.Trim()).Distinct(StringComparer.Ordinal).Take(32).ToList();
+        MapId ??= "";
+        ProfileIds = NormalizeProfileIds(ProfileIds ?? []);
+        ProfileIdsByMap ??= new(StringComparer.Ordinal);
+        if (MapId.Length > 0)
+        {
+            if (ProfileIdsByMap.Count == 0 && ProfileIds.Count > 0)
+                ProfileIdsByMap[MapId] = [.. ProfileIds];
+            ProfileIds = ProfileIdsByMap.TryGetValue(MapId, out var saved) ? NormalizeProfileIds(saved ?? []) : [];
+        }
         IntervalSeconds = Math.Clamp(IntervalSeconds, 2, 300);
         CenteringZoom = Math.Clamp(CenteringZoom, 2, 12);
         MarkerSize = Math.Clamp(MarkerSize, 16, 48);
@@ -65,8 +74,29 @@ internal sealed class PlayerPositionTrackingSettings
     {
         var clone = (PlayerPositionTrackingSettings)MemberwiseClone();
         clone.ProfileIds = [.. ProfileIds ?? []];
+        clone.ProfileIdsByMap = (ProfileIdsByMap ?? new()).ToDictionary(pair => pair.Key,
+            pair => new List<string>(pair.Value ?? []), StringComparer.Ordinal);
         return clone;
     }
+
+    internal void SelectMap(string mapId)
+    {
+        if (string.IsNullOrEmpty(mapId) || MapId == mapId) return;
+        Normalize();
+        MapId = mapId;
+        ProfileIds = ProfileIdsByMap.TryGetValue(mapId, out var saved) ? NormalizeProfileIds(saved ?? []) : [];
+    }
+
+    internal void SaveMapProfiles(string mapId, IEnumerable<string> profileIds)
+    {
+        if (string.IsNullOrWhiteSpace(mapId)) return;
+        ProfileIdsByMap[mapId] = NormalizeProfileIds(profileIds);
+        if (MapId == mapId) ProfileIds = [.. ProfileIdsByMap[mapId]];
+    }
+
+    private static List<string> NormalizeProfileIds(IEnumerable<string> ids) => ids
+        .Where(id => !string.IsNullOrWhiteSpace(id)).Select(id => id.Trim())
+        .Distinct(StringComparer.Ordinal).Take(32).ToList();
 
     public Rectangle GetScreenRectangle(Rectangle bounds)
     {
@@ -132,4 +162,4 @@ internal sealed record PlayerPositionDiagnostics(DateTimeOffset CapturedAt, stri
 internal sealed record PlayerPositionUpdate(string SessionId, string MapId, string ProfileId, string TrackingId, string MarkerUid, TreasureMarkerTemplate Template, int X, int Y, int Z, DateTimeOffset MeasuredAt,
     bool CenterOnPlayer = false, bool KeepZoom = true, int CenteringZoom = 8, bool ShowLabel = true, int MarkerSize = 32, string LabelContent = "name",
     string Visibility = "private", string[]? ProfileIds = null, int IntervalSeconds = 5, bool AutoSelectMap = true,
-    PlayerPositionServerInfo? Server = null);
+    PlayerPositionServerInfo? Server = null, Guid? ConnectionId = null);

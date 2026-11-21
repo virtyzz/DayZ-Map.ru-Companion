@@ -66,7 +66,7 @@ internal sealed class PlayerPositionTrackingController : IDisposable
                     var source = (server.Server, server.ConnectionId, map.Id);
                     if (source != lastSource) lastPosition = null;
                     lastSource = source;
-                    settings.MapId = map.Id;
+                    settings.SelectMap(map.Id);
                     var originalRegion = settings.Clone();
                     var recognized = await capture.CaptureAndRecognizeAsync(settings, map, token);
                     PlayerPosition? position = recognized.Position ?? throw new DayZCompanionException(recognized.Message);
@@ -82,7 +82,7 @@ internal sealed class PlayerPositionTrackingController : IDisposable
                     if (server.Server != currentServer.Server || server.ConnectionId != currentServer.ConnectionId) continue;
                     if (PlayerPositionMapResolver.Resolve(session, currentServer).Id != map.Id) continue;
                     if (!current.RegionRelativeToWindow && settings.RegionRelativeToWindow) current.CopyRegionFrom(settings);
-                    current.MapId = map.Id;
+                    current.SelectMap(map.Id);
                     settings = current;
                     if (position is null) throw new DayZCompanionException("Скачок координат не подтвердился при повторном считывании.");
                     bridge.Queue(settings, position, currentServer);

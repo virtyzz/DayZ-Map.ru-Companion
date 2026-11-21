@@ -141,6 +141,10 @@ internal static class EditorRenderingTests
                                 if (!heading || editor.dataset.page !== tab) throw new Error('Empty editor tab: ' + tab);
                                 result.push({ tab, heading });
                             }
+                            window.DayZMapCompanion.openTab('account');
+                            if (!document.querySelector('form[data-account-email] input[type="email"]')
+                                || !document.querySelector('[data-account-action="discord"]'))
+                                throw new Error('Both sign-in methods must be available on the account tab');
                             window.DayZMapCompanion.openTab('overview');
                             const map = document.querySelector('[data-session-map]');
                             if (map?.dataset.map !== 'cherno' || map.getBoundingClientRect().width < 250)
@@ -241,7 +245,7 @@ internal static class EditorRenderingTests
                         using var report = JsonDocument.Parse(result);
                         if (!report.RootElement.GetProperty("ok").GetBoolean()) throw new Exception(result);
                         var tabs = report.RootElement.GetProperty("tabs").GetArrayLength();
-                        if (tabs != 14) throw new Exception($"Expected 14 tabs, rendered {tabs}");
+                        if (tabs != 15) throw new Exception($"Expected 15 tabs, rendered {tabs}");
                         Console.WriteLine($"  Rendered {tabs} editor tabs, map connected: {connected}");
                     }
                     form.ClientSize = new System.Drawing.Size(1060, 900);

@@ -39,6 +39,8 @@ var tests = new (string Name, Action Run)[]
     ("Window capture rejects stale frames and respects cancellation", WindowCaptureTests.FreshnessAndCancellation),
     ("Window capture reads covered content and recovers after restore", WindowCaptureTests.CapturesCoveredWindowAndRecovers),
     ("Player position resolves server maps and preserves privacy", PlayerPositionSharingTests.MapResolutionAndPrivacy),
+    ("Companion waits for a fresh sample before publishing a private position to others", PlayerPositionSharingTests.PrivateSamplesAreNotReusedWhenSwitchingToPublic),
+    ("Companion remembers sharing profiles for each map", PlayerPositionSharingTests.SharedProfileSelectionsFollowTheMap),
     ("Player position requires a fresh confirmation for GPS jumps", PlayerPositionSharingTests.GpsJumpsRequireConfirmation),
     ("Player position acknowledgement releases bridge lock before notifying", PlayerPositionSharingTests.AcknowledgementReleasesBridgeLock),
     ("Updater cleanup removes completed attempts and preserves active handoff", UpdateTests.CleanupPreservesActiveAttempts),
